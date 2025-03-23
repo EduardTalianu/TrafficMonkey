@@ -275,22 +275,8 @@ Logs are stored in the `logs` directory and can help diagnose issues:
 - Windows: `[installation_path]\logs\traffic_analyzer.log`
 - Linux/macOS: `[installation_path]/logs/traffic_analyzer.log`
 
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit pull requests, report bugs, or suggest features.
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/new-feature`
-3. Commit your changes: `git commit -am 'Add new feature'`
-4. Push to the branch: `git push origin feature/new-feature`
-5. Submit a pull request
-
 ## Acknowledgments
 
 - Wireshark/TShark for packet capture capabilities
 - VirusTotal for threat intelligence
-- All contributors and testers
+
