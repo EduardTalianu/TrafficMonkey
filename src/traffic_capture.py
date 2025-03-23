@@ -6,6 +6,7 @@ import json
 import time
 import threading
 import logging
+import random
 from collections import deque, defaultdict
 
 # Configure logging
@@ -124,6 +125,8 @@ class TrafficCaptureEngine:
                 "tshark",
                 "-i", interface,
                 "-T", "json",
+                "-f", "ip or icmp or udp port 53",  # Capture IP, ICMP, and DNS traffic
+                "-Y", "ip or icmp or dns",          # Display filter for the same
                 "-l"  # Line-buffered output
             ]
             
@@ -235,7 +238,7 @@ class TrafficCaptureEngine:
         return objects
     
     def process_packet_json(self, packet_data):
-        """Process a packet with robust error handling and port extraction"""
+        """Process a packet with robust error handling and protocol-specific extraction"""
         try:
             # Verify we have a dictionary
             if not isinstance(packet_data, dict):
@@ -255,7 +258,8 @@ class TrafficCaptureEngine:
             
             # Get IP info if available
             if "ip" not in layers:
-                # This is probably not an IP packet - not an error, just skip it
+                # This is probably not an IP packet - could be ARP, etc.
+                # Handle non-IP protocols if needed
                 return
                 
             ip_layer = layers["ip"]
@@ -283,6 +287,9 @@ class TrafficCaptureEngine:
                 try:
                     src_port = int(tcp_layer.get("tcp.srcport", 0))
                     dst_port = int(tcp_layer.get("tcp.dstport", 0))
+                    
+                    # For port scan detection
+                    self._update_port_scan_data(src_ip, dst_ip, dst_port)
                 except (ValueError, TypeError):
                     self.gui.update_output("Warning: Could not convert TCP port to integer")
             
@@ -292,8 +299,19 @@ class TrafficCaptureEngine:
                 try:
                     src_port = int(udp_layer.get("udp.srcport", 0))
                     dst_port = int(udp_layer.get("udp.dstport", 0))
+                    
+                    # For port scan detection
+                    self._update_port_scan_data(src_ip, dst_ip, dst_port)
+                    
+                    # Process DNS over UDP (port 53)
+                    if dst_port == 53 or src_port == 53:
+                        self._process_dns_packet(layers, src_ip, dst_ip)
                 except (ValueError, TypeError):
                     self.gui.update_output("Warning: Could not convert UDP port to integer")
+            
+            # Check for ICMP
+            elif "icmp" in layers:
+                self._process_icmp_packet(layers, src_ip, dst_ip)
             
             # Get frame info
             frame = layers.get("frame", {})
@@ -360,3 +378,123 @@ class TrafficCaptureEngine:
         except Exception as e:
             self.gui.update_output(f"Error processing packet: {e}")
             return False
+
+    def _update_port_scan_data(self, src_ip, dst_ip, dst_port):
+        """Update port scan detection data"""
+        if not dst_port:
+            return
+            
+        try:
+            # Create the port_scan_timestamps table if it doesn't exist
+            self.gui.db_cursor.execute("""
+                CREATE TABLE IF NOT EXISTS port_scan_timestamps (
+                    src_ip TEXT,
+                    dst_ip TEXT,
+                    dst_port INTEGER,
+                    timestamp REAL,
+                    PRIMARY KEY (src_ip, dst_ip, dst_port)
+                )
+            """)
+            
+            # Update or insert port scan timestamp
+            current_time = time.time()
+            self.gui.db_cursor.execute("""
+                INSERT OR REPLACE INTO port_scan_timestamps
+                (src_ip, dst_ip, dst_port, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (src_ip, dst_ip, dst_port, current_time))
+        except Exception as e:
+            self.gui.update_output(f"Error updating port scan data: {e}")
+
+    def _process_dns_packet(self, layers, src_ip, dst_ip):
+        """Extract and store DNS query information"""
+        try:
+            if "dns" not in layers:
+                return
+                
+            dns_layer = layers["dns"]
+            if not isinstance(dns_layer, dict):
+                return
+                
+            # Create DNS table if it doesn't exist
+            self.gui.db_cursor.execute("""
+                CREATE TABLE IF NOT EXISTS dns_queries (
+                    timestamp REAL,
+                    src_ip TEXT,
+                    query_domain TEXT,
+                    query_type TEXT
+                )
+            """)
+            
+            # Extract DNS query name
+            query_name = dns_layer.get("dns.qry.name")
+            if not query_name:
+                return
+                
+            # Extract query type
+            query_type = dns_layer.get("dns.qry.type")
+            if not query_type:
+                query_type = "unknown"
+                
+            # Store DNS query
+            current_time = time.time()
+            self.gui.db_cursor.execute("""
+                INSERT INTO dns_queries
+                (timestamp, src_ip, query_domain, query_type)
+                VALUES (?, ?, ?, ?)
+            """, (current_time, src_ip, query_name, query_type))
+            
+            # Periodically log DNS activity
+            if random.random() < 0.01:  # Log approximately 1% of DNS queries
+                self.gui.update_output(f"DNS Query: {src_ip} -> {query_name} (Type: {query_type})")
+                
+        except Exception as e:
+            self.gui.update_output(f"Error processing DNS packet: {e}")
+
+    def _process_icmp_packet(self, layers, src_ip, dst_ip):
+        """Extract and store ICMP packet information"""
+        try:
+            if "icmp" not in layers:
+                return
+                
+            icmp_layer = layers["icmp"]
+            if not isinstance(icmp_layer, dict):
+                return
+                
+            # Create ICMP table if it doesn't exist
+            self.gui.db_cursor.execute("""
+                CREATE TABLE IF NOT EXISTS icmp_packets (
+                    src_ip TEXT,
+                    dst_ip TEXT,
+                    icmp_type INTEGER,
+                    timestamp REAL
+                )
+            """)
+            
+            # Extract ICMP type
+            icmp_type = None
+            try:
+                icmp_type = int(icmp_layer.get("icmp.type", 0))
+            except (ValueError, TypeError):
+                icmp_type = 0
+                
+            # Store ICMP packet
+            current_time = time.time()
+            self.gui.db_cursor.execute("""
+                INSERT INTO icmp_packets
+                (src_ip, dst_ip, icmp_type, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (src_ip, dst_ip, icmp_type, current_time))
+            
+            # Log ICMP floods
+            self.gui.db_cursor.execute("""
+                SELECT COUNT(*) FROM icmp_packets 
+                WHERE src_ip = ? AND dst_ip = ? AND timestamp > ?
+            """, (src_ip, dst_ip, current_time - 10))  # Last 10 seconds
+            
+            count = self.gui.db_cursor.fetchone()[0]
+            if count > 10:  # Log if more than 10 ICMP packets in 10 seconds
+                self.gui.update_output(f"High ICMP traffic: {src_ip} sent {count} ICMP packets to {dst_ip} in the last 10 seconds")
+                
+        except Exception as e:
+            self.gui.update_output(f"Error processing ICMP packet: {e}")
