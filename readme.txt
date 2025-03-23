@@ -1,6 +1,6 @@
 # Traffic Monkey
 
-![Traffic Monkey Logo](https://example.com/traffic-monkey-logo.png)
+![Traffic Monkey Logo](https://github.com/EdwardDali/TrafficMonkey/blob/main/image.jpg)
 
 A comprehensive network traffic analyzer and security monitoring tool for detecting and alerting on suspicious network activity.
 
