@@ -1,4 +1,4 @@
- # Traffic Monkey
+# Traffic Monkey
 
 ![Traffic Monkey Logo](https://github.com/EdwardDali/TrafficMonkey/blob/main/image.jpg)
 
@@ -51,10 +51,10 @@ Traffic Monkey is a Python-based desktop application that captures and analyzes 
 
 ### Windows Installation
 
-powershell
+```powershell
 # Clone the repository
-git clone https://github.com/youruser/traffic-monkey.git
-cd traffic-monkey
+git clone https://github.com/EdwardDali/TrafficMonkey.git
+cd TrafficMonkey
 
 # Create virtual environment (optional but recommended)
 python -m venv venv
@@ -68,19 +68,19 @@ echo "VIRUSTOTAL_API_KEY=your_api_key_here" > .env
 
 # Run the application (as Administrator)
 python main.py
-
+```
 
 ### Linux Installation
 
-bash
+```bash
 # Install tshark
 sudo apt-get update
 sudo apt-get install tshark
 # Select 'Yes' when asked about allowing non-root users to capture packets
 
 # Clone the repository
-git clone https://github.com/youruser/traffic-monkey.git
-cd traffic-monkey
+git clone https://github.com/EdwardDali/TrafficMonkey.git
+cd TrafficMonkey
 
 # Create virtual environment (optional but recommended)
 python3 -m venv venv
@@ -94,17 +94,17 @@ echo "VIRUSTOTAL_API_KEY=your_api_key_here" > .env
 
 # Run the application
 sudo python main.py
-
+```
 
 ### macOS Installation
 
-bash
+```bash
 # Install tshark via Homebrew
 brew install wireshark
 
 # Clone the repository
-git clone https://github.com/youruser/traffic-monkey.git
-cd traffic-monkey
+git clone https://github.com/EdwardDali/TrafficMonkey.git
+cd TrafficMonkey
 
 # Create virtual environment (optional but recommended)
 python3 -m venv venv
@@ -118,7 +118,7 @@ echo "VIRUSTOTAL_API_KEY=your_api_key_here" > .env
 
 # Run the application
 sudo python main.py
-
+```
 
 ## Required Python Packages
 
@@ -136,7 +136,7 @@ The following packages are required (included in requirements.txt):
 Traffic Monkey needs elevated privileges to capture network traffic:
 
 - **Windows**: Right-click and select "Run as Administrator"
-- **Linux/macOS**: Run with sudo (sudo python main.py)
+- **Linux/macOS**: Run with sudo (`sudo python main.py`)
 
 ### First-time Setup
 
@@ -163,7 +163,7 @@ The application uses a SQLite database to store:
 
 ## Detection Rules System
 
-Traffic Monkey uses a flexible rule-based system for detecting suspicious network activity. Rules are Python classes that inherit from the base Rule class.
+Traffic Monkey uses a flexible rule-based system for detecting suspicious network activity. Rules are Python classes that inherit from the base `Rule` class.
 
 ### Built-in Rules
 
@@ -174,19 +174,19 @@ Traffic Monkey uses a flexible rule-based system for detecting suspicious networ
 - **DNSAnomalyRule**: Identifies DNS tunneling and algorithm-generated domains
 - **HighPortConnectionRule**: Monitors connections on non-standard high ports
 - **ICMPFloodRule**: Detects potential ping flood attacks
-- **PortScanRule**: Identifies port scanning activity
+- **PortScanRule**: Identifies port scanning activities
 
 ### Creating Custom Rules
 
-Create new rules by adding Python files to the rules directory. Each rule must:
+Create new rules by adding Python files to the `rules` directory. Each rule must:
 
-1. Inherit from the Rule class
-2. Implement the analyze() method to detect suspicious activity
+1. Inherit from the `Rule` class
+2. Implement the `analyze()` method to detect suspicious activity
 3. Return a list of alert messages
 
 Example rule structure:
 
-python
+```python
 class MyCustomRule(Rule):
     def __init__(self):
         super().__init__(
@@ -218,7 +218,7 @@ class MyCustomRule(Rule):
             self.threshold = int(value)
             return True
         return False
-
+```
 
 ## Usage Scenarios
 
@@ -248,17 +248,17 @@ Monitor your home network for:
 #### "tshark not found" error
 - Ensure Wireshark is installed with the TShark component
 - Verify tshark is in your system PATH:
-  - Windows: Open Command Prompt and type where tshark
-  - Linux/macOS: Open Terminal and type which tshark
+  - Windows: Open Command Prompt and type `where tshark`
+  - Linux/macOS: Open Terminal and type `which tshark`
 - If not found, add the directory containing tshark to your PATH
 
 #### Permission errors on startup
 - Run the application with administrator/root privileges
 - On Linux, ensure the appropriate capabilities are set:
   
-bash
-  sudo setcap cap_net_raw,cap_net_admin=eip /usr/bin/dumpcap
-
+```bash
+sudo setcap cap_net_raw,cap_net_admin=eip /usr/bin/dumpcap
+```
 
 #### No interfaces showing in the interface list
 - Verify you have at least one active network interface
@@ -266,14 +266,14 @@ bash
 - Check if Wireshark can detect interfaces when run manually
 
 #### Database errors
-- Check if the db directory exists and is writable
-- If database is corrupted, delete the traffic_stats.db file and restart
+- Check if the `db` directory exists and is writable
+- If database is corrupted, delete the `traffic_stats.db` file and restart
 
 ### Log File Location
 
-Logs are stored in the logs directory and can help diagnose issues:
-- Windows: [installation_path]\logs\traffic_analyzer.log
-- Linux/macOS: [installation_path]/logs/traffic_analyzer.log
+Logs are stored in the `logs` directory and can help diagnose issues:
+- Windows: `[installation_path]\logs\traffic_analyzer.log`
+- Linux/macOS: `[installation_path]/logs/traffic_analyzer.log`
 
 ## License
 
@@ -284,9 +284,9 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 Contributions are welcome! Please feel free to submit pull requests, report bugs, or suggest features.
 
 1. Fork the repository
-2. Create a feature branch: git checkout -b feature/new-feature
-3. Commit your changes: git commit -am 'Add new feature'
-4. Push to the branch: git push origin feature/new-feature
+2. Create a feature branch: `git checkout -b feature/new-feature`
+3. Commit your changes: `git commit -am 'Add new feature'`
+4. Push to the branch: `git push origin feature/new-feature`
 5. Submit a pull request
 
 ## Acknowledgments
