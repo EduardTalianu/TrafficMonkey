@@ -220,21 +220,39 @@ class TrafficCaptureEngine:
         """
         Extracts complete JSON object strings from a string 's' by scanning for balanced curly braces.
         Returns a list of JSON object strings.
+        This version is more robust against malformed JSON.
         """
         objects = []
-        start = None
-        bracket_count = 0
+        start_indices = []
+        bracket_counts = []
+        
         for i, char in enumerate(s):
             if char == '{':
-                if start is None:
-                    start = i
-                bracket_count += 1
+                if not start_indices:  # This is the start of a new object
+                    start_indices.append(i)
+                    bracket_counts.append(1)
+                else:
+                    # Increment the current bracket count
+                    bracket_counts[-1] += 1
             elif char == '}':
-                bracket_count -= 1
-                if bracket_count == 0 and start is not None:
-                    # A complete object is found
-                    objects.append(s[start:i+1])
-                    start = None
+                if start_indices:  # Only process if we're tracking an object
+                    bracket_counts[-1] -= 1
+                    
+                    # Check if we've closed the current object
+                    if bracket_counts[-1] == 0:
+                        start = start_indices.pop()
+                        bracket_counts.pop()
+                        
+                        # Extract the JSON object
+                        json_obj = s[start:i+1]
+                        
+                        # Validate it's actually parseable JSON before adding
+                        try:
+                            json.loads(json_obj)
+                            objects.append(json_obj)
+                        except json.JSONDecodeError:
+                            self.gui.update_output(f"Skipping malformed JSON object: {json_obj[:50]}...")
+        
         return objects
     
     def process_packet_json(self, packet_data):

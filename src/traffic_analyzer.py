@@ -908,38 +908,52 @@ class LiveCaptureGUI:
             self.refresh_malicious_list()
 
     def refresh_malicious_list(self):
-        """Refresh the malicious IPs list"""
+        """Refresh the malicious IPs list with all IPs from alerts except localhost"""
         # Clear current items
         for item in self.malicious_tree.get_children():
             self.malicious_tree.delete(item)
         
         try:
-            # Get alerts with "Malicious" in the message
+            # Get all alerts (not just ones with "Malicious" in the message)
             query = """
                 SELECT ip_address, alert_message, rule_name, timestamp
                 FROM alerts
-                WHERE alert_message LIKE '%Malicious%' OR alert_message LIKE '%VirusTotal%'
                 ORDER BY timestamp DESC
             """
             
             rows = self.db_cursor.execute(query).fetchall()
             
             if not rows:
-                self.update_output("No malicious activity detected")
+                self.update_output("No alert activity detected")
                 return
             
-            # Add each malicious IP to the tree
+            # Get local machine's IP addresses to exclude
+            local_ips = self.get_local_ips()
+            
+            # Set to track IPs we've already added (to avoid duplicates)
+            added_ips = set()
+            
+            # Add each IP from alerts to the tree
             for row in rows:
                 ip = row[0]
                 alert = row[1]
                 rule = row[2]
                 timestamp = row[3]
                 
-                # Determine alert type from the message
-                if "VirusTotal" in alert:
+                # Skip local IPs
+                if ip in local_ips:
+                    continue
+                    
+                # Skip if we've already added this IP
+                if ip in added_ips:
+                    continue
+                    
+                # Add to tracking set
+                added_ips.add(ip)
+                
+                # Determine alert type from the rule name
+                if "VirusTotal" in rule:
                     alert_type = "VirusTotal"
-                elif "Malicious" in alert:
-                    alert_type = "Malicious Traffic"
                 else:
                     alert_type = rule
                 
@@ -948,11 +962,59 @@ class LiveCaptureGUI:
                 
                 # Add to tree
                 self.malicious_tree.insert("", "end", values=(ip, alert_type, status, timestamp))
+                
+                # Extract any additional IPs from the alert message
+                additional_ips = self.extract_ips_from_message(alert)
+                for add_ip in additional_ips:
+                    # Skip local IPs and already added IPs
+                    if add_ip in local_ips or add_ip in added_ips:
+                        continue
+                        
+                    # Add to tracking set
+                    added_ips.add(add_ip)
+                    
+                    # Add to tree with related alert info
+                    self.malicious_tree.insert("", "end", values=(add_ip, alert_type, status, timestamp))
             
-            self.update_output(f"Found {len(rows)} potentially malicious alerts")
+            self.update_output(f"Found {len(added_ips)} potentially malicious IPs from all alerts")
             
         except Exception as e:
             self.update_output(f"Error refreshing malicious list: {e}")
+
+    def extract_ips_from_message(self, message):
+        """Extract all IP addresses from an alert message"""
+        # Regular expression to match IPv4 addresses
+        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+        return re.findall(ip_pattern, message)
+
+    def get_local_ips(self):
+        """Get local machine IP addresses to exclude from alerts"""
+        local_ips = set(['127.0.0.1', 'localhost'])
+        
+        try:
+            # Get hostname and associated IPs
+            import socket
+            hostname = socket.gethostname()
+            host_ips = socket.gethostbyname_ex(hostname)[2]
+            local_ips.update(host_ips)
+            
+            # Common local network ranges
+            local_patterns = [
+                r'192\.168\.',
+                r'10\.',
+                r'172\.(1[6-9]|2[0-9]|3[0-1])\.'
+            ]
+            
+            # Check all interfaces
+            for interface_info in self.capture_engine.get_interfaces():
+                name, iface_id, ip_addr, desc = interface_info
+                if ip_addr and ip_addr != "Unknown":
+                    local_ips.add(ip_addr)
+        except Exception:
+            # If we can't determine local IPs, just use the defaults
+            pass
+            
+        return local_ips
 
     def setup_database(self):
         """Set up the database connection and create tables"""
