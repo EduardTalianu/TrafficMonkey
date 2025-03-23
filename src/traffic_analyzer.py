@@ -1303,39 +1303,59 @@ class LiveCaptureGUI:
 
     def refresh_db_stats(self):
         """Refresh all database statistics"""
+        # Disable the refresh button to prevent multiple clicks
+        refresh_button = None
+        for widget in self.db_tab.winfo_children():
+            if isinstance(widget, ttk.Frame):
+                for child in widget.winfo_children():
+                    if isinstance(child, ttk.Button) and "Refresh" in str(child['text']):
+                        refresh_button = child
+                        refresh_button['state'] = 'disabled'
+                        break
+                if refresh_button:
+                    break
+        
         try:
-            # Get database path
+            # Create a new database connection just for stats to avoid locking issues
             db_dir = os.path.join(self.app_root, "db")
             db_path = os.path.join(db_dir, "traffic_stats.db")
+            
+            # Use separate connection with timeout
+            stats_conn = sqlite3.connect(db_path, timeout=10)
+            stats_cursor = stats_conn.cursor()
             
             # Get database summary statistics
             db_file_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
             
-            # Get database counts
+            # Get database counts with error handling for each query
             try:
-                conn_count = self.db_cursor.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
+                conn_count = stats_cursor.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
             except Exception:
                 conn_count = 0
-                
+                    
             try:
-                total_bytes = self.db_cursor.execute("SELECT SUM(total_bytes) FROM connections").fetchone()[0] or 0
+                total_bytes = stats_cursor.execute("SELECT SUM(total_bytes) FROM connections").fetchone()[0] or 0
             except Exception:
                 total_bytes = 0
-                
+                    
             try:
-                total_packets = self.db_cursor.execute("SELECT SUM(packet_count) FROM connections").fetchone()[0] or 0
+                total_packets = stats_cursor.execute("SELECT SUM(packet_count) FROM connections").fetchone()[0] or 0
             except Exception:
                 total_packets = 0
-                
+                    
             try:
-                unique_src_ips = self.db_cursor.execute("SELECT COUNT(DISTINCT src_ip) FROM connections").fetchone()[0]
+                unique_src_ips = stats_cursor.execute("SELECT COUNT(DISTINCT src_ip) FROM connections").fetchone()[0]
             except Exception:
                 unique_src_ips = 0
-                
+                    
             try:
-                unique_dst_ips = self.db_cursor.execute("SELECT COUNT(DISTINCT dst_ip) FROM connections").fetchone()[0]
+                unique_dst_ips = stats_cursor.execute("SELECT COUNT(DISTINCT dst_ip) FROM connections").fetchone()[0]
             except Exception:
                 unique_dst_ips = 0
+            
+            # Close this dedicated connection
+            stats_cursor.close()
+            stats_conn.close()
             
             # Update the summary text widget
             self.db_summary_text.delete(1.0, tk.END)
@@ -1346,7 +1366,7 @@ class LiveCaptureGUI:
             self.db_summary_text.insert(tk.END, f"Unique Source IPs: {unique_src_ips:,}\n")
             self.db_summary_text.insert(tk.END, f"Unique Destination IPs: {unique_dst_ips:,}\n")
             
-            # Update connections display
+            # Update connections display using the original method name
             self.update_connections_display()
             
             self.update_output("Database statistics refreshed")
@@ -1354,29 +1374,51 @@ class LiveCaptureGUI:
         except Exception as e:
             self.update_output(f"Error refreshing database stats: {e}")
             self.status_var.set("DB Stats Error")
+        finally:
+            # Re-enable the refresh button after a short delay
+            if refresh_button:
+                self.master.after(2000, lambda: refresh_button.config(state='normal'))
 
     def update_connections_display(self):
-        """Update the connections treeview with current data"""
+        """Update the connections treeview with current data in a safer way"""
         # Clear existing items
         for item in self.connections_tree.get_children():
             self.connections_tree.delete(item)
         
         try:
-            # Fetch connections data
+            # Create a separate connection to avoid locking
+            db_dir = os.path.join(self.app_root, "db")
+            db_path = os.path.join(db_dir, "traffic_stats.db")
+            display_conn = sqlite3.connect(db_path, timeout=10)
+            display_cursor = display_conn.cursor()
+            
+            # Fetch connections data with a stricter LIMIT to avoid memory issues
             query = """
                 SELECT src_ip, dst_ip, total_bytes, packet_count, timestamp
                 FROM connections
                 ORDER BY total_bytes DESC
-                LIMIT 1000
+                LIMIT 200
             """
             
-            rows = self.db_cursor.execute(query).fetchall()
+            display_cursor.execute(query)
+            rows = display_cursor.fetchall()
             
+            # Close the connection after fetching data
+            display_cursor.close()
+            display_conn.close()
+            
+            # Add rows to the treeview
+            count = 0
             for row in rows:
                 # Format byte size
                 bytes_formatted = f"{row[2]:,}" if row[2] is not None else "0"
                 # Insert row into treeview
                 self.connections_tree.insert("", "end", values=(row[0], row[1], bytes_formatted, row[3], row[4]))
+                count += 1
+                
+                # Process UI events every 50 rows to keep application responsive
+                if count % 50 == 0:
+                    self.master.update_idletasks()
             
             self.update_output(f"Displaying {len(rows)} connections")
         except Exception as e:

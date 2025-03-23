@@ -134,7 +134,7 @@ class TrafficCaptureEngine:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=1  # Line buffered
+                #bufsize=1  # Line buffered
                 # Remove text=True parameter
             )
             
