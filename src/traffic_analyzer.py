@@ -285,7 +285,7 @@ class LiveCaptureGUI:
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
         
         # Path to false positives file
-        self.false_positives_file = os.path.join(self.app_root, "rules", "false_positives.txt")
+        self.false_positives_file = os.path.join(self.app_root, "db", "false_positives.txt")
         self.false_positives = self.load_false_positives()
 
         # Database Setup - Do this BEFORE creating any tabs that need the database
@@ -345,6 +345,11 @@ class LiveCaptureGUI:
         """Load false positives list from file"""
         false_positives = set()
         try:
+            # Create directory if it doesn't exist
+            fp_dir = os.path.dirname(self.false_positives_file)
+            if not os.path.exists(fp_dir):
+                os.makedirs(fp_dir, exist_ok=True)
+                
             if os.path.exists(self.false_positives_file):
                 with open(self.false_positives_file, 'r') as f:
                     for line in f:

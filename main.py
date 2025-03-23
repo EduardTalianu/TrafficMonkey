@@ -49,7 +49,7 @@ def main():
     # Create main window
     root = tk.Tk()
     root.geometry("950x700")
-    root.title("Network Traffic Analyzer")
+    root.title("Traffic Monkey")
     
     try:
         # Set icon if available

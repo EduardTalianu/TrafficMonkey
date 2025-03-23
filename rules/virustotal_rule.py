@@ -18,32 +18,58 @@ class VirusTotalRule(Rule):
         self.max_checks_per_run = 5  # Maximum number of resources to check per rule run
         self.check_urls = True       # Whether to extract and check URLs from connection data
         
-        # Store cache in the current directory
-        self.cache_file = "vt_cache.json"
-        
-        # Find the rules directory and false positives file without using __file__
-        # This will work with the exec() loading mechanism
+        # Set up cache file path in db directory
         try:
-            import os
-            # Try to locate the root directory from the app_root in the GUI
-            # First, check if we're running in the context of the GUI
+            # Try to locate the db directory from the app_root in the GUI
             if 'gui' in globals() and hasattr(globals()['gui'], 'app_root'):
                 app_root = globals()['gui'].app_root
-                self.false_positives_file = os.path.join(app_root, "rules", "false_positives.txt")
+                self.cache_file = os.path.join(app_root, "db", "vt_cache.json")
             else:
                 # Fallback: Search for common parent directories
                 current_dir = os.getcwd()
-                if os.path.exists(os.path.join(current_dir, "rules", "false_positives.txt")):
-                    self.false_positives_file = os.path.join(current_dir, "rules", "false_positives.txt")
-                elif os.path.exists(os.path.join(current_dir, "..", "rules", "false_positives.txt")):
-                    self.false_positives_file = os.path.join(current_dir, "..", "rules", "false_positives.txt")
+                if os.path.exists(os.path.join(current_dir, "db")):
+                    self.cache_file = os.path.join(current_dir, "db", "vt_cache.json")
+                elif os.path.exists(os.path.join(current_dir, "..", "db")):
+                    self.cache_file = os.path.join(current_dir, "..", "db", "vt_cache.json")
                 else:
-                    # Last resort: just use a relative path
-                    self.false_positives_file = os.path.join("rules", "false_positives.txt")
+                    # Last resort: just use the current directory
+                    self.cache_file = "vt_cache.json"
             
+            # Create the db directory if it doesn't exist
+            cache_dir = os.path.dirname(self.cache_file)
+            if not os.path.exists(cache_dir):
+                os.makedirs(cache_dir, exist_ok=True)
+                
+            logging.info(f"Using VirusTotal cache file at: {self.cache_file}")
+        except Exception as e:
+            logging.error(f"Error setting VirusTotal cache file path: {e}")
+            self.cache_file = "vt_cache.json"
+        
+        # Set up false positives file path in db directory
+        try:
+            # Try to locate the db directory from the app_root in the GUI
+            if 'gui' in globals() and hasattr(globals()['gui'], 'app_root'):
+                app_root = globals()['gui'].app_root
+                self.false_positives_file = os.path.join(app_root, "db", "false_positives.txt")
+            else:
+                # Fallback: Search for common parent directories
+                current_dir = os.getcwd()
+                if os.path.exists(os.path.join(current_dir, "db")):
+                    self.false_positives_file = os.path.join(current_dir, "db", "false_positives.txt")
+                elif os.path.exists(os.path.join(current_dir, "..", "db")):
+                    self.false_positives_file = os.path.join(current_dir, "..", "db", "false_positives.txt")
+                else:
+                    # Last resort: just use the current directory
+                    self.false_positives_file = "false_positives.txt"
+            
+            # Create the db directory if it doesn't exist
+            fp_dir = os.path.dirname(self.false_positives_file)
+            if not os.path.exists(fp_dir):
+                os.makedirs(fp_dir, exist_ok=True)
+                
             logging.info(f"Using false positives file at: {self.false_positives_file}")
         except Exception as e:
-            logging.error(f"Error locating false positives file: {e}")
+            logging.error(f"Error setting false positives file path: {e}")
             self.false_positives_file = "false_positives.txt"
         
         self.false_positives = self.load_false_positives()
@@ -93,6 +119,11 @@ class VirusTotalRule(Rule):
         """Load false positives list from file"""
         false_positives = set()
         try:
+            # Create directory if it doesn't exist
+            fp_dir = os.path.dirname(self.false_positives_file)
+            if not os.path.exists(fp_dir):
+                os.makedirs(fp_dir, exist_ok=True)
+                
             if os.path.exists(self.false_positives_file):
                 with open(self.false_positives_file, 'r') as f:
                     for line in f:
@@ -125,6 +156,11 @@ class VirusTotalRule(Rule):
     def save_cache(self):
         """Save cache to disk"""
         try:
+            # Make sure the directory exists
+            cache_dir = os.path.dirname(self.cache_file)
+            if not os.path.exists(cache_dir):
+                os.makedirs(cache_dir, exist_ok=True)
+                
             combined_cache = {
                 'ips': self.ip_cache,
                 'urls': self.url_cache

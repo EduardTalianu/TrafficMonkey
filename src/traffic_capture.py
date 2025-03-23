@@ -30,7 +30,7 @@ class TrafficCaptureEngine:
         interfaces = []
         try:
             cmd = ["tshark", "-D"]
-            output = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode('utf-8', errors='ignore')
+            output = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode('utf-8', errors='replace')
             
             for line in output.splitlines():
                 if not line.strip():
@@ -51,7 +51,7 @@ class TrafficCaptureEngine:
                     
             return interfaces
         except subprocess.CalledProcessError as e:
-            self.gui.update_output(f"Error getting tshark interfaces: {e.output.decode('utf-8', errors='ignore')}")
+            self.gui.update_output(f"Error getting tshark interfaces: {e.output.decode('utf-8', errors='replace')}")
             return []
         except Exception as e:
             self.gui.update_output(f"Error listing interfaces: {e}")
@@ -129,13 +129,13 @@ class TrafficCaptureEngine:
             
             self.gui.update_output(f"Running command: {' '.join(cmd)}")
             
-            # Start tshark process
+            # Start tshark process - use binary mode instead of text mode
             self.tshark_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
                 bufsize=1  # Line buffered
+                # Remove text=True parameter
             )
             
             packet_count = 0
@@ -143,11 +143,12 @@ class TrafficCaptureEngine:
             last_buffer_log_time = time.time()
             
             # Process each line from tshark
-            for line in iter(self.tshark_process.stdout.readline, ''):
+            for binary_line in iter(self.tshark_process.stdout.readline, b''):
                 if not self.running:
                     break
                     
-                line = line.strip()
+                # Decode with error handling
+                line = binary_line.decode('utf-8', errors='replace').strip()
                 if not line:
                     continue
                 
@@ -197,7 +198,7 @@ class TrafficCaptureEngine:
             if self.tshark_process:
                 errors = self.tshark_process.stderr.read()
                 if errors:
-                    self.gui.update_output(f"Tshark errors: {errors}")
+                    self.gui.update_output(f"Tshark errors: {errors.decode('utf-8', errors='replace')}")
         
         except PermissionError:
             self.gui.update_output("Permission denied. Run with elevated privileges.")
