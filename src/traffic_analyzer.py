@@ -399,6 +399,10 @@ class LiveCaptureGUI:
         
         # Set up window close handler
         self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Initialize status flags for refresh operations
+        self.malicious_refresh_in_progress = False
+        self.leaderboard_refresh_in_progress = False
 
     def on_closing(self):
         """Handle application closing"""
@@ -654,10 +658,12 @@ class LiveCaptureGUI:
         self.alerts_by_ip_tab = ttk.Frame(self.alerts_notebook)
         self.alerts_by_alert_tab = ttk.Frame(self.alerts_notebook)
         self.alerts_malicious_tab = ttk.Frame(self.alerts_notebook)
+        self.alerts_leaderboard_tab = ttk.Frame(self.alerts_notebook)  # New leaderboard tab
         
         self.alerts_notebook.add(self.alerts_by_ip_tab, text="By IP Address")
         self.alerts_notebook.add(self.alerts_by_alert_tab, text="By Alert Type")
         self.alerts_notebook.add(self.alerts_malicious_tab, text="Possible Malicious")
+        self.alerts_notebook.add(self.alerts_leaderboard_tab, text="Threat Leaderboard")  # Add the new tab
         
         # Create the IP-focused tab
         self.create_alerts_by_ip_subtab()
@@ -667,9 +673,12 @@ class LiveCaptureGUI:
         
         # Create the Possible Malicious tab
         self.create_alerts_malicious_subtab()
+        
+        # Create the new Leaderboard tab
+        self.create_alerts_leaderboard_subtab()
 
     def create_alerts_by_ip_subtab(self):
-        """Create the IP-focused alerts tab"""
+        """Create the IP-focused alerts tab with right-click menu"""
         # Control buttons frame
         control_frame = ttk.Frame(self.alerts_by_ip_tab)
         control_frame.pack(fill="x", padx=10, pady=5)
@@ -697,10 +706,10 @@ class LiveCaptureGUI:
         
         # Create treeview for alerts by IP
         self.alerts_tree = ttk.Treeview(alerts_frame,
-                                       columns=("ip", "alert_count", "last_seen"),
-                                       show="headings",
-                                       height=10,
-                                       yscrollcommand=scrollbar.set)
+                                    columns=("ip", "alert_count", "last_seen"),
+                                    show="headings",
+                                    height=10,
+                                    yscrollcommand=scrollbar.set)
         self.alerts_tree.pack(fill="both", expand=True, padx=5, pady=5)
         scrollbar.config(command=self.alerts_tree.yview)
         
@@ -716,6 +725,9 @@ class LiveCaptureGUI:
         # Bind event to show alerts for selected IP
         self.alerts_tree.bind("<<TreeviewSelect>>", self.show_ip_alerts)
         
+        # Add right-click context menu
+        self.create_alerts_tree_context_menu()
+        
         # Alerts details frame
         details_frame = ttk.LabelFrame(self.alerts_by_ip_tab, text="Alert Details")
         details_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -726,10 +738,10 @@ class LiveCaptureGUI:
         
         # Create alerts details list
         self.alerts_details_tree = ttk.Treeview(details_frame,
-                                               columns=("alert", "rule", "timestamp"),
-                                               show="headings",
-                                               height=10,
-                                               yscrollcommand=details_scrollbar.set)
+                                            columns=("alert", "rule", "timestamp"),
+                                            show="headings",
+                                            height=10,
+                                            yscrollcommand=details_scrollbar.set)
         self.alerts_details_tree.pack(fill="both", expand=True, padx=5, pady=5)
         details_scrollbar.config(command=self.alerts_details_tree.yview)
         
@@ -741,6 +753,90 @@ class LiveCaptureGUI:
         self.alerts_details_tree.column("alert", width=300)
         self.alerts_details_tree.column("rule", width=150)
         self.alerts_details_tree.column("timestamp", width=150)
+        
+        # Info and button frame for selected IP
+        info_frame = ttk.Frame(self.alerts_by_ip_tab)
+        info_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.alerts_ip_var = tk.StringVar()
+        ttk.Label(info_frame, text="Selected IP:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Entry(info_frame, textvariable=self.alerts_ip_var, width=30).grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        
+        button_frame = ttk.Frame(info_frame)
+        button_frame.grid(row=0, column=2, sticky="e", padx=5, pady=5)
+        
+        ttk.Button(button_frame, text="Copy IP", command=self.copy_alerts_ip).pack(side="left", padx=5)
+        ttk.Button(button_frame, text="Mark as False Positive", command=self.mark_alerts_ip_as_false_positive).pack(side="left", padx=5)
+        
+        # Make the third column (with buttons) expand
+        info_frame.columnconfigure(2, weight=1)
+
+    def create_alerts_tree_context_menu(self):
+        """Create right-click context menu for the alerts IP tree"""
+        self.alerts_tree_menu = tk.Menu(self.master, tearoff=0)
+        self.alerts_tree_menu.add_command(label="Copy IP", command=self.copy_alerts_ip)
+        self.alerts_tree_menu.add_command(label="Mark as False Positive", command=self.mark_alerts_ip_as_false_positive)
+        self.alerts_tree_menu.add_command(label="Show Details", command=self.show_alerts_ip_details_from_menu)
+        
+        # Bind right-click to show context menu
+        self.alerts_tree.bind("<Button-3>", self.show_alerts_tree_context_menu)
+        
+        # Also bind selection to update the IP entry
+        self.alerts_tree.bind("<<TreeviewSelect>>", self.update_alerts_selected_ip)
+
+    def show_alerts_tree_context_menu(self, event):
+        """Show context menu on right-click in alerts tree"""
+        # Select the item under cursor
+        item = self.alerts_tree.identify_row(event.y)
+        if item:
+            self.alerts_tree.selection_set(item)
+            self.update_alerts_selected_ip(None)
+            self.alerts_tree_menu.post(event.x_root, event.y_root)
+
+    def update_alerts_selected_ip(self, event):
+        """Update the IP entry when a row is selected in alerts tree"""
+        # First handle the primary function of showing details
+        if event is not None:
+            self.show_ip_alerts(event)
+        
+        # Then update the IP field
+        selected = self.alerts_tree.selection()
+        if selected:
+            ip = self.alerts_tree.item(selected[0], "values")[0]
+            self.alerts_ip_var.set(ip)
+        else:
+            self.alerts_ip_var.set("")
+
+    def copy_alerts_ip(self):
+        """Copy the selected IP from alerts tree to clipboard"""
+        ip = self.alerts_ip_var.get()
+        if ip:
+            self.master.clipboard_clear()
+            self.master.clipboard_append(ip)
+            self.update_output(f"Copied IP {ip} to clipboard")
+
+    def mark_alerts_ip_as_false_positive(self):
+        """Mark the selected IP as a false positive from alerts tree"""
+        ip = self.alerts_ip_var.get()
+        if ip:
+            self.false_positives.add(ip)
+            self.save_false_positives()
+            self.update_output(f"Marked {ip} as false positive")
+            
+            # Update status in all relevant trees
+            self._update_status_in_treeview(self.malicious_tree, ip, "False Positive")
+            self._update_status_in_treeview(self.leaderboard_tree, ip, "False Positive")
+            
+            # Refresh views to ensure consistency
+            self.refresh_alerts()
+            self.refresh_malicious_list()
+            self.refresh_leaderboard()
+
+    def show_alerts_ip_details_from_menu(self):
+        """Show details for selected IP (called from context menu)"""
+        selected = self.alerts_tree.selection()
+        if selected:
+            self.show_ip_alerts(None)
 
     def create_alerts_by_alert_subtab(self):
         """Create the Alert-focused tab"""
@@ -816,7 +912,7 @@ class LiveCaptureGUI:
         self.rule_alerts_tree.column("timestamp", width=150)
 
     def create_alerts_malicious_subtab(self):
-        """Create the Possible Malicious tab"""
+        """Create the Possible Malicious tab with fixes for display issues"""
         # Control buttons frame
         control_frame = ttk.Frame(self.alerts_malicious_tab)
         control_frame.pack(fill="x", padx=10, pady=5)
@@ -872,6 +968,299 @@ class LiveCaptureGUI:
         # Make the third column (with buttons) expand
         info_frame.columnconfigure(2, weight=1)
 
+    def create_alerts_leaderboard_subtab(self):
+        """Create the Threat Leaderboard tab"""
+        # Control buttons frame
+        control_frame = ttk.Frame(self.alerts_leaderboard_tab)
+        control_frame.pack(fill="x", padx=10, pady=5)
+        
+        ttk.Button(control_frame, text="Refresh Leaderboard", command=self.refresh_leaderboard).pack(side="left", padx=5)
+        ttk.Button(control_frame, text="Manage False Positives", command=self.manage_false_positives).pack(side="left", padx=5)
+        
+        # Leaderboard treeview
+        leaderboard_frame = ttk.Frame(self.alerts_leaderboard_tab)
+        leaderboard_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        # Scrollbar for the treeview
+        scrollbar = ttk.Scrollbar(leaderboard_frame)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Create treeview for threat leaderboard
+        self.leaderboard_tree = ttk.Treeview(leaderboard_frame,
+                                     columns=("ip", "distinct_rules", "total_alerts", "status"),
+                                     show="headings",
+                                     height=15,
+                                     yscrollcommand=scrollbar.set)
+        self.leaderboard_tree.pack(fill="both", expand=True, padx=5, pady=5)
+        scrollbar.config(command=self.leaderboard_tree.yview)
+        
+        # Configure columns
+        self.leaderboard_tree.heading("ip", text="IP Address")
+        self.leaderboard_tree.heading("distinct_rules", text="Distinct Alert Types")
+        self.leaderboard_tree.heading("total_alerts", text="Total Alerts")
+        self.leaderboard_tree.heading("status", text="Status")
+        
+        self.leaderboard_tree.column("ip", width=150)
+        self.leaderboard_tree.column("distinct_rules", width=150)
+        self.leaderboard_tree.column("total_alerts", width=100)
+        self.leaderboard_tree.column("status", width=100)
+        
+        # Add right-click menu
+        self.create_leaderboard_context_menu()
+        
+        # Detail frame for showing triggered rules
+        details_frame = ttk.LabelFrame(self.alerts_leaderboard_tab, text="Triggered Rules")
+        details_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        # Scrollbar for details
+        details_scrollbar = ttk.Scrollbar(details_frame)
+        details_scrollbar.pack(side="right", fill="y")
+        
+        # Create treeview for rule details
+        self.leaderboard_details_tree = ttk.Treeview(details_frame,
+                                               columns=("rule", "count", "last_alert"),
+                                               show="headings",
+                                               height=10,
+                                               yscrollcommand=details_scrollbar.set)
+        self.leaderboard_details_tree.pack(fill="both", expand=True, padx=5, pady=5)
+        details_scrollbar.config(command=self.leaderboard_details_tree.yview)
+        
+        # Configure details columns
+        self.leaderboard_details_tree.heading("rule", text="Rule Name")
+        self.leaderboard_details_tree.heading("count", text="Alert Count")
+        self.leaderboard_details_tree.heading("last_alert", text="Last Alert")
+        
+        self.leaderboard_details_tree.column("rule", width=250)
+        self.leaderboard_details_tree.column("count", width=100)
+        self.leaderboard_details_tree.column("last_alert", width=150)
+        
+        # Info and button frame
+        info_frame = ttk.Frame(self.alerts_leaderboard_tab)
+        info_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.leaderboard_ip_var = tk.StringVar()
+        ttk.Label(info_frame, text="Selected IP:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Entry(info_frame, textvariable=self.leaderboard_ip_var, width=30).grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        
+        button_frame = ttk.Frame(info_frame)
+        button_frame.grid(row=0, column=2, sticky="e", padx=5, pady=5)
+        
+        ttk.Button(button_frame, text="Copy IP", command=self.copy_leaderboard_ip).pack(side="left", padx=5)
+        ttk.Button(button_frame, text="Mark as False Positive", command=self.mark_leaderboard_as_false_positive).pack(side="left", padx=5)
+        
+        # Make the third column (with buttons) expand
+        info_frame.columnconfigure(2, weight=1)
+        
+        # Bind selection event
+        self.leaderboard_tree.bind("<<TreeviewSelect>>", self.show_leaderboard_details)
+
+    def create_leaderboard_context_menu(self):
+        """Create right-click context menu for leaderboard IPs"""
+        self.leaderboard_menu = tk.Menu(self.master, tearoff=0)
+        self.leaderboard_menu.add_command(label="Copy IP", command=self.copy_leaderboard_ip)
+        self.leaderboard_menu.add_command(label="Mark as False Positive", command=self.mark_leaderboard_as_false_positive)
+        self.leaderboard_menu.add_command(label="Show Details", command=self.show_leaderboard_details_from_menu)
+        
+        # Bind right-click to show context menu
+        self.leaderboard_tree.bind("<Button-3>", self.show_leaderboard_context_menu)
+        
+        # Also bind selection to update the IP entry
+        self.leaderboard_tree.bind("<<TreeviewSelect>>", self.update_leaderboard_selected_ip)
+
+    def show_leaderboard_context_menu(self, event):
+        """Show context menu on right-click"""
+        # Select the item under cursor
+        item = self.leaderboard_tree.identify_row(event.y)
+        if item:
+            self.leaderboard_tree.selection_set(item)
+            self.update_leaderboard_selected_ip(None)
+            self.leaderboard_menu.post(event.x_root, event.y_root)
+
+    def update_leaderboard_selected_ip(self, event):
+        """Update the IP entry when a row is selected"""
+        selected = self.leaderboard_tree.selection()
+        if selected:
+            ip = self.leaderboard_tree.item(selected[0], "values")[0]
+            self.leaderboard_ip_var.set(ip)
+        else:
+            self.leaderboard_ip_var.set("")
+
+    def copy_leaderboard_ip(self):
+        """Copy the selected IP from leaderboard to clipboard"""
+        ip = self.leaderboard_ip_var.get()
+        if ip:
+            self.master.clipboard_clear()
+            self.master.clipboard_append(ip)
+            self.update_output(f"Copied IP {ip} to clipboard")
+
+    def mark_leaderboard_as_false_positive(self):
+        """Mark the selected IP as a false positive from leaderboard"""
+        ip = self.leaderboard_ip_var.get()
+        if ip:
+            self.false_positives.add(ip)
+            self.save_false_positives()
+            self.update_output(f"Marked {ip} as false positive")
+            
+            # Update status in all relevant trees
+            self._update_status_in_treeview(self.leaderboard_tree, ip, "False Positive")
+            self._update_status_in_treeview(self.malicious_tree, ip, "False Positive")
+            
+            # Refresh both views to ensure consistency
+            self.refresh_leaderboard()
+            self.refresh_malicious_list()
+
+    def show_leaderboard_details_from_menu(self):
+        """Show details for selected IP (called from context menu)"""
+        self.show_leaderboard_details(None)
+
+    def show_leaderboard_details(self, event):
+        """Show rule details for the selected IP in leaderboard"""
+        # Clear existing items
+        for item in self.leaderboard_details_tree.get_children():
+            self.leaderboard_details_tree.delete(item)
+        
+        # Get selected IP
+        selected = self.leaderboard_tree.selection()
+        if not selected:
+            return
+            
+        ip = self.leaderboard_tree.item(selected[0], "values")[0]
+        
+        # Queue the query for rule details by IP
+        self.db_manager.queue_query(
+            self._get_ip_rule_details,
+            callback=lambda rows: self._update_leaderboard_details_display(rows, ip),
+            ip_address=ip
+        )
+
+    def _get_ip_rule_details(self, ip_address):
+        """Get rule details for an IP, showing each distinct rule type only once"""
+        try:
+            cursor = self.db_manager.analysis_conn.cursor()
+            
+            query = """
+                SELECT rule_name, COUNT(*) as alert_count, MAX(timestamp) as last_alert
+                FROM alerts
+                WHERE ip_address = ?
+                GROUP BY rule_name
+                ORDER BY last_alert DESC
+            """
+            
+            rows = cursor.execute(query, (ip_address,)).fetchall()
+            cursor.close()
+            return rows
+        except Exception as e:
+            logging.error(f"Error getting rule details for IP {ip_address}: {e}")
+            return []
+
+    def _update_leaderboard_details_display(self, rows, ip):
+        """Update the leaderboard details display with rule information"""
+        try:
+            # Add to details tree
+            for row in rows:
+                self.leaderboard_details_tree.insert("", "end", values=(row[0], row[1], row[2]))
+            
+            self.update_output(f"Showing {len(rows)} rule types triggered by IP: {ip}")
+        except Exception as e:
+            self.update_output(f"Error fetching rule details for {ip}: {e}")
+
+    def refresh_leaderboard(self):
+        """Refresh the threat leaderboard display"""
+        # Set flag to indicate refresh is in progress
+        self.leaderboard_refresh_in_progress = True
+        
+        # Clear current items
+        for item in self.leaderboard_tree.get_children():
+            self.leaderboard_tree.delete(item)
+        
+        # Queue the leaderboard query
+        self.db_manager.queue_query(
+            self._get_leaderboard_data,
+            callback=self._update_leaderboard_display
+        )
+        
+        self.update_output("Refreshing threat leaderboard...")
+
+    def _get_leaderboard_data(self):
+        """Get data for the threat leaderboard with correct rule type counting"""
+        try:
+            cursor = self.db_manager.analysis_conn.cursor()
+            
+            # First, get distinct rule types triggered by each IP
+            query = """
+                SELECT 
+                    ip_address, 
+                    COUNT(DISTINCT rule_name) as distinct_rules,
+                    MAX(timestamp) as last_alert
+                FROM alerts
+                GROUP BY ip_address
+                ORDER BY distinct_rules DESC
+            """
+            
+            rows = cursor.execute(query).fetchall()
+            
+            # Get local machine's IP addresses to exclude
+            local_ips = self.get_local_ips()
+            if local_ips is None:
+                local_ips = set(['127.0.0.1', 'localhost'])
+            
+            # Process results and add total alert count for reference
+            result_data = []
+            for ip, distinct_rules, last_alert in rows:
+                # Skip local IPs
+                if ip in local_ips:
+                    continue
+                
+                # Get total number of alerts for this IP (just for reference)
+                total_alerts = cursor.execute(
+                    "SELECT COUNT(*) FROM alerts WHERE ip_address = ?", 
+                    (ip,)
+                ).fetchone()[0]
+                
+                # Determine status
+                status = "False Positive" if ip in self.false_positives else "Active"
+                
+                # Add to results
+                result_data.append((ip, distinct_rules, total_alerts, status, last_alert))
+            
+            cursor.close()
+            return result_data
+        except Exception as e:
+            logging.error(f"Error getting leaderboard data: {e}")
+            return []
+
+    def _update_leaderboard_display(self, data):
+        """Update the leaderboard display with the results"""
+        try:
+            # Add each item to the tree
+            for ip, distinct_rules, total_alerts, status, last_alert in data:
+                self.leaderboard_tree.insert("", "end", values=(ip, distinct_rules, total_alerts, status))
+            
+            self.update_output(f"Leaderboard updated with {len(data)} IP addresses")
+            
+            # Reset the refresh flag
+            self.leaderboard_refresh_in_progress = False
+        except Exception as e:
+            self.update_output(f"Error updating leaderboard display: {e}")
+            self.leaderboard_refresh_in_progress = False
+
+    def _update_status_in_treeview(self, tree, ip, new_status):
+        """Update the status field for an IP in the specified treeview"""
+        for item in tree.get_children():
+            values = tree.item(item, "values")
+            if values and values[0] == ip:
+                new_values = list(values)
+                # Find the status column (usually index 2 or 3)
+                status_index = None
+                if len(values) >= 4 and values[3] in ("Active", "False Positive"):
+                    status_index = 3
+                elif len(values) >= 3 and values[2] in ("Active", "False Positive"):
+                    status_index = 2
+                
+                if status_index is not None:
+                    new_values[status_index] = new_status
+                    tree.item(item, values=new_values)
+
     def create_malicious_context_menu(self):
         """Create right-click context menu for malicious IPs"""
         self.malicious_menu = tk.Menu(self.master, tearoff=0)
@@ -918,12 +1307,13 @@ class LiveCaptureGUI:
             self.save_false_positives()
             self.update_output(f"Marked {ip} as false positive")
             
-            # Update the status in the tree
-            selected = self.malicious_tree.selection()
-            if selected:
-                values = list(self.malicious_tree.item(selected[0], "values"))
-                values[2] = "False Positive"
-                self.malicious_tree.item(selected[0], values=values)
+            # Update the status in all tree views
+            self._update_status_in_treeview(self.malicious_tree, ip, "False Positive")
+            self._update_status_in_treeview(self.leaderboard_tree, ip, "False Positive")
+            
+            # Refresh views to ensure consistency
+            self.refresh_malicious_list()
+            self.refresh_leaderboard()
 
     def manage_false_positives(self):
         """Open dialog to manage false positives"""
@@ -977,14 +1367,18 @@ class LiveCaptureGUI:
             # Update listbox
             listbox.delete(selected[0])
             
-            # Refresh malicious list
+            # Refresh all views
             self.refresh_malicious_list()
+            self.refresh_leaderboard()
 
     def refresh_malicious_list(self):
-        """Refresh the malicious IPs list with all IPs from alerts except localhost"""
+        """Refresh the malicious IPs list with fixed duplicate handling"""
         # Clear current items
         for item in self.malicious_tree.get_children():
             self.malicious_tree.delete(item)
+        
+        # Set a flag to indicate refresh is in progress
+        self.malicious_refresh_in_progress = True
         
         # Queue a query to get alert data
         self.db_manager.queue_query(
@@ -993,9 +1387,9 @@ class LiveCaptureGUI:
         )
         
         self.update_output("Refreshing malicious IP list...")
-    
+
     def _get_malicious_ip_data(self):
-        """Get data for malicious IP display (runs in database thread)"""
+        """Get data for malicious IP display with improved duplicate handling"""
         try:
             # Create a dedicated cursor for this operation
             cursor = self.db_manager.analysis_conn.cursor()
@@ -1015,14 +1409,11 @@ class LiveCaptureGUI:
             
             # Get local machine's IP addresses to exclude
             local_ips = self.get_local_ips()
-            if local_ips is None:  # Added check for None
+            if local_ips is None:
                 local_ips = set(['127.0.0.1', 'localhost'])
             
-            # List to store results
-            result_data = []
-            
-            # Set to track IPs we've already added (to avoid duplicates)
-            added_ips = set()
+            # Use a dictionary to store results by IP to prevent duplicates
+            result_dict = {}
             
             # Process each IP from alerts
             for row in rows:
@@ -1034,13 +1425,11 @@ class LiveCaptureGUI:
                 # Skip local IPs
                 if ip in local_ips:
                     continue
-                    
-                # Skip if we've already added this IP
-                if ip in added_ips:
+                
+                # Skip if we've already added this IP with the same rule (prevents duplicates)
+                dict_key = f"{ip}:{rule}"
+                if dict_key in result_dict:
                     continue
-                    
-                # Add to tracking set
-                added_ips.add(ip)
                 
                 # Determine alert type from the rule name
                 if "VirusTotal" in rule:
@@ -1051,23 +1440,28 @@ class LiveCaptureGUI:
                 # Determine status
                 status = "False Positive" if ip in self.false_positives else "Active"
                 
-                # Add to results
-                result_data.append((ip, alert_type, status, timestamp))
+                # Add to results dictionary
+                result_dict[dict_key] = (ip, alert_type, status, timestamp)
                 
                 # Extract any additional IPs from the alert message
                 additional_ips = self.extract_ips_from_message(alert)
-                if additional_ips:  # Check if not None
+                if additional_ips:
                     for add_ip in additional_ips:
-                        # Skip local IPs and already added IPs
-                        if add_ip in local_ips or add_ip in added_ips:
+                        # Skip local IPs
+                        if add_ip in local_ips:
                             continue
-                            
-                        # Add to tracking set
-                        added_ips.add(add_ip)
+                        
+                        # Skip if already added with same rule
+                        add_dict_key = f"{add_ip}:{rule}"
+                        if add_dict_key in result_dict:
+                            continue
                         
                         # Add to results with related alert info
                         add_status = "False Positive" if add_ip in self.false_positives else "Active"
-                        result_data.append((add_ip, alert_type, add_status, timestamp))
+                        result_dict[add_dict_key] = (add_ip, alert_type, add_status, timestamp)
+            
+            # Convert dictionary to list
+            result_data = list(result_dict.values())
             
             # Close the dedicated cursor
             cursor.close()
@@ -1075,19 +1469,23 @@ class LiveCaptureGUI:
             return result_data
                 
         except Exception as e:
-            logger.error(f"Error getting malicious IPs: {e}")
+            logging.error(f"Error getting malicious IPs: {e}")
             return []
-    
+
     def _update_malicious_display(self, data):
-        """Update the malicious IP display with the results"""
+        """Update the malicious IP display with improved handling of UI updates"""
         try:
             # Add each item to the tree
             for ip, alert_type, status, timestamp in data:
                 self.malicious_tree.insert("", "end", values=(ip, alert_type, status, timestamp))
             
             self.update_output(f"Found {len(data)} potentially malicious IPs from all alerts")
+            
+            # Reset the refresh flag
+            self.malicious_refresh_in_progress = False
         except Exception as e:
             self.update_output(f"Error updating malicious IP display: {e}")
+            self.malicious_refresh_in_progress = False
 
     def extract_ips_from_message(self, message):
         """Extract all IP addresses from an alert message"""
@@ -1168,9 +1566,6 @@ class LiveCaptureGUI:
                 self.alerts_tree.insert("", "end", values=(row[0], row[1], row[2]))
             
             self.update_output(f"Found alerts for {len(rows)} IP addresses")
-            
-            # Also refresh the malicious IPs list
-            self.refresh_malicious_list()
         except Exception as e:
             self.update_output(f"Error refreshing alerts: {e}")
 
@@ -1349,6 +1744,12 @@ class LiveCaptureGUI:
             
             for item in self.malicious_tree.get_children():
                 self.malicious_tree.delete(item)
+                
+            for item in self.leaderboard_tree.get_children():
+                self.leaderboard_tree.delete(item)
+                
+            for item in self.leaderboard_details_tree.get_children():
+                self.leaderboard_details_tree.delete(item)
             
             self.update_output("All alerts cleared")
         else:
@@ -1379,7 +1780,6 @@ class LiveCaptureGUI:
             self.db_manager.get_top_connections,
             callback=self._update_connections_display
         )
-        
         self.update_output("Database statistics refresh queued")
         self.status_var.set("DB Stats Queued")
 
@@ -1525,9 +1925,17 @@ class LiveCaptureGUI:
         self.status_var.set("Stopped")
 
     def analyze_traffic(self):
-        """Analyze traffic with the loaded rules and show alerts"""
+        """Analyze traffic with the loaded rules and show alerts with controlled update frequency"""
         # Get a dedicated cursor for rules to use (from analysis database)
         analysis_cursor = self.db_manager.get_cursor_for_rules()
+        
+        # Track time since last UI updates
+        current_time = time.time()
+        if not hasattr(self, 'last_alerts_update_time'):
+            self.last_alerts_update_time = 0
+        
+        # Define minimum time between updates (in seconds)
+        min_update_interval = 15  # Update alerts tabs at most every 15 seconds
         
         alerts = []
         try:
@@ -1582,7 +1990,7 @@ class LiveCaptureGUI:
                                         # Only show notification for malicious traffic
                                         if 'malicious' in alert.lower() or 'virustotal' in alert.lower():
                                             self.tray_app.show_alert_notification(alert, rule.name, malicious_ip)
-                                    
+                                        
                                 alerts.append(alert)
                     except Exception as e:
                         self.update_output(f"Rule {rule.name} error: {e}")
@@ -1594,8 +2002,12 @@ class LiveCaptureGUI:
             for alert in alerts:
                 self.update_output(alert)
             
-            # Update alerts tab if there are new alerts (with random chance to avoid too frequent updates)
-            if random.random() < 0.5:  # ~50% chance to refresh
+            # Check if it's time to update the alerts tabs (every min_update_interval seconds)
+            time_since_last_update = current_time - self.last_alerts_update_time
+            if time_since_last_update >= min_update_interval:
+                # Reset the timer
+                self.last_alerts_update_time = current_time
+                
                 # Queue UI updates through database manager
                 self.db_manager.queue_query(
                     self.db_manager.get_alerts_by_ip,
@@ -1607,13 +2019,30 @@ class LiveCaptureGUI:
                     callback=self._update_alerts_by_type_display
                 )
                 
-                # Queue malicious list refresh
-                self.master.after(0, self.refresh_malicious_list)
+                # Don't refresh malicious list if it's already refreshing
+                if not hasattr(self, 'malicious_refresh_in_progress') or not self.malicious_refresh_in_progress:
+                    # Queue malicious list refresh
+                    self.master.after(0, self.refresh_malicious_list)
+                    
+                # Also refresh the leaderboard
+                if not hasattr(self, 'leaderboard_refresh_in_progress') or not self.leaderboard_refresh_in_progress:
+                    self.master.after(0, self.refresh_leaderboard)
+                
+                self.update_output("Alert displays updated (next update in ~15 seconds)")
         else:
             self.update_output("No anomalies in this batch")
 
-        # Periodically refresh the database stats tab (but not too often to avoid performance issues)
-        if random.random() < 0.2:  # ~20% chance to refresh stats
+        # Periodically refresh the database stats tab (at most every 30 seconds)
+        if not hasattr(self, 'last_stats_update_time'):
+            self.last_stats_update_time = 0
+        
+        stats_update_interval = 30  # Update stats at most every 30 seconds
+        time_since_stats_update = current_time - self.last_stats_update_time
+        
+        if time_since_stats_update >= stats_update_interval:
+            # Reset the timer
+            self.last_stats_update_time = current_time
+            
             self.db_manager.queue_query(
                 self.db_manager.get_database_stats,
                 callback=lambda stats: self._update_stats_display(stats, None)
@@ -1623,6 +2052,8 @@ class LiveCaptureGUI:
                 self.db_manager.get_top_connections,
                 callback=self._update_connections_display
             )
+            
+            self.update_output("Database statistics updated (next update in ~30 seconds)")
 
     def update_output(self, message):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1746,3 +2177,4 @@ class LiveCaptureGUI:
                 if self.selected_rule.update_param(param_name, var.get()):
                     self.update_output(f"Updated {param_name} to {var.get()} for {self.selected_rule.name}")
             self.show_rule_details(None)
+        selected = self
