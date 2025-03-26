@@ -15,7 +15,9 @@ def setup_directories():
     dirs = {
         "logs": os.path.join(app_root, "logs"),
         "db": os.path.join(app_root, "db"),
-        "rules": os.path.join(app_root, "rules")
+        "rules": os.path.join(app_root, "rules"),
+        "alerts": os.path.join(app_root, "alerts"),
+        "alerts/subtabs": os.path.join(app_root, "alerts", "subtabs")
     }
     
     for dir_name, dir_path in dirs.items():
