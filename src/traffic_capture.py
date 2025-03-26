@@ -25,6 +25,11 @@ class TrafficCaptureEngine:
         self.tshark_process = None
         self.packet_queue = deque()
         self.alerts_by_ip = defaultdict(set)
+        self.packet_batch_count = 0
+        self.packet_count = 0
+        
+        # Use the database manager from the GUI
+        self.db_manager = gui.db_manager
     
     def get_interfaces(self):
         """Get network interfaces using tshark directly"""
@@ -96,6 +101,8 @@ class TrafficCaptureEngine:
         self.running = True
         self.batch_size = batch_size
         self.sliding_window_size = sliding_window_size
+        self.packet_count = 0
+        self.packet_batch_count = 0
         self.capture_thread = threading.Thread(target=self.capture_packets, 
                                               args=(interface,), 
                                               daemon=True)
@@ -141,7 +148,6 @@ class TrafficCaptureEngine:
                 # Remove text=True parameter
             )
             
-            packet_count = 0
             buffer = ""  # Buffer to accumulate JSON output
             last_buffer_log_time = time.time()
             
@@ -175,7 +181,8 @@ class TrafficCaptureEngine:
                         try:
                             packet_data = json.loads(obj_str)
                             self.process_packet_json(packet_data)
-                            packet_count += 1
+                            self.packet_count += 1
+                            self.packet_batch_count += 1
                         except json.JSONDecodeError as e:
                             self.gui.update_output(f"JSON Decode Error: {e}")
                     
@@ -183,14 +190,15 @@ class TrafficCaptureEngine:
                     last_obj_end = buffer.rfind(objs[-1]) + len(objs[-1])
                     buffer = buffer[last_obj_end:]
                     
-                    # Commit database changes
-                    self.gui.db_conn.commit()
-                    
-                    # Periodically analyze traffic and update UI
-                    if packet_count > 0 and packet_count % self.batch_size == 0:
+                    # Commit database changes in batches
+                    if self.packet_batch_count >= self.batch_size:
+                        self.db_manager.commit_capture()
+                        self.packet_batch_count = 0
+                        
+                        # Periodically analyze traffic and update UI
                         self.gui.analyze_traffic()
-                        self.gui.update_output(f"Processed {packet_count} packets total")
-                        self.gui.master.after(0, lambda pc=packet_count: self.gui.status_var.set(f"Captured: {pc} packets"))
+                        self.gui.update_output(f"Processed {self.packet_count} packets total")
+                        self.gui.master.after(0, lambda pc=self.packet_count: self.gui.status_var.set(f"Captured: {pc} packets"))
                 
                 # Prevent buffer from growing too large (10MB limit)
                 if len(buffer) > 10_000_000:
@@ -359,39 +367,10 @@ class TrafficCaptureEngine:
                 is_rdp = 1
                 self.gui.update_output(f"Detected RDP connection from {src_ip}:{src_port} to {dst_ip}:{dst_port}")
             
-            # Database operations with explicit success/failure logging
-            try:
-                # Try to update existing record first
-                update_query = """
-                    UPDATE connections 
-                    SET total_bytes = total_bytes + ?,
-                        packet_count = packet_count + 1,
-                        timestamp = CURRENT_TIMESTAMP
-                    WHERE connection_key = ?
-                """
-                self.gui.db_cursor.execute(update_query, (length, connection_key))
-                
-                rows_updated = self.gui.db_cursor.rowcount
-                
-                # If no rows were updated, insert a new record
-                if rows_updated == 0:
-                    insert_query = """
-                        INSERT INTO connections 
-                        (connection_key, src_ip, dst_ip, src_port, dst_port, total_bytes, packet_count, timestamp, is_rdp_client)
-                        VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?)
-                    """
-                    self.gui.db_cursor.execute(insert_query, (connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp))
-                    
-                    # Log new connections but not too verbose
-                    if is_rdp or length > 10000 or (src_port and src_port > 49000) or (dst_port and dst_port > 49000):
-                        self.gui.update_output(f"New notable connection: {connection_key} ({length} bytes)")
-                
-                # Note: We'll commit in batches instead of every packet for performance
-                return True
-                    
-            except Exception as e:
-                self.gui.update_output(f"SQLite error processing {connection_key}: {e}")
-                return False
+            # Use database manager to add packet
+            return self.db_manager.add_packet(
+                connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp
+            )
                     
         except Exception as e:
             self.gui.update_output(f"Error processing packet: {e}")
@@ -402,27 +381,8 @@ class TrafficCaptureEngine:
         if not dst_port:
             return
             
-        try:
-            # Create the port_scan_timestamps table if it doesn't exist
-            self.gui.db_cursor.execute("""
-                CREATE TABLE IF NOT EXISTS port_scan_timestamps (
-                    src_ip TEXT,
-                    dst_ip TEXT,
-                    dst_port INTEGER,
-                    timestamp REAL,
-                    PRIMARY KEY (src_ip, dst_ip, dst_port)
-                )
-            """)
-            
-            # Update or insert port scan timestamp
-            current_time = time.time()
-            self.gui.db_cursor.execute("""
-                INSERT OR REPLACE INTO port_scan_timestamps
-                (src_ip, dst_ip, dst_port, timestamp)
-                VALUES (?, ?, ?, ?)
-            """, (src_ip, dst_ip, dst_port, current_time))
-        except Exception as e:
-            self.gui.update_output(f"Error updating port scan data: {e}")
+        # Use database manager to store port scan data
+        self.db_manager.add_port_scan_data(src_ip, dst_ip, dst_port)
 
     def _process_dns_packet(self, layers, src_ip, dst_ip):
         """Extract and store DNS query information"""
@@ -434,16 +394,6 @@ class TrafficCaptureEngine:
             if not isinstance(dns_layer, dict):
                 return
                 
-            # Create DNS table if it doesn't exist
-            self.gui.db_cursor.execute("""
-                CREATE TABLE IF NOT EXISTS dns_queries (
-                    timestamp REAL,
-                    src_ip TEXT,
-                    query_domain TEXT,
-                    query_type TEXT
-                )
-            """)
-            
             # Extract DNS query name
             query_name = dns_layer.get("dns.qry.name")
             if not query_name:
@@ -454,13 +404,8 @@ class TrafficCaptureEngine:
             if not query_type:
                 query_type = "unknown"
                 
-            # Store DNS query
-            current_time = time.time()
-            self.gui.db_cursor.execute("""
-                INSERT INTO dns_queries
-                (timestamp, src_ip, query_domain, query_type)
-                VALUES (?, ?, ?, ?)
-            """, (current_time, src_ip, query_name, query_type))
+            # Store DNS query using database manager
+            self.db_manager.add_dns_query(src_ip, query_name, query_type)
             
             # Periodically log DNS activity
             if random.random() < 0.01:  # Log approximately 1% of DNS queries
@@ -479,16 +424,6 @@ class TrafficCaptureEngine:
             if not isinstance(icmp_layer, dict):
                 return
                 
-            # Create ICMP table if it doesn't exist
-            self.gui.db_cursor.execute("""
-                CREATE TABLE IF NOT EXISTS icmp_packets (
-                    src_ip TEXT,
-                    dst_ip TEXT,
-                    icmp_type INTEGER,
-                    timestamp REAL
-                )
-            """)
-            
             # Extract ICMP type
             icmp_type = None
             try:
@@ -496,23 +431,35 @@ class TrafficCaptureEngine:
             except (ValueError, TypeError):
                 icmp_type = 0
                 
-            # Store ICMP packet
-            current_time = time.time()
-            self.gui.db_cursor.execute("""
-                INSERT INTO icmp_packets
-                (src_ip, dst_ip, icmp_type, timestamp)
-                VALUES (?, ?, ?, ?)
-            """, (src_ip, dst_ip, icmp_type, current_time))
+            # Store ICMP packet using database manager
+            self.db_manager.add_icmp_packet(src_ip, dst_ip, icmp_type)
             
-            # Log ICMP floods
-            self.gui.db_cursor.execute("""
-                SELECT COUNT(*) FROM icmp_packets 
-                WHERE src_ip = ? AND dst_ip = ? AND timestamp > ?
-            """, (src_ip, dst_ip, current_time - 10))  # Last 10 seconds
+            # Check for ICMP floods using the analysis database and queue system
+            def check_icmp_flood():
+                try:
+                    current_time = time.time()
+                    count = self.db_manager.analysis_cursor.execute("""
+                        SELECT COUNT(*) FROM icmp_packets 
+                        WHERE src_ip = ? AND dst_ip = ? AND timestamp > ?
+                    """, (src_ip, dst_ip, current_time - 10)).fetchone()[0]  # Last 10 seconds
+                    
+                    if count > 10:  # Log if more than 10 ICMP packets in 10 seconds
+                        self.gui.update_output(f"High ICMP traffic: {src_ip} sent {count} ICMP packets to {dst_ip} in the last 10 seconds")
+                except Exception as e:
+                    self.gui.update_output(f"Error checking ICMP flood: {e}")
             
-            count = self.gui.db_cursor.fetchone()[0]
-            if count > 10:  # Log if more than 10 ICMP packets in 10 seconds
-                self.gui.update_output(f"High ICMP traffic: {src_ip} sent {count} ICMP packets to {dst_ip} in the last 10 seconds")
+            # Queue the ICMP flood check
+            self.db_manager.queue_query(check_icmp_flood)
                 
         except Exception as e:
             self.gui.update_output(f"Error processing ICMP packet: {e}")
+            
+    def add_alert(self, ip_address, alert_message, rule_name):
+        """Add an alert through the database manager's queue"""
+        # Store in in-memory collection first
+        if alert_message not in self.alerts_by_ip[ip_address]:
+            self.alerts_by_ip[ip_address].add(alert_message)
+            
+            # Queue the alert for processing
+            return self.db_manager.queue_alert(ip_address, alert_message, rule_name)
+        return False

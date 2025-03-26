@@ -9,6 +9,7 @@ import logging
 import re
 import random
 from dotenv import load_dotenv
+import json
 
 # Required for system tray and notifications
 import pystray
@@ -17,6 +18,9 @@ from plyer import notification
 
 # Import the traffic capture module - this contains all packet parsing logic
 from traffic_capture import TrafficCaptureEngine
+
+# Import the database manager
+from database_manager import DatabaseManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -27,14 +31,18 @@ logger = logging.getLogger('traffic_analyzer')
 load_dotenv()
 
 class Rule:
-    """Base class for all rules"""
+    """Base class for all rules with dual-database support"""
     def __init__(self, name, description):
         self.name = name
         self.description = description
         self.enabled = True
+        self.db_manager = None  # Will be set by RuleLoader
     
     def analyze(self, db_cursor):
-        """Analyze traffic and return list of alerts"""
+        """
+        Analyze traffic and return list of alerts
+        The db_cursor is from the analysis database (read-only)
+        """
         return []
     
     def get_params(self):
@@ -44,13 +52,23 @@ class Rule:
     def update_param(self, param_name, value):
         """Update a configurable parameter"""
         return False
+    
+    def update_connection(self, connection_key, field, value):
+        """
+        Update a connection in the database
+        This method ensures updates go to the capture database
+        """
+        if self.db_manager:
+            return self.db_manager.update_connection_field(connection_key, field, value)
+        return False
 
 class RuleLoader:
     """Handles loading rule modules from the rules directory"""
     
-    def __init__(self):
-        """Initialize the rule loader"""
+    def __init__(self, db_manager):
+        """Initialize the rule loader with a database manager"""
         self.rules = []
+        self.db_manager = db_manager
         
         # Root directory of the application
         self.app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -75,7 +93,18 @@ class RuleLoader:
                 
                 try:
                     # Create a custom namespace for the module
-                    rule_namespace = {'Rule': Rule}
+                    rule_namespace = {
+                        'Rule': Rule,
+                        'db_manager': self.db_manager,  # Inject database manager
+                        'os': os,
+                        'time': time,
+                        'logging': logging,
+                        're': re,
+                        'requests': __import__('requests') if 'requests' in sys.modules else None,
+                        'json': json,
+                        'hashlib': __import__('hashlib') if 'hashlib' in sys.modules else None,
+                        'ipaddress': __import__('ipaddress') if 'ipaddress' in sys.modules else None
+                    }
                     
                     # Load the module content
                     with open(module_path, 'r') as f:
@@ -93,6 +122,10 @@ class RuleLoader:
                             
                             # Create an instance of the rule
                             rule_instance = obj()
+                            
+                            # Inject database manager into the rule instance
+                            rule_instance.db_manager = self.db_manager
+                            
                             self.rules.append(rule_instance)
                             logger.info(f"Loaded rule: {rule_instance.name} from {filename}")
                             print(f"Loaded rule: {rule_instance.name} from {filename}")
@@ -109,6 +142,54 @@ class RuleLoader:
         # Add some built-in rules if no rules were loaded
         if not self.rules:
             self._add_default_rules()
+        
+        # Apply any needed patches to rules
+        self.patch_loaded_rules()
+    
+    def patch_loaded_rules(self):
+        """Apply patches to known rules that need special handling"""
+        for rule in self.rules:
+            if "VirusTotal" in rule.name:
+                self.patch_virustotal_rule(rule, self.db_manager)
+    
+    def patch_virustotal_rule(self, rule_instance, db_manager):
+        """
+        Patch the VirusTotal rule to work with our database architecture
+        This is applied to each rule that contains 'VirusTotal' in its name
+        """
+        if "VirusTotal" in rule_instance.name:
+            # Save original analyze method
+            original_analyze = rule_instance.analyze
+            
+            # Define a new analyze method that uses our architecture
+            def new_analyze(self, db_cursor):
+                # Replace any direct UPDATE statements in alerts
+                alerts = original_analyze(self, db_cursor)
+                
+                # Patch for database updates - look for specific patterns
+                for connection_key, src_ip, dst_ip in db_cursor.execute(
+                    """
+                    SELECT connection_key, src_ip, dst_ip 
+                    FROM connections 
+                    WHERE (vt_result IS NULL OR vt_result = 'unknown')
+                    AND total_bytes > 1000
+                    LIMIT 100
+                    """
+                ).fetchall():
+                    # If we have DB updates in original function, handle them here
+                    # Example: Update vt_result field
+                    if any("Malicious" in alert for alert in alerts if isinstance(alert, str)):
+                        self.update_connection(connection_key, "vt_result", "Malicious")
+                
+                return alerts
+            
+            # Replace the analyze method
+            rule_instance.analyze = new_analyze.__get__(rule_instance)
+            
+            # Ensure database manager is set
+            rule_instance.db_manager = db_manager
+            
+            logger.info(f"Patched {rule_instance.name} to work with dual-database architecture")
     
     def _add_default_rules(self):
         """Add default built-in rules"""
@@ -153,9 +234,13 @@ class RuleLoader:
                     self.threshold_kb = int(value)
                     return True
                 return False
-                
+        
+        # Create instance and inject database manager
+        rule_instance = LargeDataTransferRule()
+        rule_instance.db_manager = self.db_manager
+        
         # Add the built-in rule
-        self.rules.append(LargeDataTransferRule())
+        self.rules.append(rule_instance)
         logger.info("Added built-in rule: Large Data Transfer Detector")
 
 class SystemTrayApp:
@@ -210,8 +295,7 @@ class SystemTrayApp:
             icon.stop()
             
             # Close the application
-            self.app.master.destroy()
-            sys.exit(0)
+            self.app.on_closing()
     
     def run(self):
         """Run the system tray icon in a separate thread"""
@@ -288,7 +372,7 @@ class LiveCaptureGUI:
         self.false_positives_file = os.path.join(self.app_root, "db", "false_positives.txt")
         self.false_positives = self.load_false_positives()
 
-        # Database Setup - Do this BEFORE creating any tabs that need the database
+        # Database Setup - Use new DatabaseManager
         self.setup_database()
 
         # UI Setup
@@ -325,11 +409,11 @@ class LiveCaptureGUI:
         self.running = False
         self.capture_thread = None
         
-        # Initialize TrafficCaptureEngine
+        # Initialize TrafficCaptureEngine with database manager
         self.capture_engine = TrafficCaptureEngine(self)
         
-        # Load Rules
-        self.rule_loader = RuleLoader()
+        # Load Rules with database manager
+        self.rule_loader = RuleLoader(self.db_manager)
         self.rules = self.rule_loader.rules
         self.selected_rule = None
         self.param_vars = {}
@@ -340,6 +424,23 @@ class LiveCaptureGUI:
         
         # Initialize interfaces after UI is set up
         self.refresh_interfaces()
+        
+        # Set up window close handler
+        self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def on_closing(self):
+        """Handle application closing"""
+        if messagebox.askyesno("Exit", "Are you sure you want to exit?"):
+            # Stop capturing if needed
+            if self.running:
+                self.stop_capture()
+                
+            # Close database connections
+            if hasattr(self, 'db_manager'):
+                self.db_manager.close()
+                
+            # Destroy the window
+            self.master.destroy()
 
     def load_false_positives(self):
         """Load false positives list from file"""
@@ -913,7 +1014,20 @@ class LiveCaptureGUI:
         for item in self.malicious_tree.get_children():
             self.malicious_tree.delete(item)
         
+        # Queue a query to get alert data
+        self.db_manager.queue_query(
+            self._get_malicious_ip_data,
+            callback=self._update_malicious_display
+        )
+        
+        self.update_output("Refreshing malicious IP list...")
+    
+    def _get_malicious_ip_data(self):
+        """Get data for malicious IP display (runs in database thread)"""
         try:
+            # Create a dedicated cursor for this operation
+            cursor = self.db_manager.analysis_conn.cursor()
+            
             # Get all alerts (not just ones with "Malicious" in the message)
             query = """
                 SELECT ip_address, alert_message, rule_name, timestamp
@@ -921,19 +1035,24 @@ class LiveCaptureGUI:
                 ORDER BY timestamp DESC
             """
             
-            rows = self.db_cursor.execute(query).fetchall()
+            rows = cursor.execute(query).fetchall()
             
             if not rows:
-                self.update_output("No alert activity detected")
-                return
+                cursor.close()
+                return []
             
             # Get local machine's IP addresses to exclude
             local_ips = self.get_local_ips()
+            if local_ips is None:  # Added check for None
+                local_ips = set(['127.0.0.1', 'localhost'])
+            
+            # List to store results
+            result_data = []
             
             # Set to track IPs we've already added (to avoid duplicates)
             added_ips = set()
             
-            # Add each IP from alerts to the tree
+            # Process each IP from alerts
             for row in rows:
                 ip = row[0]
                 alert = row[1]
@@ -960,26 +1079,43 @@ class LiveCaptureGUI:
                 # Determine status
                 status = "False Positive" if ip in self.false_positives else "Active"
                 
-                # Add to tree
-                self.malicious_tree.insert("", "end", values=(ip, alert_type, status, timestamp))
+                # Add to results
+                result_data.append((ip, alert_type, status, timestamp))
                 
                 # Extract any additional IPs from the alert message
                 additional_ips = self.extract_ips_from_message(alert)
-                for add_ip in additional_ips:
-                    # Skip local IPs and already added IPs
-                    if add_ip in local_ips or add_ip in added_ips:
-                        continue
+                if additional_ips:  # Check if not None
+                    for add_ip in additional_ips:
+                        # Skip local IPs and already added IPs
+                        if add_ip in local_ips or add_ip in added_ips:
+                            continue
+                            
+                        # Add to tracking set
+                        added_ips.add(add_ip)
                         
-                    # Add to tracking set
-                    added_ips.add(add_ip)
-                    
-                    # Add to tree with related alert info
-                    self.malicious_tree.insert("", "end", values=(add_ip, alert_type, status, timestamp))
+                        # Add to results with related alert info
+                        add_status = "False Positive" if add_ip in self.false_positives else "Active"
+                        result_data.append((add_ip, alert_type, add_status, timestamp))
             
-            self.update_output(f"Found {len(added_ips)} potentially malicious IPs from all alerts")
+            # Close the dedicated cursor
+            cursor.close()
             
+            return result_data
+                
         except Exception as e:
-            self.update_output(f"Error refreshing malicious list: {e}")
+            logger.error(f"Error getting malicious IPs: {e}")
+            return []
+    
+    def _update_malicious_display(self, data):
+        """Update the malicious IP display with the results"""
+        try:
+            # Add each item to the tree
+            for ip, alert_type, status, timestamp in data:
+                self.malicious_tree.insert("", "end", values=(ip, alert_type, status, timestamp))
+            
+            self.update_output(f"Found {len(data)} potentially malicious IPs from all alerts")
+        except Exception as e:
+            self.update_output(f"Error updating malicious IP display: {e}")
 
     def extract_ips_from_message(self, message):
         """Extract all IP addresses from an alert message"""
@@ -995,8 +1131,11 @@ class LiveCaptureGUI:
             # Get hostname and associated IPs
             import socket
             hostname = socket.gethostname()
-            host_ips = socket.gethostbyname_ex(hostname)[2]
-            local_ips.update(host_ips)
+            try:
+                host_ips = socket.gethostbyname_ex(hostname)[2]
+                local_ips.update(host_ips)
+            except:
+                pass  # Ignore errors in getting IP from hostname
             
             # Common local network ranges
             local_patterns = [
@@ -1006,109 +1145,28 @@ class LiveCaptureGUI:
             ]
             
             # Check all interfaces
-            for interface_info in self.capture_engine.get_interfaces():
-                name, iface_id, ip_addr, desc = interface_info
-                if ip_addr and ip_addr != "Unknown":
-                    local_ips.add(ip_addr)
-        except Exception:
+            if hasattr(self, 'capture_engine') and self.capture_engine:
+                try:
+                    for interface_info in self.capture_engine.get_interfaces():
+                        if len(interface_info) >= 3:  # Make sure we have enough elements
+                            name, iface_id, ip_addr = interface_info[0], interface_info[1], interface_info[2]
+                            if ip_addr and ip_addr != "Unknown":
+                                local_ips.add(ip_addr)
+                except:
+                    pass  # Ignore errors in getting IPs from interfaces
+        except Exception as e:
             # If we can't determine local IPs, just use the defaults
-            pass
-            
+            logger.error(f"Error getting local IPs: {e}")
+                
         return local_ips
 
     def setup_database(self):
-        """Set up the database connection and create tables"""
+        """Set up the database manager"""
         try:
-            # Close existing connection if any
-            try:
-                if hasattr(self, 'db_conn'):
-                    self.db_conn.close()
-            except:
-                pass
-                
-            # Create the db directory if it doesn't exist
-            db_dir = os.path.join(self.app_root, "db")
-            os.makedirs(db_dir, exist_ok=True)
+            # Create the database manager
+            self.db_manager = DatabaseManager(self.app_root)
             
-            # Create a new connection with the absolute path to ensure it's in the right place
-            db_path = os.path.join(db_dir, "traffic_stats.db")
-            self.db_conn = sqlite3.connect(db_path, check_same_thread=False)
-            self.db_cursor = self.db_conn.cursor()
-            
-            # Enable WAL mode for better performance and reliability
-            self.db_cursor.execute("PRAGMA journal_mode=WAL")
-            self.db_cursor.execute("PRAGMA synchronous=NORMAL")
-            
-            # Create tables with enhanced schema including port information
-            self.db_cursor.execute("""
-                CREATE TABLE IF NOT EXISTS connections (
-                    connection_key TEXT PRIMARY KEY,
-                    src_ip TEXT,
-                    dst_ip TEXT,
-                    src_port INTEGER DEFAULT NULL,
-                    dst_port INTEGER DEFAULT NULL,
-                    total_bytes INTEGER DEFAULT 0,
-                    packet_count INTEGER DEFAULT 0,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Check if required columns exist and add them if they don't
-            existing_columns = [row[1] for row in self.db_cursor.execute("PRAGMA table_info(connections)").fetchall()]
-            
-            # Add missing port columns if they don't exist
-            if "src_port" not in existing_columns:
-                self.db_cursor.execute("ALTER TABLE connections ADD COLUMN src_port INTEGER DEFAULT NULL")
-                logger.info("Added missing column: src_port")
-                
-            if "dst_port" not in existing_columns:
-                self.db_cursor.execute("ALTER TABLE connections ADD COLUMN dst_port INTEGER DEFAULT NULL")
-                logger.info("Added missing column: dst_port")
-            
-            # Add vt_result column if it doesn't exist
-            if "vt_result" not in existing_columns:
-                self.db_cursor.execute("ALTER TABLE connections ADD COLUMN vt_result TEXT DEFAULT 'unknown'")
-                logger.info("Added missing column: vt_result")
-                
-            # Add is_rdp_client column if it doesn't exist
-            if "is_rdp_client" not in existing_columns:
-                self.db_cursor.execute("ALTER TABLE connections ADD COLUMN is_rdp_client BOOLEAN DEFAULT 0")
-                logger.info("Added missing column: is_rdp_client")
-            
-            # Create indices for faster lookups
-            self.db_cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_connections_ips 
-                ON connections(src_ip, dst_ip)
-            """)
-            
-            self.db_cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_connections_ports 
-                ON connections(src_port, dst_port)
-            """)
-            
-            # Create alerts table if it doesn't exist
-            self.db_cursor.execute("""
-                CREATE TABLE IF NOT EXISTS alerts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ip_address TEXT,
-                    alert_message TEXT,
-                    rule_name TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            self.db_cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_alerts_ip 
-                ON alerts(ip_address)
-            """)
-            
-            self.db_cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_alerts_rule
-                ON alerts(rule_name)
-            """)
-            
-            self.db_conn.commit()
-            logger.info("Database setup complete")
+            logger.info("Database manager initialized")
             return True
             
         except Exception as e:
@@ -1116,134 +1174,23 @@ class LiveCaptureGUI:
             print(f"Database setup error: {e}")
             return False
 
-    def refresh_alerts_by_type(self):
-        """Refresh the alerts by rule type display"""
-        # Clear existing items
-        for item in self.alert_types_tree.get_children():
-            self.alert_types_tree.delete(item)
-        
-        try:
-            # Get unique rules with alerts
-            query = """
-                SELECT rule_name, COUNT(*) as alert_count, MAX(timestamp) as last_seen
-                FROM alerts 
-                GROUP BY rule_name
-                ORDER BY last_seen DESC
-            """
-            
-            rows = self.db_cursor.execute(query).fetchall()
-            
-            if not rows:
-                self.update_output("No alerts found in database")
-                return
-            
-            # Add to tree view
-            for row in rows:
-                self.alert_types_tree.insert("", "end", values=(row[0], row[1], row[2]))
-            
-            self.update_output(f"Found alerts for {len(rows)} rule types")
-            
-        except Exception as e:
-            self.update_output(f"Error refreshing alerts by type: {e}")
-
-    def show_rule_alerts(self, event):
-        """Show alerts for the selected rule"""
-        # Clear existing items
-        for item in self.rule_alerts_tree.get_children():
-            self.rule_alerts_tree.delete(item)
-        
-        # Get selected rule
-        selected = self.alert_types_tree.selection()
-        if not selected:
-            return
-            
-        rule_name = self.alert_types_tree.item(selected[0], "values")[0]
-        
-        try:
-            # Get alerts for the selected rule
-            query = """
-                SELECT ip_address, alert_message, timestamp
-                FROM alerts
-                WHERE rule_name = ?
-                ORDER BY timestamp DESC
-            """
-            
-            rows = self.db_cursor.execute(query, (rule_name,)).fetchall()
-            
-            # Add to details tree
-            for row in rows:
-                self.rule_alerts_tree.insert("", "end", values=(row[0], row[1], row[2]))
-            
-            self.update_output(f"Showing {len(rows)} alerts for rule: {rule_name}")
-            
-        except Exception as e:
-            self.update_output(f"Error fetching alerts for rule {rule_name}: {e}")
-
-    def apply_rule_filter(self):
-        """Apply rule filter to alerts"""
-        rule_filter = self.rule_filter.get().strip()
-        if not rule_filter:
-            self.update_output("No filter entered")
-            return
-            
-        # Clear existing items
-        for item in self.alert_types_tree.get_children():
-            self.alert_types_tree.delete(item)
-        
-        try:
-            # Get unique rules with alerts matching filter
-            query = """
-                SELECT rule_name, COUNT(*) as alert_count, MAX(timestamp) as last_seen
-                FROM alerts 
-                WHERE rule_name LIKE ?
-                GROUP BY rule_name
-                ORDER BY last_seen DESC
-            """
-            
-            # Add wildcards to make it more user-friendly
-            filter_pattern = f"%{rule_filter}%"
-            rows = self.db_cursor.execute(query, (filter_pattern,)).fetchall()
-            
-            if not rows:
-                self.update_output(f"No alerts found matching filter: {rule_filter}")
-                return
-            
-            # Add to tree view
-            for row in rows:
-                self.alert_types_tree.insert("", "end", values=(row[0], row[1], row[2]))
-            
-            self.update_output(f"Found {len(rows)} rule types matching filter: {rule_filter}")
-            
-        except Exception as e:
-            self.update_output(f"Error applying filter: {e}")
-
-    def clear_rule_filter(self):
-        """Clear the rule filter and refresh alerts"""
-        self.rule_filter.delete(0, tk.END)
-        self.refresh_alerts_by_type()
-        self.update_output("Rule filter cleared")
-
     def refresh_alerts(self):
-        """Refresh the alerts by IP display"""
+        """Queue a refresh for the alerts by IP display"""
         # Clear existing items
         for item in self.alerts_tree.get_children():
             self.alerts_tree.delete(item)
         
+        # Queue the alerts query
+        self.db_manager.queue_query(
+            self.db_manager.get_alerts_by_ip,
+            callback=self._update_alerts_display
+        )
+        
+        self.update_output("Alerts refresh queued")
+
+    def _update_alerts_display(self, rows):
+        """Update the alerts treeview with the results"""
         try:
-            # Get unique IPs with alerts
-            query = """
-                SELECT ip_address, COUNT(*) as alert_count, MAX(timestamp) as last_seen
-                FROM alerts 
-                GROUP BY ip_address
-                ORDER BY last_seen DESC
-            """
-            
-            rows = self.db_cursor.execute(query).fetchall()
-            
-            if not rows:
-                self.update_output("No alerts found in database")
-                return
-            
             # Add to tree view
             for row in rows:
                 self.alerts_tree.insert("", "end", values=(row[0], row[1], row[2]))
@@ -1252,7 +1199,6 @@ class LiveCaptureGUI:
             
             # Also refresh the malicious IPs list
             self.refresh_malicious_list()
-            
         except Exception as e:
             self.update_output(f"Error refreshing alerts: {e}")
 
@@ -1269,23 +1215,21 @@ class LiveCaptureGUI:
             
         ip = self.alerts_tree.item(selected[0], "values")[0]
         
+        # Queue the IP alerts query
+        self.db_manager.queue_query(
+            self.db_manager.get_ip_alerts,
+            callback=lambda rows: self._update_ip_alerts_display(rows, ip),
+            ip_address=ip  # Changed to keyword argument
+        )
+
+    def _update_ip_alerts_display(self, rows, ip):
+        """Update the IP alerts display with the results"""
         try:
-            # Get alerts for the selected IP
-            query = """
-                SELECT alert_message, rule_name, timestamp
-                FROM alerts
-                WHERE ip_address = ?
-                ORDER BY timestamp DESC
-            """
-            
-            rows = self.db_cursor.execute(query, (ip,)).fetchall()
-            
             # Add to details tree
             for row in rows:
                 self.alerts_details_tree.insert("", "end", values=(row[0], row[1], row[2]))
             
             self.update_output(f"Showing {len(rows)} alerts for IP: {ip}")
-            
         except Exception as e:
             self.update_output(f"Error fetching alerts for {ip}: {e}")
 
@@ -1300,32 +1244,14 @@ class LiveCaptureGUI:
         for item in self.alerts_tree.get_children():
             self.alerts_tree.delete(item)
         
-        try:
-            # Get unique IPs with alerts matching filter
-            query = """
-                SELECT ip_address, COUNT(*) as alert_count, MAX(timestamp) as last_seen
-                FROM alerts 
-                WHERE ip_address LIKE ?
-                GROUP BY ip_address
-                ORDER BY last_seen DESC
-            """
-            
-            # Add wildcards to make it more user-friendly
-            filter_pattern = f"%{ip_filter}%"
-            rows = self.db_cursor.execute(query, (filter_pattern,)).fetchall()
-            
-            if not rows:
-                self.update_output(f"No alerts found matching filter: {ip_filter}")
-                return
-            
-            # Add to tree view
-            for row in rows:
-                self.alerts_tree.insert("", "end", values=(row[0], row[1], row[2]))
-            
-            self.update_output(f"Found {len(rows)} IP addresses matching filter: {ip_filter}")
-            
-        except Exception as e:
-            self.update_output(f"Error applying filter: {e}")
+        # Queue the filtered query
+        self.db_manager.queue_query(
+            self.db_manager.get_filtered_alerts_by_ip,
+            callback=self._update_alerts_display,
+            ip_filter=ip_filter  # Changed to keyword argument
+        )
+        
+        self.update_output(f"Querying alerts matching filter: {ip_filter}")
 
     def clear_ip_filter(self):
         """Clear the IP filter and refresh alerts"""
@@ -1333,38 +1259,131 @@ class LiveCaptureGUI:
         self.refresh_alerts()
         self.update_output("Filter cleared")
 
+    def refresh_alerts_by_type(self):
+        """Queue a refresh for the alerts by rule type display"""
+        # Clear existing items
+        for item in self.alert_types_tree.get_children():
+            self.alert_types_tree.delete(item)
+        
+        # Queue the alerts query
+        self.db_manager.queue_query(
+            self.db_manager.get_alerts_by_rule_type,
+            callback=self._update_alerts_by_type_display
+        )
+        
+        self.update_output("Alerts by type refresh queued")
+
+    def _update_alerts_by_type_display(self, rows):
+        """Update the alerts by type treeview with the results"""
+        try:
+            if not rows:
+                self.update_output("No alerts found in database")
+                return
+            
+            # Add to tree view
+            for row in rows:
+                self.alert_types_tree.insert("", "end", values=(row[0], row[1], row[2]))
+            
+            self.update_output(f"Found alerts for {len(rows)} rule types")
+        except Exception as e:
+            self.update_output(f"Error refreshing alerts by type: {e}")
+
+    def show_rule_alerts(self, event):
+        """Show alerts for the selected rule"""
+        # Clear existing items
+        for item in self.rule_alerts_tree.get_children():
+            self.rule_alerts_tree.delete(item)
+        
+        # Get selected rule
+        selected = self.alert_types_tree.selection()
+        if not selected:
+            return
+            
+        rule_name = self.alert_types_tree.item(selected[0], "values")[0]
+        
+        # Queue the query
+        self.db_manager.queue_query(
+            self.db_manager.get_rule_alerts,
+            callback=lambda rows: self._update_rule_alerts_display(rows, rule_name),
+            rule_name=rule_name  # Changed to keyword argument
+        )
+
+    def _update_rule_alerts_display(self, rows, rule_name):
+        """Update the rule alerts display with the results"""
+        try:
+            # Add to details tree
+            for row in rows:
+                self.rule_alerts_tree.insert("", "end", values=(row[0], row[1], row[2]))
+            
+            self.update_output(f"Showing {len(rows)} alerts for rule: {rule_name}")
+        except Exception as e:
+            self.update_output(f"Error fetching alerts for rule {rule_name}: {e}")
+
+    def apply_rule_filter(self):
+        """Apply rule filter to alerts"""
+        rule_filter = self.rule_filter.get().strip()
+        if not rule_filter:
+            self.update_output("No filter entered")
+            return
+            
+        # Clear existing items
+        for item in self.alert_types_tree.get_children():
+            self.alert_types_tree.delete(item)
+        
+        # Queue the filtered query
+        self.db_manager.queue_query(
+            self.db_manager.get_filtered_alerts_by_rule,
+            callback=self._update_alerts_by_type_display,
+            rule_filter=rule_filter  # Changed to keyword argument
+        )
+        
+        self.update_output(f"Querying rules matching filter: {rule_filter}")
+
+    def clear_rule_filter(self):
+        """Clear the rule filter and refresh alerts"""
+        self.rule_filter.delete(0, tk.END)
+        self.refresh_alerts_by_type()
+        self.update_output("Rule filter cleared")
+
     def clear_alerts(self):
         """Clear all alerts from the database"""
         if messagebox.askyesno("Clear Alerts", "Are you sure you want to clear all alerts?"):
-            try:
-                self.db_cursor.execute("DELETE FROM alerts")
-                self.db_conn.commit()
+            # Queue the clear operation
+            self.db_manager.queue_query(
+                self.db_manager.clear_alerts,
+                callback=self._after_clear_alerts
+            )
+            
+            # Clear the alerts dictionaries
+            self.capture_engine.alerts_by_ip.clear()
+            
+            self.update_output("Alert clearing operation queued")
+
+    def _after_clear_alerts(self, success):
+        """Callback after clearing alerts"""
+        if success:
+            # Clear the tree views
+            for item in self.alerts_tree.get_children():
+                self.alerts_tree.delete(item)
                 
-                # Clear the alerts dictionaries
-                self.capture_engine.alerts_by_ip.clear()
+            for item in self.alerts_details_tree.get_children():
+                self.alerts_details_tree.delete(item)
+            
+            for item in self.alert_types_tree.get_children():
+                self.alert_types_tree.delete(item)
                 
-                # Clear the tree views
-                for item in self.alerts_tree.get_children():
-                    self.alerts_tree.delete(item)
-                    
-                for item in self.alerts_details_tree.get_children():
-                    self.alerts_details_tree.delete(item)
-                
-                for item in self.alert_types_tree.get_children():
-                    self.alert_types_tree.delete(item)
-                    
-                for item in self.rule_alerts_tree.get_children():
-                    self.rule_alerts_tree.delete(item)
-                
-                for item in self.malicious_tree.get_children():
-                    self.malicious_tree.delete(item)
-                
-                self.update_output("All alerts cleared")
-            except Exception as e:
-                self.update_output(f"Error clearing alerts: {e}")
+            for item in self.rule_alerts_tree.get_children():
+                self.rule_alerts_tree.delete(item)
+            
+            for item in self.malicious_tree.get_children():
+                self.malicious_tree.delete(item)
+            
+            self.update_output("All alerts cleared")
+        else:
+            self.update_output("Error clearing alerts")
 
     def refresh_db_stats(self):
-        """Refresh all database statistics"""
+        """Queue a stats refresh request"""
         # Disable the refresh button to prevent multiple clicks
         refresh_button = None
         for widget in self.db_tab.winfo_children():
@@ -1377,101 +1396,52 @@ class LiveCaptureGUI:
                 if refresh_button:
                     break
         
+        # Queue the database stats query
+        self.db_manager.queue_query(
+            self.db_manager.get_database_stats,
+            callback=lambda stats: self._update_stats_display(stats, refresh_button)
+        )
+        
+        # Queue the connections query
+        self.db_manager.queue_query(
+            self.db_manager.get_top_connections,
+            callback=self._update_connections_display
+        )
+        
+        self.update_output("Database statistics refresh queued")
+        self.status_var.set("DB Stats Queued")
+
+    def _update_stats_display(self, stats, refresh_button=None):
+        """Update the database stats display with the results"""
         try:
-            # Create a new database connection just for stats to avoid locking issues
-            db_dir = os.path.join(self.app_root, "db")
-            db_path = os.path.join(db_dir, "traffic_stats.db")
-            
-            # Use separate connection with timeout
-            stats_conn = sqlite3.connect(db_path, timeout=10)
-            stats_cursor = stats_conn.cursor()
-            
-            # Get database summary statistics
-            db_file_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
-            
-            # Get database counts with error handling for each query
-            try:
-                conn_count = stats_cursor.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
-            except Exception:
-                conn_count = 0
-                    
-            try:
-                total_bytes = stats_cursor.execute("SELECT SUM(total_bytes) FROM connections").fetchone()[0] or 0
-            except Exception:
-                total_bytes = 0
-                    
-            try:
-                total_packets = stats_cursor.execute("SELECT SUM(packet_count) FROM connections").fetchone()[0] or 0
-            except Exception:
-                total_packets = 0
-                    
-            try:
-                unique_src_ips = stats_cursor.execute("SELECT COUNT(DISTINCT src_ip) FROM connections").fetchone()[0]
-            except Exception:
-                unique_src_ips = 0
-                    
-            try:
-                unique_dst_ips = stats_cursor.execute("SELECT COUNT(DISTINCT dst_ip) FROM connections").fetchone()[0]
-            except Exception:
-                unique_dst_ips = 0
-            
-            # Close this dedicated connection
-            stats_cursor.close()
-            stats_conn.close()
-            
             # Update the summary text widget
             self.db_summary_text.delete(1.0, tk.END)
-            self.db_summary_text.insert(tk.END, f"Database File Size: {db_file_size:,} bytes\n")
-            self.db_summary_text.insert(tk.END, f"Total Connections: {conn_count:,}\n")
-            self.db_summary_text.insert(tk.END, f"Total Data Transferred: {total_bytes:,} bytes ({total_bytes/1024/1024:.2f} MB)\n")
-            self.db_summary_text.insert(tk.END, f"Total Packets: {total_packets:,}\n")
-            self.db_summary_text.insert(tk.END, f"Unique Source IPs: {unique_src_ips:,}\n")
-            self.db_summary_text.insert(tk.END, f"Unique Destination IPs: {unique_dst_ips:,}\n")
+            self.db_summary_text.insert(tk.END, f"Database File Size: {stats['db_file_size']:,} bytes\n")
+            self.db_summary_text.insert(tk.END, f"Total Connections: {stats['conn_count']:,}\n")
+            self.db_summary_text.insert(tk.END, f"Total Data Transferred: {stats['total_bytes']:,} bytes ({stats['total_bytes']/1024/1024:.2f} MB)\n")
+            self.db_summary_text.insert(tk.END, f"Total Packets: {stats['total_packets']:,}\n")
+            self.db_summary_text.insert(tk.END, f"Unique Source IPs: {stats['unique_src_ips']:,}\n")
+            self.db_summary_text.insert(tk.END, f"Unique Destination IPs: {stats['unique_dst_ips']:,}\n")
             
-            # Update connections display using the original method name
-            self.update_connections_display()
-            
-            self.update_output("Database statistics refreshed")
+            self.update_output("Database statistics updated")
             self.status_var.set("DB Stats Updated")
         except Exception as e:
-            self.update_output(f"Error refreshing database stats: {e}")
-            self.status_var.set("DB Stats Error")
+            self.update_output(f"Error updating stats display: {e}")
         finally:
             # Re-enable the refresh button after a short delay
             if refresh_button:
                 self.master.after(2000, lambda: refresh_button.config(state='normal'))
 
-    def update_connections_display(self):
-        """Update the connections treeview with current data in a safer way"""
-        # Clear existing items
-        for item in self.connections_tree.get_children():
-            self.connections_tree.delete(item)
-        
+    def _update_connections_display(self, connections):
+        """Update the connections treeview with the results"""
         try:
-            # Create a separate connection to avoid locking
-            db_dir = os.path.join(self.app_root, "db")
-            db_path = os.path.join(db_dir, "traffic_stats.db")
-            display_conn = sqlite3.connect(db_path, timeout=10)
-            display_cursor = display_conn.cursor()
-            
-            # Fetch connections data with a stricter LIMIT to avoid memory issues
-            query = """
-                SELECT src_ip, dst_ip, total_bytes, packet_count, timestamp
-                FROM connections
-                ORDER BY total_bytes DESC
-                LIMIT 200
-            """
-            
-            display_cursor.execute(query)
-            rows = display_cursor.fetchall()
-            
-            # Close the connection after fetching data
-            display_cursor.close()
-            display_conn.close()
+            # Clear existing items
+            for item in self.connections_tree.get_children():
+                self.connections_tree.delete(item)
             
             # Add rows to the treeview
             count = 0
-            for row in rows:
+            for row in connections:
                 # Format byte size
                 bytes_formatted = f"{row[2]:,}" if row[2] is not None else "0"
                 # Insert row into treeview
@@ -1482,7 +1452,7 @@ class LiveCaptureGUI:
                 if count % 50 == 0:
                     self.master.update_idletasks()
             
-            self.update_output(f"Displaying {len(rows)} connections")
+            self.update_output(f"Displaying {len(connections)} connections")
         except Exception as e:
             self.update_output(f"Error updating connections display: {e}")
 
@@ -1584,85 +1554,103 @@ class LiveCaptureGUI:
 
     def analyze_traffic(self):
         """Analyze traffic with the loaded rules and show alerts"""
+        # Get a dedicated cursor for rules to use (from analysis database)
+        analysis_cursor = self.db_manager.get_cursor_for_rules()
+        
         alerts = []
-        for rule in self.rules:
-            if rule.enabled:
-                try:
-                    rule_alerts = rule.analyze(self.db_cursor)
-                    if rule_alerts:
-                        for alert in rule_alerts:
-                            # First, identify which IP is malicious based on the alert message
-                            malicious_ip = None
-                            
-                            # Extract IPs from the alert message (source and destination)
-                            ip_matches = re.findall(r'(\d+\.\d+\.\d+\.\d+)', alert)
-                            
-                            if len(ip_matches) >= 2:
-                                # If we have at least two IPs (typical src->dst format)
-                                src_ip, dst_ip = ip_matches[0], ip_matches[1]
+        try:
+            for rule in self.rules:
+                if rule.enabled:
+                    try:
+                        # Run the rule with the analysis database cursor (read-only)
+                        rule_alerts = rule.analyze(analysis_cursor)
+                        
+                        if rule_alerts:
+                            for alert in rule_alerts:
+                                # First, identify which IP is malicious based on the alert message
+                                malicious_ip = None
                                 
-                                # Check the message context to determine which IP is malicious
-                                if "Malicious IP detected in connection from" in alert:
-                                    # The destination IP is malicious in this case
-                                    malicious_ip = dst_ip
-                                elif "from Malicious IP" in alert or "from suspicious IP" in alert:
-                                    # The source IP is malicious
-                                    malicious_ip = src_ip
-                                elif "VirusTotal" in alert:
-                                    # In VirusTotal alerts, typically the destination is flagged
-                                    malicious_ip = dst_ip
-                                else:
-                                    # Default: use first IP in the message
-                                    malicious_ip = ip_matches[0]
-                            elif len(ip_matches) == 1:
-                                # Only one IP found, use it
-                                malicious_ip = ip_matches[0]
-                            
-                            if malicious_ip:
-                                # Skip if this IP is marked as a false positive
-                                if malicious_ip in self.false_positives:
-                                    continue
+                                # Extract IPs from the alert message (source and destination)
+                                ip_matches = re.findall(r'(\d+\.\d+\.\d+\.\d+)', alert)
                                 
-                                # Store alerts by IP and save to database
-                                if alert not in self.capture_engine.alerts_by_ip[malicious_ip]:
-                                    self.capture_engine.alerts_by_ip[malicious_ip].add(alert)
+                                if len(ip_matches) >= 2:
+                                    # If we have at least two IPs (typical src->dst format)
+                                    src_ip, dst_ip = ip_matches[0], ip_matches[1]
                                     
-                                    # Save alert to database
-                                    try:
-                                        self.db_cursor.execute("""
-                                            INSERT INTO alerts (ip_address, alert_message, rule_name)
-                                            VALUES (?, ?, ?)
-                                        """, (malicious_ip, alert, rule.name))
-                                        self.db_conn.commit()
+                                    # Check the message context to determine which IP is malicious
+                                    if "Malicious IP detected in connection from" in alert:
+                                        # The destination IP is malicious in this case
+                                        malicious_ip = dst_ip
+                                    elif "from Malicious IP" in alert or "from suspicious IP" in alert:
+                                        # The source IP is malicious
+                                        malicious_ip = src_ip
+                                    elif "VirusTotal" in alert:
+                                        # In VirusTotal alerts, typically the destination is flagged
+                                        malicious_ip = dst_ip
+                                    else:
+                                        # Default: use first IP in the message
+                                        malicious_ip = ip_matches[0]
+                                elif len(ip_matches) == 1:
+                                    # Only one IP found, use it
+                                    malicious_ip = ip_matches[0]
+                                
+                                if malicious_ip:
+                                    # Skip if this IP is marked as a false positive
+                                    if malicious_ip in self.false_positives:
+                                        continue
+                                    
+                                    # Use in-memory check first (for efficiency)
+                                    if alert not in self.capture_engine.alerts_by_ip[malicious_ip]:
+                                        # Add to in-memory collection
+                                        self.capture_engine.alerts_by_ip[malicious_ip].add(alert)
+                                        
+                                        # Queue the alert for processing
+                                        self.db_manager.queue_alert(malicious_ip, alert, rule.name)
                                         
                                         # Only show notification for malicious traffic
                                         if 'malicious' in alert.lower() or 'virustotal' in alert.lower():
                                             self.tray_app.show_alert_notification(alert, rule.name, malicious_ip)
-                                    except Exception as e:
-                                        self.update_output(f"Error saving alert to database: {e}")
-                            
-                            alerts.append(alert)
-                except Exception as e:
-                    self.update_output(f"Rule {rule.name} error: {e}")
+                                    
+                                alerts.append(alert)
+                    except Exception as e:
+                        self.update_output(f"Rule {rule.name} error: {e}")
+        finally:
+            # Make sure to close the cursor when done
+            analysis_cursor.close()
         
         if alerts:
             for alert in alerts:
                 self.update_output(alert)
             
-            # Update alerts tab if there are new alerts
-            if random.random() < 0.5:  # ~50% chance to refresh, to avoid too frequent updates
-                self.master.after(0, self.refresh_alerts)
-                self.master.after(0, self.refresh_alerts_by_type)
+            # Update alerts tab if there are new alerts (with random chance to avoid too frequent updates)
+            if random.random() < 0.5:  # ~50% chance to refresh
+                # Queue UI updates through database manager
+                self.db_manager.queue_query(
+                    self.db_manager.get_alerts_by_ip,
+                    callback=self._update_alerts_display
+                )
+                
+                self.db_manager.queue_query(
+                    self.db_manager.get_alerts_by_rule_type,
+                    callback=self._update_alerts_by_type_display
+                )
+                
+                # Queue malicious list refresh
                 self.master.after(0, self.refresh_malicious_list)
         else:
             self.update_output("No anomalies in this batch")
 
         # Periodically refresh the database stats tab (but not too often to avoid performance issues)
         if random.random() < 0.2:  # ~20% chance to refresh stats
-            try:
-                self.master.after(0, self.refresh_db_stats)
-            except:
-                pass
+            self.db_manager.queue_query(
+                self.db_manager.get_database_stats,
+                callback=lambda stats: self._update_stats_display(stats, None)
+            )
+            
+            self.db_manager.queue_query(
+                self.db_manager.get_top_connections,
+                callback=self._update_connections_display
+            )
 
     def update_output(self, message):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1705,7 +1693,7 @@ class LiveCaptureGUI:
         rule_states = {rule.name: rule.enabled for rule in self.rules}
         
         # Reload rules
-        self.rule_loader = RuleLoader()
+        self.rule_loader = RuleLoader(self.db_manager)
         self.rules = self.rule_loader.rules
         
         # Restore rule states
