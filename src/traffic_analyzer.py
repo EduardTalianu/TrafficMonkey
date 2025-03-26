@@ -438,20 +438,25 @@ class TreeViewManager:
             tree.delete(item)
     
     @staticmethod
-    def populate_tree(tree, data, columns=None):
-        """Populate a tree with data rows"""
+    def populate_tree(tree, data, columns=None, batch_size=50):
+        """Populate a tree with data rows in batches to avoid UI freezing"""
         if not data:
             return
             
-        # If columns not specified, use all values
-        if columns is None:
-            for row in data:
-                tree.insert("", "end", values=row)
-        else:
-            # Extract only the specified columns
-            for row in data:
-                values = [row[col] for col in columns]
-                tree.insert("", "end", values=values)
+        # Process in batches
+        for i in range(0, len(data), batch_size):
+            batch = data[i:i+batch_size]
+            # Process the current batch
+            if columns is None:
+                for row in batch:
+                    tree.insert("", "end", values=row)
+            else:
+                for row in batch:
+                    values = [row[col] for col in columns]
+                    tree.insert("", "end", values=values)
+            
+            # Update the UI after each batch
+            tree.update_idletasks()
     
     @staticmethod
     def get_selected_value(tree, column_index=0):
@@ -628,6 +633,23 @@ class LiveCaptureGUI:
         self.leaderboard_refresh_in_progress = False
         self.last_alerts_update_time = 0
         self.last_stats_update_time = 0
+        
+        #Data caching
+
+        self.data_cache = {}
+        self.cache_expiry = {}
+        self.cache_lifetime = 60  # seconds
+
+    def get_cached_data(self, cache_key, query_func, *args, force_refresh=False, **kwargs):
+        """Get data from cache or fetch from database if expired"""
+        current_time = time.time()
+        
+        if not force_refresh and cache_key in self.data_cache:
+            if current_time < self.cache_expiry.get(cache_key, 0):
+                return self.data_cache[cache_key]
+        
+        # Fetch fresh data
+        data = query_func(*args, **kwargs)
 
     def on_closing(self):
         """Handle application closing"""
@@ -869,6 +891,23 @@ class LiveCaptureGUI:
         self.create_alerts_by_alert_subtab()
         self.create_alerts_malicious_subtab()
         self.create_alerts_leaderboard_subtab()
+
+        # Bind to tab selection event to load data only for visible tab
+        self.alerts_notebook.bind("<<NotebookTabChanged>>", self.on_alert_tab_selected)
+
+    def on_alert_tab_selected(self, event):
+        """Load data for the selected tab"""
+        selected_tab = self.alerts_notebook.select()
+        tab_id = self.alerts_notebook.index(selected_tab)
+        
+        if tab_id == 0:  # By IP Address tab
+            self.refresh_alerts()
+        elif tab_id == 1:  # By Alert Type tab
+            self.refresh_alerts_by_type()
+        elif tab_id == 2:  # Malicious tab
+            self.refresh_malicious_list()
+        elif tab_id == 3:  # Leaderboard tab
+            self.refresh_leaderboard()
 
     def create_alerts_by_ip_subtab(self):
         """Create the IP-focused alerts tab with unified components"""
@@ -1817,7 +1856,7 @@ class LiveCaptureGUI:
         current_time = time.time()
         
         # Define minimum time between updates (in seconds)
-        min_update_interval = 15  # Update alerts tabs at most every 15 seconds
+        min_update_interval = 30  # Update alerts tabs at most every 30 seconds
         
         alerts = []
         try:
@@ -1910,7 +1949,7 @@ class LiveCaptureGUI:
                 if not hasattr(self, 'leaderboard_refresh_in_progress') or not self.leaderboard_refresh_in_progress:
                     self.master.after(0, self.refresh_leaderboard)
                 
-                self.update_output("Alert displays updated (next update in ~15 seconds)")
+                self.update_output("Alert displays updated (next update in ~30 seconds)")
         else:
             self.update_output("No anomalies in this batch")
 

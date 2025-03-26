@@ -30,7 +30,7 @@ class LateralMovementRule(Rule):
         
         # Thresholds
         self.min_target_hosts = 3  # Minimum hosts targeted to consider lateral movement
-        self.connection_window = 3600  # Time window in seconds (1 hour)
+        self.connection_window = 600  # Time window in seconds (10 min)
         self.min_admin_protocols = 1  # Minimum admin protocols used
         
         # Detection state

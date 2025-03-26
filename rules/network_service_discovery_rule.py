@@ -6,7 +6,7 @@ class NetworkDiscoveryRule(Rule):
     def __init__(self):
         super().__init__("Network Service Discovery", "Detects when a host is scanning for available services on the network")
         self.service_ports = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 389, 443, 445, 636, 1433, 3306, 3389, 5432, 5900]
-        self.hit_threshold = 5  # Number of service ports accessed to trigger alert
+        self.hit_threshold = 10  # Number of service ports accessed to trigger alert
         self.time_window = 300  # Time window in seconds (5 minutes)
         self.exclude_admins = True  # Exclude known admin workstations
         self.admin_ips = []  # List of admin IPs to exclude
@@ -69,7 +69,7 @@ class NetworkDiscoveryRule(Rule):
         return {
             "hit_threshold": {
                 "type": "int",
-                "default": 5,
+                "default": 10,
                 "current": self.hit_threshold,
                 "description": "Number of service ports to trigger alert"
             },

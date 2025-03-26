@@ -5,7 +5,7 @@ class ConnectionAsymmetryRule(Rule):
     """Rule that detects unusual asymmetry in connection traffic volumes"""
     def __init__(self):
         super().__init__("Connection Asymmetry Detection", "Detects significant differences between inbound and outbound traffic volumes")
-        self.asymmetry_ratio = 10.0  # Ratio of outbound to inbound traffic (or vice versa) to consider asymmetric
+        self.asymmetry_ratio = 100.0  # Ratio of outbound to inbound traffic (or vice versa) to consider asymmetric
         self.min_bytes = 10000       # Minimum total bytes to consider
         self.exclude_common = True   # Exclude common services (web, streaming) that are naturally asymmetric
     
@@ -26,7 +26,7 @@ class ConnectionAsymmetryRule(Rule):
                 FROM connections
                 WHERE total_bytes > ?
                 GROUP BY src_ip, dst_ip
-            """, (self.min_bytes / 10,))  # Set a lower threshold for the query
+            """, (self.min_bytes / 100,))  # Set a lower threshold for the query
             
             # Store results locally to avoid keeping the cursor active
             all_connections = []
@@ -144,7 +144,7 @@ class ConnectionAsymmetryRule(Rule):
         return {
             "asymmetry_ratio": {
                 "type": "float",
-                "default": 10.0,
+                "default": 100.0,
                 "current": self.asymmetry_ratio,
                 "description": "Ratio threshold for traffic asymmetry"
             },
