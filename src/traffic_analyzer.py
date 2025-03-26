@@ -142,54 +142,22 @@ class RuleLoader:
         # Add some built-in rules if no rules were loaded
         if not self.rules:
             self._add_default_rules()
-        
-        # Apply any needed patches to rules
-        self.patch_loaded_rules()
     
     def patch_loaded_rules(self):
-        """Apply patches to known rules that need special handling"""
-        for rule in self.rules:
-            if "VirusTotal" in rule.name:
-                self.patch_virustotal_rule(rule, self.db_manager)
+        """
+        No-op function that replaces the original patching functionality.
+        All rules should now be compatible with the dual-database system.
+        """
+        logger.info("Rule patching disabled - using dual-database compatible rules")
+        return
     
     def patch_virustotal_rule(self, rule_instance, db_manager):
         """
-        Patch the VirusTotal rule to work with our database architecture
-        This is applied to each rule that contains 'VirusTotal' in its name
+        No-op function that replaces the original VirusTotal patch.
+        The VirusTotal rule is now inherently compatible with the dual-database system.
         """
-        if "VirusTotal" in rule_instance.name:
-            # Save original analyze method
-            original_analyze = rule_instance.analyze
-            
-            # Define a new analyze method that uses our architecture
-            def new_analyze(self, db_cursor):
-                # Replace any direct UPDATE statements in alerts
-                alerts = original_analyze(self, db_cursor)
-                
-                # Patch for database updates - look for specific patterns
-                for connection_key, src_ip, dst_ip in db_cursor.execute(
-                    """
-                    SELECT connection_key, src_ip, dst_ip 
-                    FROM connections 
-                    WHERE (vt_result IS NULL OR vt_result = 'unknown')
-                    AND total_bytes > 1000
-                    LIMIT 100
-                    """
-                ).fetchall():
-                    # If we have DB updates in original function, handle them here
-                    # Example: Update vt_result field
-                    if any("Malicious" in alert for alert in alerts if isinstance(alert, str)):
-                        self.update_connection(connection_key, "vt_result", "Malicious")
-                
-                return alerts
-            
-            # Replace the analyze method
-            rule_instance.analyze = new_analyze.__get__(rule_instance)
-            
-            # Ensure database manager is set
-            rule_instance.db_manager = db_manager
-            
-            logger.info(f"Patched {rule_instance.name} to work with dual-database architecture")
+        logger.info(f"Skipping patch for {rule_instance.name} - rule is already compatible")
+        return
     
     def _add_default_rules(self):
         """Add default built-in rules"""
@@ -202,20 +170,24 @@ class RuleLoader:
                 )
                 self.threshold_kb = 5000  # Default 5MB threshold
                 
-            def analyze(self, db_cursor):
+            def analyze(self, db_cursor, *args):
+                """Updated to accept variable arguments for compatibility"""
                 alerts = []
                 
                 # Query for connections with large data transfers
-                db_cursor.execute("""
-                    SELECT src_ip, dst_ip, total_bytes
-                    FROM connections
-                    WHERE total_bytes > ?
-                """, (self.threshold_kb * 1024,))
+                try:
+                    large_transfers = []
+                    for row in db_cursor.execute("""
+                        SELECT src_ip, dst_ip, total_bytes
+                        FROM connections
+                        WHERE total_bytes > ?
+                    """, (self.threshold_kb * 1024,)):
+                        large_transfers.append(row)
                 
-                large_transfers = db_cursor.fetchall()
-                
-                for src_ip, dst_ip, total_bytes in large_transfers:
-                    alerts.append(f"ALERT: Large data transfer from {src_ip} to {dst_ip} - {total_bytes/1024/1024:.2f} MB")
+                    for src_ip, dst_ip, total_bytes in large_transfers:
+                        alerts.append(f"ALERT: Large data transfer from {src_ip} to {dst_ip} - {total_bytes/1024/1024:.2f} MB")
+                except Exception as e:
+                    logging.error(f"Error in LargeDataTransferRule: {e}")
                     
                 return alerts
             
