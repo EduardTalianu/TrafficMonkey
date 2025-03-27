@@ -569,13 +569,11 @@ class LiveCaptureGUI:
         self.interfaces_tab = ttk.Frame(self.notebook)
         self.settings_tab = ttk.Frame(self.notebook)
         self.rules_tab = ttk.Frame(self.notebook)
-        self.db_tab = ttk.Frame(self.notebook)
         self.alerts_tab = ttk.Frame(self.notebook)
         
         self.notebook.add(self.interfaces_tab, text="Network Interfaces")
         self.notebook.add(self.settings_tab, text="Detection Settings")
         self.notebook.add(self.rules_tab, text="Rules")
-        self.notebook.add(self.db_tab, text="Database/Stats")
         self.notebook.add(self.alerts_tab, text="Alerts")
         
         # Initialize interfaces
@@ -589,7 +587,6 @@ class LiveCaptureGUI:
         self.create_interfaces_tab()
         self.create_settings_tab()
         self.create_rules_tab()
-        self.create_db_tab()
         self.create_alerts_tab()
         
         # Capture Variables
@@ -822,38 +819,6 @@ class LiveCaptureGUI:
         self.apply_params_button = ttk.Button(params_frame, text="Apply Parameters", command=self.apply_rule_params)
         self.apply_params_button.pack(side="right", padx=5, pady=5)
         self.apply_params_button.config(state="disabled")
-
-    def create_db_tab(self):
-        """Create a simplified Database/Stats tab"""
-        # Control buttons frame
-        control_frame = self.tab_factory.create_control_buttons(
-            self.db_tab,
-            [{"text": "Refresh Database Stats", "command": self.refresh_db_stats}]
-        )
-        
-        # Database summary information
-        summary_frame = ttk.LabelFrame(self.db_tab, text="Database Summary")
-        summary_frame.pack(fill="x", padx=10, pady=5)
-        
-        # Summary statistics text
-        self.db_summary_text = tk.Text(summary_frame, height=6, wrap=tk.WORD)
-        self.db_summary_text.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        # Create a simple connection list
-        connections_frame = ttk.LabelFrame(self.db_tab, text="Top Connections")
-        connections_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        
-        # Create connections treeview
-        self.connections_tree, _ = self.tab_factory.create_tree_with_scrollbar(
-            connections_frame,
-            columns=("src_ip", "dst_ip", "bytes", "packets", "timestamp"),
-            headings=["Source IP", "Destination IP", "Bytes", "Packets", "Last Seen"],
-            widths=[150, 150, 100, 70, 150],
-            height=15
-        )
-        
-        # Initial message
-        self.db_summary_text.insert(tk.END, "Click 'Refresh Database Stats' to load statistics")
 
     def create_alerts_tab(self):
         """Create alerts tab with dynamically loaded subtabs"""
@@ -1321,82 +1286,6 @@ class LiveCaptureGUI:
                 if hasattr(subtab, 'refresh'):
                     subtab.refresh()
 
-    def refresh_db_stats(self):
-        """Queue a stats refresh request"""
-        # Disable the refresh button to prevent multiple clicks
-        refresh_button = None
-        for widget in self.db_tab.winfo_children():
-            if isinstance(widget, ttk.Frame):
-                for child in widget.winfo_children():
-                    if isinstance(child, ttk.Button) and "Refresh" in str(child['text']):
-                        refresh_button = child
-                        refresh_button['state'] = 'disabled'
-                        break
-                if refresh_button:
-                    break
-        
-        # Queue the database stats query
-        self.db_manager.queue_query(
-            self.db_manager.get_database_stats,
-            callback=lambda stats: self._update_stats_display(stats, refresh_button)
-        )
-        
-        # Queue the connections query
-        self.db_manager.queue_query(
-            self.db_manager.get_top_connections,
-            callback=self._update_connections_display
-        )
-        self.update_output("Database statistics refresh queued")
-        self.status_var.set("DB Stats Queued")
-
-    def _update_stats_display(self, stats, refresh_button=None):
-        """Update the database stats display with the results"""
-        try:
-            # Update the summary text widget
-            self.db_summary_text.delete(1.0, tk.END)
-            self.db_summary_text.insert(tk.END, f"Database File Size: {stats['db_file_size']:,} bytes\n")
-            self.db_summary_text.insert(tk.END, f"Total Connections: {stats['conn_count']:,}\n")
-            self.db_summary_text.insert(tk.END, f"Total Data Transferred: {stats['total_bytes']:,} bytes ({stats['total_bytes']/1024/1024:.2f} MB)\n")
-            self.db_summary_text.insert(tk.END, f"Total Packets: {stats['total_packets']:,}\n")
-            self.db_summary_text.insert(tk.END, f"Unique Source IPs: {stats['unique_src_ips']:,}\n")
-            self.db_summary_text.insert(tk.END, f"Unique Destination IPs: {stats['unique_dst_ips']:,}\n")
-            
-            self.update_output("Database statistics updated")
-            self.status_var.set("DB Stats Updated")
-        except Exception as e:
-            self.update_output(f"Error updating stats display: {e}")
-        finally:
-            # Re-enable the refresh button after a short delay
-            if refresh_button:
-                self.master.after(2000, lambda: refresh_button.config(state='normal'))
-
-    def _update_connections_display(self, connections):
-        """Update the connections treeview with the results"""
-        try:
-            # Clear existing items
-            self.tree_manager.clear_tree(self.connections_tree)
-            
-            # Format connections data
-            formatted_connections = []
-            for row in connections:
-                # Format byte size
-                bytes_formatted = f"{row[2]:,}" if row[2] is not None else "0"
-                # Add to formatted list
-                formatted_connections.append((row[0], row[1], bytes_formatted, row[3], row[4]))
-            
-            # Use TreeManager to populate tree in batches
-            # This avoids UI freezing with large datasets
-            batch_size = 50
-            for i in range(0, len(formatted_connections), batch_size):
-                batch = formatted_connections[i:i+batch_size]
-                self.tree_manager.populate_tree(self.connections_tree, batch)
-                # Process UI events every batch
-                self.master.update_idletasks()
-            
-            self.update_output(f"Displaying {len(connections)} connections")
-        except Exception as e:
-            self.update_output(f"Error updating connections display: {e}")
-
     def clear_output(self):
         self.output_text.config(state=tk.NORMAL)
         self.output_text.delete(1.0, tk.END)
@@ -1586,7 +1475,8 @@ class LiveCaptureGUI:
         else:
             self.update_output("No anomalies in this batch")
 
-        # Periodically refresh the database stats tab (at most every 30 seconds)
+        # We still want database stats to update, but now we don't have a tab to show them in
+        # Just update the status bar with minimal info
         stats_update_interval = 30  # Update stats at most every 30 seconds
         time_since_stats_update = current_time - self.last_stats_update_time
         
@@ -1594,17 +1484,8 @@ class LiveCaptureGUI:
             # Reset the timer
             self.last_stats_update_time = current_time
             
-            self.db_manager.queue_query(
-                self.db_manager.get_database_stats,
-                callback=lambda stats: self._update_stats_display(stats, None)
-            )
-            
-            self.db_manager.queue_query(
-                self.db_manager.get_top_connections,
-                callback=self._update_connections_display
-            )
-            
-            self.update_output("Database statistics updated (next update in ~30 seconds)")
+            # Just update the status bar with basic packet count info
+            self.master.after(0, lambda: self.status_var.set(f"Captured: {self.packet_count} packets"))
 
     def update_output(self, message):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
