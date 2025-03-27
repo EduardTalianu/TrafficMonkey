@@ -1485,7 +1485,7 @@ class LiveCaptureGUI:
             self.last_stats_update_time = current_time
             
             # Just update the status bar with basic packet count info
-            self.master.after(0, lambda: self.status_var.set(f"Captured: {self.packet_count} packets"))
+            self.master.after(0, lambda: self.status_var.set(f"Captured: {self.capture_engine.packet_count} packets"))
 
     def update_output(self, message):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1608,3 +1608,10 @@ class LiveCaptureGUI:
                 if self.selected_rule.update_param(param_name, var.get()):
                     self.update_output(f"Updated {param_name} to {var.get()} for {self.selected_rule.name}")
             self.show_rule_details(None)
+
+    @property
+    def packet_count(self):
+        """Get packet count from the capture engine"""
+        if hasattr(self, 'capture_engine'):
+            return self.capture_engine.packet_count
+        return 0

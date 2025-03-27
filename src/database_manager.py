@@ -79,7 +79,8 @@ class DatabaseManager:
         logger.info("Analysis database initialized for read operations")
     
     def _create_tables(self, cursor):
-        """Create required tables in the database"""
+        """Create required tables in the database (with added HTTP/TLS support)"""
+        # Original tables remain the same
         # Connections table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS connections (
@@ -92,7 +93,8 @@ class DatabaseManager:
                 packet_count INTEGER DEFAULT 0,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 vt_result TEXT DEFAULT 'unknown',
-                is_rdp_client BOOLEAN DEFAULT 0
+                is_rdp_client BOOLEAN DEFAULT 0,
+                protocol TEXT DEFAULT NULL
             )
         """)
         
@@ -156,6 +158,92 @@ class DatabaseManager:
                 dst_ip TEXT,
                 icmp_type INTEGER,
                 timestamp REAL
+            )
+        """)
+        
+        # HTTP requests table (new)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS http_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                connection_key TEXT,
+                timestamp REAL,
+                method TEXT,
+                host TEXT,
+                uri TEXT,
+                version TEXT,
+                user_agent TEXT,
+                referer TEXT,
+                content_type TEXT,
+                request_headers TEXT,
+                request_size INTEGER DEFAULT 0,
+                FOREIGN KEY (connection_key) REFERENCES connections (connection_key)
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_requests_conn 
+            ON http_requests(connection_key)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_requests_host 
+            ON http_requests(host)
+        """)
+        
+        # HTTP responses table (new)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS http_responses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                http_request_id INTEGER,
+                status_code INTEGER,
+                content_type TEXT,
+                content_length INTEGER,
+                server TEXT,
+                response_headers TEXT,
+                timestamp REAL,
+                FOREIGN KEY (http_request_id) REFERENCES http_requests (id)
+            )
+        """)
+        
+        # TLS connection information (new)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tls_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                connection_key TEXT,
+                timestamp REAL,
+                tls_version TEXT,
+                cipher_suite TEXT,
+                server_name TEXT,
+                ja3_fingerprint TEXT,
+                ja3s_fingerprint TEXT,
+                certificate_issuer TEXT,
+                certificate_subject TEXT,
+                certificate_validity_start TEXT,
+                certificate_validity_end TEXT,
+                certificate_serial TEXT,
+                FOREIGN KEY (connection_key) REFERENCES connections (connection_key)
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tls_connections_conn 
+            ON tls_connections(connection_key)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tls_connections_ja3 
+            ON tls_connections(ja3_fingerprint)
+        """)
+        
+        # Application protocols table (new)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS app_protocols (
+                connection_key TEXT PRIMARY KEY,
+                app_protocol TEXT,
+                protocol_details TEXT,
+                detection_method TEXT,
+                timestamp REAL,
+                FOREIGN KEY (connection_key) REFERENCES connections (connection_key)
             )
         """)
     
@@ -231,7 +319,7 @@ class DatabaseManager:
                 
                 for row in sync_capture_cursor.fetchall():
                     sync_analysis_cursor.execute(
-                        "INSERT OR REPLACE INTO connections VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT OR REPLACE INTO connections VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         row
                     )
                     sync_count += 1
@@ -299,6 +387,78 @@ class DatabaseManager:
                         "INSERT OR REPLACE INTO icmp_packets VALUES (?, ?, ?, ?)",
                         row
                     )
+                    sync_count += 1
+                    
+                # Sync HTTP requests (new)
+                last_http_timestamp = sync_analysis_cursor.execute(
+                    "SELECT MAX(timestamp) FROM http_requests"
+                ).fetchone()[0] or 0
+                
+                sync_capture_cursor.execute(
+                    "SELECT * FROM http_requests WHERE timestamp > ?",
+                    (last_http_timestamp,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO http_requests VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                
+                # Sync HTTP responses (new)
+                last_http_resp_timestamp = sync_analysis_cursor.execute(
+                    "SELECT MAX(timestamp) FROM http_responses"
+                ).fetchone()[0] or 0
+                
+                sync_capture_cursor.execute(
+                    "SELECT * FROM http_responses WHERE timestamp > ?",
+                    (last_http_resp_timestamp,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO http_responses VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                
+                # Sync TLS connections (new)
+                last_tls_timestamp = sync_analysis_cursor.execute(
+                    "SELECT MAX(timestamp) FROM tls_connections"
+                ).fetchone()[0] or 0
+                
+                sync_capture_cursor.execute(
+                    "SELECT * FROM tls_connections WHERE timestamp > ?",
+                    (last_tls_timestamp,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO tls_connections VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                
+                # Sync App protocols (new)
+                last_app_timestamp = sync_analysis_cursor.execute(
+                    "SELECT MAX(timestamp) FROM app_protocols"
+                ).fetchone()[0] or 0
+                
+                sync_capture_cursor.execute(
+                    "SELECT * FROM app_protocols WHERE timestamp > ?",
+                    (last_app_timestamp,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO app_protocols VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
                     sync_count += 1
                 
                 # Commit the transaction
@@ -441,6 +601,366 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error adding alert: {e}")
             return False
+        
+    def add_http_request(self, connection_key, method, host, uri, version, user_agent, referer, content_type, headers_json, request_size):
+        """Store HTTP request information"""
+        try:
+            current_time = time.time()
+            self.capture_cursor.execute("""
+                INSERT INTO http_requests
+                (connection_key, timestamp, method, host, uri, version, user_agent, referer, content_type, request_headers, request_size)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (connection_key, current_time, method, host, uri, version, user_agent, referer, content_type, headers_json, request_size))
+            
+            # Get the ID of the inserted request
+            request_id = self.capture_cursor.lastrowid
+            return request_id
+        except Exception as e:
+            logger.error(f"Error storing HTTP request: {e}")
+            return None
+
+    def add_http_response(self, http_request_id, status_code, content_type, content_length, server, headers_json):
+        """Store HTTP response information"""
+        try:
+            current_time = time.time()
+            self.capture_cursor.execute("""
+                INSERT INTO http_responses
+                (http_request_id, status_code, content_type, content_length, server, response_headers, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (http_request_id, status_code, content_type, content_length, server, headers_json, current_time))
+            return True
+        except Exception as e:
+            logger.error(f"Error storing HTTP response: {e}")
+            return False
+
+    def add_tls_connection(self, connection_key, tls_version, cipher_suite, server_name, ja3_fingerprint, 
+                        ja3s_fingerprint, cert_issuer, cert_subject, cert_valid_from, cert_valid_to, cert_serial):
+        """Store TLS connection information"""
+        try:
+            current_time = time.time()
+            self.capture_cursor.execute("""
+                INSERT OR REPLACE INTO tls_connections
+                (connection_key, timestamp, tls_version, cipher_suite, server_name, ja3_fingerprint, 
+                ja3s_fingerprint, certificate_issuer, certificate_subject, certificate_validity_start, 
+                certificate_validity_end, certificate_serial)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (connection_key, current_time, tls_version, cipher_suite, server_name, ja3_fingerprint, 
+                ja3s_fingerprint, cert_issuer, cert_subject, cert_valid_from, cert_valid_to, cert_serial))
+            return True
+        except Exception as e:
+            logger.error(f"Error storing TLS connection: {e}")
+            return False
+
+    def add_app_protocol(self, connection_key, app_protocol, protocol_details=None, detection_method=None):
+        """Store application protocol information"""
+        try:
+            current_time = time.time()
+            self.capture_cursor.execute("""
+                INSERT OR REPLACE INTO app_protocols
+                (connection_key, app_protocol, protocol_details, detection_method, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (connection_key, app_protocol, protocol_details, detection_method, current_time))
+            
+            # Also update the connection record with the protocol
+            self.capture_cursor.execute("""
+                UPDATE connections
+                SET protocol = ?
+                WHERE connection_key = ?
+            """, (app_protocol, connection_key))
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error storing application protocol: {e}")
+            return False
+
+    def sync_databases(self):
+        """Synchronize data from capture DB to analysis DB"""
+        try:
+            with self.sync_lock:
+                current_time = time.time()
+                logger.info("Starting database synchronization")
+                sync_count = 0
+                
+                # Create dedicated cursors for synchronization
+                sync_capture_cursor = self.capture_conn.cursor()
+                sync_analysis_cursor = self.analysis_conn.cursor()
+                
+                # Begin transaction on analysis DB
+                self.analysis_conn.execute("BEGIN TRANSACTION")
+                
+                # Sync connections table
+                last_timestamp = sync_analysis_cursor.execute(
+                    "SELECT MAX(timestamp) FROM connections"
+                ).fetchone()[0] or '1970-01-01'
+                
+                # Get new connections from capture DB
+                sync_capture_cursor.execute(
+                    "SELECT * FROM connections WHERE timestamp > datetime(?)", 
+                    (last_timestamp,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO connections VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                
+                # Sync alerts table
+                last_alert_timestamp = sync_analysis_cursor.execute(
+                    "SELECT MAX(timestamp) FROM alerts"
+                ).fetchone()[0] or '1970-01-01'
+                
+                sync_capture_cursor.execute(
+                    "SELECT * FROM alerts WHERE timestamp > datetime(?)",
+                    (last_alert_timestamp,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO alerts VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                
+                # Sync port_scan_timestamps table
+                sync_capture_cursor.execute("SELECT * FROM port_scan_timestamps")
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO port_scan_timestamps VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                
+                # Sync dns_queries table (last 24 hours only)
+                day_ago = time.time() - 86400
+                sync_capture_cursor.execute(
+                    "SELECT * FROM dns_queries WHERE timestamp > ?",
+                    (day_ago,)
+                )
+                
+                # Clear old DNS queries from analysis DB
+                sync_analysis_cursor.execute(
+                    "DELETE FROM dns_queries WHERE timestamp < ?",
+                    (day_ago,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO dns_queries VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                
+                # Sync icmp_packets table (last 24 hours only)
+                sync_capture_cursor.execute(
+                    "SELECT * FROM icmp_packets WHERE timestamp > ?",
+                    (day_ago,)
+                )
+                
+                # Clear old ICMP packets from analysis DB
+                sync_analysis_cursor.execute(
+                    "DELETE FROM icmp_packets WHERE timestamp < ?",
+                    (day_ago,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO icmp_packets VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                    
+                # Sync HTTP requests (new)
+                last_http_timestamp = sync_analysis_cursor.execute(
+                    "SELECT MAX(timestamp) FROM http_requests"
+                ).fetchone()[0] or 0
+                
+                sync_capture_cursor.execute(
+                    "SELECT * FROM http_requests WHERE timestamp > ?",
+                    (last_http_timestamp,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO http_requests VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                
+                # Sync HTTP responses (new)
+                last_http_resp_timestamp = sync_analysis_cursor.execute(
+                    "SELECT MAX(timestamp) FROM http_responses"
+                ).fetchone()[0] or 0
+                
+                sync_capture_cursor.execute(
+                    "SELECT * FROM http_responses WHERE timestamp > ?",
+                    (last_http_resp_timestamp,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO http_responses VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                
+                # Sync TLS connections (new)
+                last_tls_timestamp = sync_analysis_cursor.execute(
+                    "SELECT MAX(timestamp) FROM tls_connections"
+                ).fetchone()[0] or 0
+                
+                sync_capture_cursor.execute(
+                    "SELECT * FROM tls_connections WHERE timestamp > ?",
+                    (last_tls_timestamp,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO tls_connections VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                
+                # Sync App protocols (new)
+                last_app_timestamp = sync_analysis_cursor.execute(
+                    "SELECT MAX(timestamp) FROM app_protocols"
+                ).fetchone()[0] or 0
+                
+                sync_capture_cursor.execute(
+                    "SELECT * FROM app_protocols WHERE timestamp > ?",
+                    (last_app_timestamp,)
+                )
+                
+                for row in sync_capture_cursor.fetchall():
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO app_protocols VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
+                    sync_count += 1
+                
+                # Commit the transaction
+                self.analysis_conn.commit()
+                self.last_sync_time = current_time
+                
+                # Close the sync-specific cursors
+                sync_capture_cursor.close()
+                sync_analysis_cursor.close()
+                
+                logger.info(f"Synchronized {sync_count} records between databases")
+                return sync_count
+                    
+        except Exception as e:
+            # Rollback on error
+            try:
+                self.analysis_conn.rollback()
+            except:
+                pass
+            logger.error(f"Database sync error: {e}")
+            return 0
+
+    # Query methods for HTTP and TLS data
+    def get_http_requests_by_host(self, host_filter=None, limit=100):
+        """Get HTTP requests filtered by host pattern"""
+        try:
+            cursor = self.analysis_conn.cursor()
+            
+            if host_filter:
+                filter_pattern = f"%{host_filter}%"
+                cursor.execute("""
+                    SELECT r.id, r.method, r.host, r.uri, r.user_agent, r.timestamp, 
+                        resp.status_code, resp.content_type
+                    FROM http_requests r
+                    LEFT JOIN http_responses resp ON r.id = resp.http_request_id
+                    WHERE r.host LIKE ?
+                    ORDER BY r.timestamp DESC
+                    LIMIT ?
+                """, (filter_pattern, limit))
+            else:
+                cursor.execute("""
+                    SELECT r.id, r.method, r.host, r.uri, r.user_agent, r.timestamp, 
+                        resp.status_code, resp.content_type
+                    FROM http_requests r
+                    LEFT JOIN http_responses resp ON r.id = resp.http_request_id
+                    ORDER BY r.timestamp DESC
+                    LIMIT ?
+                """, (limit,))
+            
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except Exception as e:
+            logger.error(f"Error retrieving HTTP requests: {e}")
+            return []
+
+    def get_tls_connections(self, filter_pattern=None, limit=100):
+        """Get TLS connections with optional filtering"""
+        try:
+            cursor = self.analysis_conn.cursor()
+            
+            if filter_pattern:
+                pattern = f"%{filter_pattern}%"
+                cursor.execute("""
+                    SELECT t.server_name, t.tls_version, t.cipher_suite, t.ja3_fingerprint,
+                        c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp
+                    FROM tls_connections t
+                    JOIN connections c ON t.connection_key = c.connection_key
+                    WHERE t.server_name LIKE ? OR t.ja3_fingerprint LIKE ?
+                    ORDER BY t.timestamp DESC
+                    LIMIT ?
+                """, (pattern, pattern, limit))
+            else:
+                cursor.execute("""
+                    SELECT t.server_name, t.tls_version, t.cipher_suite, t.ja3_fingerprint,
+                        c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp
+                    FROM tls_connections t
+                    JOIN connections c ON t.connection_key = c.connection_key
+                    ORDER BY t.timestamp DESC
+                    LIMIT ?
+                """, (limit,))
+            
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except Exception as e:
+            logger.error(f"Error retrieving TLS connections: {e}")
+            return []
+
+    def get_suspicious_tls_connections(self):
+        """Get potentially suspicious TLS connections based on version and cipher suite"""
+        try:
+            cursor = self.analysis_conn.cursor()
+            
+            # Query for old TLS versions and weak ciphers
+            cursor.execute("""
+                SELECT t.server_name, t.tls_version, t.cipher_suite, t.ja3_fingerprint,
+                    c.src_ip, c.dst_ip, t.timestamp
+                FROM tls_connections t
+                JOIN connections c ON t.connection_key = c.connection_key
+                WHERE t.tls_version IN ('SSLv3', 'TLSv1.0', 'TLSv1.1')
+                OR t.cipher_suite LIKE '%NULL%'
+                OR t.cipher_suite LIKE '%EXPORT%'
+                OR t.cipher_suite LIKE '%DES%'
+                OR t.cipher_suite LIKE '%RC4%'
+                OR t.cipher_suite LIKE '%MD5%'
+                ORDER BY t.timestamp DESC
+            """)
+            
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except Exception as e:
+            logger.error(f"Error retrieving suspicious TLS connections: {e}")
+            return []
     
     def commit_capture(self):
         """Commit changes to the capture database"""
