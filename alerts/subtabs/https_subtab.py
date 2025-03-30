@@ -237,19 +237,19 @@ class HttpTlsMonitor(SubtabBase):
         # Add to tree
         for req in http_requests:
             req_id = req[0]
-            method = req[1]
-            host = req[2]
-            uri = req[3]
+            method = req[1] if req[1] else "GET"  # Default to GET if method is None
+            host = req[2] if req[2] else "Unknown"
+            uri = req[3] if req[3] else "/"       # Default to / if URI is None
             user_agent = req[4]
             timestamp = req[5]
-            status_code = req[6] if req[6] else "N/A"
+            status_code = req[6] if req[6] is not None else "N/A"
             content_type = req[7] if req[7] else "N/A"
             
             # Format the timestamp
             if isinstance(timestamp, float):
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
             
-            # Add to tree
+            # Add to tree - ensure column order matches tree definition
             self.http_tree.insert("", "end", values=(method, host, uri, status_code, content_type, timestamp), tags=(str(req_id),))
         
         self.update_output(f"Loaded {len(http_requests)} HTTP requests")

@@ -625,13 +625,49 @@ class TrafficCaptureEngine:
                 # Process HTTP response
                 return self._process_http_response(http_layer, connection_key)
                 
+            # This is an HTTP packet but not a complete request or response
+            # Could be a continuation packet or other HTTP data
+            # Attempt to extract any useful information
+            host = http_layer.get("http.host")
+            path = http_layer.get("http.request.uri")
+            method = http_layer.get("http.request.method")
+            
+            if host or path or method:
+                # This is likely part of a request
+                headers = {}
+                
+                # Extract available HTTP headers
+                for key, value in http_layer.items():
+                    if key.startswith("http.") and not key.startswith("http.response"):
+                        header_name = key[5:].replace("_", "-").title()
+                        headers[header_name] = value
+                
+                # Convert headers to JSON
+                headers_json = json.dumps(headers)
+                
+                # If we have at least some request information, store it
+                if host or path or method:
+                    self.db_manager.add_http_request(
+                        connection_key, 
+                        method or "UNKNOWN", 
+                        host or "unknown", 
+                        path or "/", 
+                        "HTTP/1.1", # Assume HTTP/1.1 if not specified
+                        http_layer.get("http.user_agent", ""),
+                        http_layer.get("http.referer", ""),
+                        http_layer.get("http.content_type", ""),
+                        headers_json, 
+                        0  # Unknown request size
+                    )
+                    return True
+                
             return False
         except Exception as e:
             self.gui.update_output(f"Error processing HTTP packet: {e}")
             return False
 
     def _process_http_request(self, http_layer, connection_key):
-        """Process HTTP request data"""
+        """Process HTTP request data with improved header extraction"""
         try:
             # Extract request details
             method = http_layer.get("http.request.method", "")
@@ -648,7 +684,7 @@ class TrafficCaptureEngine:
             
             # Loop through all keys to find headers
             for key, value in http_layer.items():
-                if key.startswith("http.request.line"):
+                if key == "http.request.line" or key == "http.response.line":
                     continue
                     
                 # Extract specific important headers
@@ -670,6 +706,12 @@ class TrafficCaptureEngine:
                         headers["Content-Length"] = value
                     except (ValueError, TypeError):
                         pass
+                elif key.startswith("http.") and ":" in key:
+                    # Handle explicitly formatted headers (http.header_name: value)
+                    header_parts = key.split(":", 1)
+                    if len(header_parts) == 2:
+                        header_name = header_parts[0][5:].replace("_", "-").title()
+                        headers[header_name] = value
                 elif key.startswith("http.") and not key.startswith("http.response"):
                     # Convert http.header_name to Header-Name format
                     header_name = key[5:].replace("_", "-").title()
@@ -678,11 +720,19 @@ class TrafficCaptureEngine:
             # Convert headers to JSON
             headers_json = json.dumps(headers)
             
+            # If host is missing but present in the headers, extract it
+            if not host and "Host" in headers:
+                host = headers["Host"]
+            
             # Store in database
             request_id = self.db_manager.add_http_request(
                 connection_key, method, host, uri, version, 
                 user_agent, referer, content_type, headers_json, request_size
             )
+            
+            # Log a small percentage of HTTP requests for monitoring
+            if random.random() < 0.05:  # Log roughly 5% of requests
+                self.gui.update_output(f"HTTP: {method} {host}{uri}")
             
             return request_id is not None
         except Exception as e:

@@ -4,6 +4,7 @@ import time
 import threading
 import logging
 import queue
+import json
 
 # Configure logging
 logger = logging.getLogger('database_manager')
@@ -79,7 +80,7 @@ class DatabaseManager:
         logger.info("Analysis database initialized for read operations")
     
     def _create_tables(self, cursor):
-        """Create required tables in the database (with added HTTP/TLS support)"""
+        """Create required tables in the database (with HTTP headers support)"""
         # Original tables remain the same
         # Connections table
         cursor.execute("""
@@ -161,7 +162,7 @@ class DatabaseManager:
             )
         """)
         
-        # HTTP requests table (new)
+        # HTTP requests table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS http_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,7 +191,37 @@ class DatabaseManager:
             ON http_requests(host)
         """)
         
-        # HTTP responses table (new)
+        # HTTP headers table (NEW) - explicit table for headers for easier querying
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS http_headers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                connection_key TEXT,
+                request_id INTEGER,
+                header_name TEXT,
+                header_value TEXT,
+                is_request BOOLEAN,
+                timestamp REAL,
+                FOREIGN KEY (connection_key) REFERENCES connections (connection_key),
+                FOREIGN KEY (request_id) REFERENCES http_requests (id)
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_headers_conn 
+            ON http_headers(connection_key)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_headers_req 
+            ON http_headers(request_id)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_headers_name 
+            ON http_headers(header_name)
+        """)
+        
+        # HTTP responses table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS http_responses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -205,7 +236,7 @@ class DatabaseManager:
             )
         """)
         
-        # TLS connection information (new)
+        # TLS connection information
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tls_connections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -235,7 +266,7 @@ class DatabaseManager:
             ON tls_connections(ja3_fingerprint)
         """)
         
-        # Application protocols table (new)
+        # Application protocols table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS app_protocols (
                 connection_key TEXT PRIMARY KEY,
@@ -246,6 +277,34 @@ class DatabaseManager:
                 FOREIGN KEY (connection_key) REFERENCES connections (connection_key)
             )
         """)
+
+    def add_http_headers(self, request_id, connection_key, headers_json, is_request=True):
+        """
+        Parses headers JSON and adds individual headers to the http_headers table
+        """
+        try:
+            current_time = time.time()
+            if not headers_json:
+                return True
+                
+            # Parse JSON headers
+            try:
+                headers = json.loads(headers_json)
+            except json.JSONDecodeError:
+                return False
+                
+            # Add each header to the headers table
+            for name, value in headers.items():
+                self.capture_cursor.execute("""
+                    INSERT INTO http_headers
+                    (connection_key, request_id, header_name, header_value, is_request, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (connection_key, request_id, name, value, is_request, current_time))
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error adding HTTP headers: {e}")
+            return False
     
     def _sync_thread(self):
         """Thread that periodically synchronizes databases"""
@@ -614,6 +673,11 @@ class DatabaseManager:
             
             # Get the ID of the inserted request
             request_id = self.capture_cursor.lastrowid
+            
+            # Add headers to the headers table
+            if headers_json:
+                self.add_http_headers(request_id, connection_key, headers_json, is_request=True)
+                
             return request_id
         except Exception as e:
             logger.error(f"Error storing HTTP request: {e}")
