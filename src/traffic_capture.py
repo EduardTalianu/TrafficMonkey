@@ -123,36 +123,31 @@ class TrafficCaptureEngine:
             self.capture_thread = None
     
     def capture_packets(self, interface):
-        """Capture packets with streaming JSON parser and enhanced TLS output"""
+        """Capture packets with streaming JSON parser"""
         try:
             self.gui.update_output(f"Capturing on interface: {interface}")
             
-            # Construct enhanced tshark command with JSON output and better TLS tracking
+            # Construct tshark command with JSON output
             cmd = [
-                "tshark",
-                "-i", interface,
-                "-T", "json",
-                # Include TLS handshake fields explicitly
-                "-o", "tls.desegment_ssl_records: TRUE",
-                "-o", "tls.desegment_ssl_application_data: TRUE",
-                # Include these protocols
-                "-f", "tcp or udp or icmp",  # Capture all TCP, UDP, and ICMP traffic
-                # More specific protocol filter
-                "-Y", "http or tls or ssl or http2 or dns or icmp",
-                # Line-buffered output
-                "-l"
-            ]
+                    "tshark",
+                    "-i", interface,
+                    "-T", "json",
+                    "-f", "tcp or udp or icmp",  # Capture all TCP, UDP, and ICMP traffic
+                    "-Y", "http or tls or ssl or http2 or dns or icmp",  # Filter by protocol, not port
+                    "-l"  # Line-buffered output
+                ]
             
             self.gui.update_output(f"Running command: {' '.join(cmd)}")
             
-            # Start tshark process - use binary mode
+            # Start tshark process - use binary mode instead of text mode
             self.tshark_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                stderr=subprocess.PIPE,
+                #bufsize=1  # Line buffered
+                # Remove text=True parameter
             )
             
-            # Rest of the method remains the same
             buffer = ""  # Buffer to accumulate JSON output
             last_buffer_log_time = time.time()
             
@@ -817,53 +812,32 @@ class TrafficCaptureEngine:
             return False
 
     def _process_tls_packet(self, layers, src_ip, dst_ip, src_port, dst_port):
-        """Extract and store TLS/SSL packet information with comprehensive field detection"""
+        """Extract and store TLS/SSL packet information with deep packet inspection"""
         try:
+            # Check for any TLS/SSL layer
+            tls_layer = None
+            if "tls" in layers and isinstance(layers["tls"], dict):
+                tls_layer = layers["tls"]
+            elif "ssl" in layers and isinstance(layers["ssl"], dict):
+                tls_layer = layers["ssl"]
+                
+            if not tls_layer:
+                return False
+            
             # Create connection key
             connection_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
             
-            # Step 1: Check for TLS in any form across multiple possible layers
-            tls_layer = None
-            tls_info = {}
-            
-            # Direct TLS/SSL layer detection
-            if "tls" in layers and isinstance(layers["tls"], dict):
-                tls_layer = layers["tls"]
-                self.gui.update_output(f"Found direct TLS layer: {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
-            elif "ssl" in layers and isinstance(layers["ssl"], dict):
-                tls_layer = layers["ssl"]
-                self.gui.update_output(f"Found direct SSL layer: {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
-                
-            # TLS data might be nested in TCP or other layers - do a deep scan of all layers
-            all_fields = self._extract_all_fields(layers)
-            
-            # Record all TLS-related fields from any layer
-            for field_name, value in all_fields.items():
-                if any(tls_hint in field_name.lower() for tls_hint in ['tls.', 'ssl.', 'x509']):
-                    tls_info[field_name] = value
-                    
-            if tls_info and not tls_layer:
-                self.gui.update_output(f"Found TLS data in non-TLS layer: {len(tls_info)} fields")
-                # Create a synthetic TLS layer from the fields
-                tls_layer = tls_info
-                
-            # If we still don't have TLS data, check for common TLS ports
-            if not tls_layer and not tls_info:
-                if dst_port in [443, 8443] or src_port in [443, 8443]:
-                    self.gui.update_output(f"Inferring TLS from port {dst_port}")
-                    # Create an empty TLS layer to track this as TLS traffic
-                    tls_layer = {"inferred_from_port": True}
-                else:
-                    # Not TLS traffic
-                    return False
-                    
             # Log detection of TLS traffic
-            self.gui.update_output(f"Processing TLS: {src_ip}:{src_port} -> {dst_ip}:{dst_port} ({len(tls_info)} fields)")
+            self.gui.update_output(f"Detected TLS traffic: {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
+            
+            # Dump all TLS layer keys for debugging
+            tls_keys = list(tls_layer.keys())
+            self.gui.update_output(f"TLS layer contains {len(tls_keys)} fields: {', '.join(tls_keys[:5])}...")
             
             # Record application protocol
             self.db_manager.add_app_protocol(connection_key, "TLS/SSL", detection_method="direct")
             
-            # Step 2: Extract TLS details with multiple detection patterns
+            # Extract TLS details with deep inspection
             tls_version = None
             cipher_suite = None
             server_name = None
@@ -877,111 +851,137 @@ class TrafficCaptureEngine:
             cert_valid_to = None
             cert_serial = None
             
-            # Look for TLS version across different possible field names
-            version_field_patterns = [
-                'tls.record.version', 'ssl.record.version',
-                'tls.handshake.version', 'ssl.handshake.version',
-                'tls.version', 'ssl.version'
-            ]
+            # IMPROVED: Check ALL possible fields for TLS version - TShark's output varies
+            for key in tls_layer.keys():
+                # TLS Version - check various field patterns
+                if any(key.endswith(suffix) for suffix in ['.version', '.record.version', '.handshake.version']):
+                    version_raw = tls_layer[key]
+                    # Map numerical versions to human-readable form
+                    version_map = {
+                        "0x0300": "SSLv3",
+                        "0x0301": "TLSv1.0",
+                        "0x0302": "TLSv1.1",
+                        "0x0303": "TLSv1.2",
+                        "0x0304": "TLSv1.3"
+                    }
+                    tls_version = version_map.get(version_raw, version_raw)
+                    self.gui.update_output(f"Found TLS version: {tls_version} from field {key}")
+                
+                # Cipher Suite - check various field patterns
+                if any(pattern in key for pattern in ['cipher', 'ciphersuite']):
+                    cipher_suite = tls_layer[key]
+                    self.gui.update_output(f"Found cipher suite: {cipher_suite} from field {key}")
+                
+                # Server Name Indication (SNI)
+                if any(pattern in key for pattern in ['server_name', 'servername', 'sni']):
+                    server_name = tls_layer[key]
+                    self.gui.update_output(f"Found SNI: {server_name} from field {key}")
+                
+                # Certificate fields
+                if 'certificate' in key or 'cert' in key:
+                    # Look for specific certificate details in this key and all keys
+                    for cert_key, value in tls_layer.items():
+                        # Issuer name
+                        if any(pattern in cert_key for pattern in ['issuer', 'issuer_name']):
+                            cert_issuer = value
+                        # Subject name
+                        elif any(pattern in cert_key for pattern in ['subject', 'subject_name']):
+                            cert_subject = value
+                        # Validity period
+                        elif any(pattern in cert_key for pattern in ['not_before', 'validity.not_before']):
+                            cert_valid_from = value
+                        elif any(pattern in cert_key for pattern in ['not_after', 'validity.not_after']):
+                            cert_valid_to = value
+                        # Serial number
+                        elif any(pattern in cert_key for pattern in ['serial', 'serialnumber']):
+                            cert_serial = value
             
-            # Version mapping
-            version_map = {
-                "0x0300": "SSLv3",
-                "0x0301": "TLSv1.0",
-                "0x0302": "TLSv1.1",
-                "0x0303": "TLSv1.2",
-                "0x0304": "TLSv1.3"
-            }
-            
-            # First check exact field matches
-            for pattern in version_field_patterns:
-                for field, value in all_fields.items():
-                    if field == pattern:
-                        version_raw = value
-                        tls_version = version_map.get(version_raw, version_raw)
-                        self.gui.update_output(f"Found TLS version from exact match: {tls_version}")
-                        break
-                if tls_version:
-                    break
-                    
-            # If exact match failed, try partial field matches
-            if not tls_version:
-                for field, value in all_fields.items():
-                    if any(pattern in field for pattern in ['tls.record.version', 'ssl.record.version', 'handshake.version']):
-                        version_raw = value
-                        tls_version = version_map.get(version_raw, version_raw)
-                        self.gui.update_output(f"Found TLS version from partial match: {tls_version}")
-                        break
-            
-            # Look for cipher suite across different possible field names
-            cipher_field_patterns = [
-                'tls.handshake.ciphersuite', 'ssl.handshake.ciphersuite',
-                'tls.handshake.cipher_suites', 'ssl.handshake.cipher_suites'
-            ]
-            
-            # First check exact field matches
-            for pattern in cipher_field_patterns:
-                for field, value in all_fields.items():
-                    if field == pattern:
-                        cipher_suite = value
-                        self.gui.update_output(f"Found cipher suite from exact match: {cipher_suite}")
-                        break
-                if cipher_suite:
-                    break
-                    
-            # If exact match failed, try partial field matches
-            if not cipher_suite:
-                for field, value in all_fields.items():
-                    if any(pattern in field.lower() for pattern in ['cipher', 'ciphersuite']):
-                        cipher_suite = value
-                        self.gui.update_output(f"Found cipher suite from partial match: {cipher_suite}")
-                        break
-            
-            # Look for server name indication (SNI)
-            sni_field_patterns = [
-                'tls.handshake.extensions_server_name', 'ssl.handshake.extensions_server_name',
-                'tls.handshake.extensions.server_name', 'ssl.handshake.extensions.server_name'
-            ]
-            
-            # First check exact field matches
-            for pattern in sni_field_patterns:
-                for field, value in all_fields.items():
-                    if field == pattern:
-                        server_name = value
-                        self.gui.update_output(f"Found SNI from exact match: {server_name}")
-                        break
-                if server_name:
-                    break
-                    
-            # If exact match failed, try partial field matches
-            if not server_name:
-                for field, value in all_fields.items():
-                    if 'server_name' in field.lower():
-                        server_name = value
-                        self.gui.update_output(f"Found SNI from partial match: {server_name}")
-                        break
-            
-            # Check for certificate information across various possible field names
-            for field, value in all_fields.items():
-                if 'issuer' in field.lower():
-                    cert_issuer = value
-                elif 'subject' in field.lower() and 'subject_key' not in field.lower():
-                    cert_subject = value
-                elif any(validity in field.lower() for validity in ['not_before', 'validity.not.before']):
-                    cert_valid_from = value
-                elif any(validity in field.lower() for validity in ['not_after', 'validity.not.after']):
-                    cert_valid_to = value
-                elif 'serial' in field.lower():
-                    cert_serial = value
-            
-            # Extract from HTTP Host header if SNI is missing
+            # IMPROVED: Extract server name from HTTP Host header if SNI is missing
             if not server_name and "http" in layers and isinstance(layers["http"], dict):
                 http_layer = layers["http"]
                 if "http.host" in http_layer:
                     server_name = http_layer["http.host"]
                     self.gui.update_output(f"Using HTTP host as server name: {server_name}")
             
-            # Extract domain from certificate if SNI is missing
+            # IMPROVED: For Client Hello, extract more details
+            handshake_type = None
+            for key in tls_layer.keys():
+                if key.endswith('.handshake.type'):
+                    handshake_type = tls_layer[key]
+                    break
+                    
+            if handshake_type == "1":  # ClientHello
+                self.gui.update_output("Processing ClientHello")
+                # Extract more ClientHello details
+                client_hello_data = {}
+                
+                for key in tls_layer.keys():
+                    # Extract cipher suites list
+                    if 'ciphersuites' in key and isinstance(tls_layer[key], list):
+                        client_hello_data['cipher_suites'] = tls_layer[key]
+                    # Extract extensions
+                    elif 'extension' in key:
+                        extension_key = key.split('.')[-1]
+                        client_hello_data[f'extension_{extension_key}'] = tls_layer[key]
+                
+                # Create a JA3 fingerprint using available data
+                if tls_version or client_hello_data:
+                    import hashlib
+                    ja3_components = []
+                    
+                    # Add TLS version if available
+                    if tls_version:
+                        ja3_components.append(tls_version)
+                    
+                    # Add cipher suites if available
+                    if 'cipher_suites' in client_hello_data:
+                        ja3_components.append(','.join(client_hello_data['cipher_suites']))
+                    
+                    # Add extensions if available
+                    extensions = [v for k, v in client_hello_data.items() if k.startswith('extension_')]
+                    if extensions:
+                        ja3_components.append(','.join(extensions))
+                    
+                    # Generate fingerprint
+                    if ja3_components:
+                        fingerprint_input = '-'.join(ja3_components)
+                        ja3_fingerprint = hashlib.md5(fingerprint_input.encode()).hexdigest()
+                        self.gui.update_output(f"Generated JA3 fingerprint: {ja3_fingerprint}")
+            
+            # IMPROVED: For Server Hello, extract more details
+            elif handshake_type == "2":  # ServerHello
+                self.gui.update_output("Processing ServerHello")
+                # Similar to ClientHello but for server response
+                server_hello_data = {}
+                
+                for key in tls_layer.keys():
+                    if 'selected_cipher' in key or 'ciphersuite' in key:
+                        server_hello_data['cipher_suite'] = tls_layer[key]
+                    elif 'extension' in key:
+                        extension_key = key.split('.')[-1]
+                        server_hello_data[f'extension_{extension_key}'] = tls_layer[key]
+                
+                # Create a JA3S fingerprint
+                if tls_version or server_hello_data:
+                    import hashlib
+                    ja3s_components = []
+                    
+                    if tls_version:
+                        ja3s_components.append(tls_version)
+                    
+                    if 'cipher_suite' in server_hello_data:
+                        ja3s_components.append(server_hello_data['cipher_suite'])
+                    
+                    extensions = [v for k, v in server_hello_data.items() if k.startswith('extension_')]
+                    if extensions:
+                        ja3s_components.append(','.join(extensions))
+                    
+                    if ja3s_components:
+                        fingerprint_input = '-'.join(ja3s_components)
+                        ja3s_fingerprint = hashlib.md5(fingerprint_input.encode()).hexdigest()
+                        self.gui.update_output(f"Generated JA3S fingerprint: {ja3s_fingerprint}")
+            
+            # IMPROVED: Extract domain from certificate if SNI is missing
             if not server_name and cert_subject:
                 # Look for CN=domain.com in the subject
                 import re
@@ -989,60 +989,42 @@ class TrafficCaptureEngine:
                 if cn_match:
                     server_name = cn_match.group(1)
                     self.gui.update_output(f"Extracted server name from certificate: {server_name}")
+                    
+            # IMPROVED: DNS resolution for IP addresses
+            if not server_name or server_name.replace('.', '').isdigit():
+                # If we only have an IP address, try to do a reverse DNS lookup
+                import socket
+                try:
+                    hostname, _, _ = socket.gethostbyaddr(dst_ip)
+                    if hostname and hostname != dst_ip:
+                        server_name = hostname
+                        self.gui.update_output(f"Resolved hostname via reverse DNS: {server_name}")
+                except (socket.herror, socket.gaierror):
+                    # If reverse lookup fails, keep the IP
+                    server_name = server_name or dst_ip
+                    self.gui.update_output(f"Using destination IP as server name: {server_name}")
             
-            # For TLS traffic on HTTPS port, consider the destination IP as server name
-            if not server_name and dst_port == 443:
-                server_name = dst_ip
-                self.gui.update_output(f"Using destination IP as server name: {server_name}")
-            
-            # Step 3: Special handling for TLS 1.3
-            # In TLS 1.3, fields may be in different places with different names
-            # Look specifically for TLS 1.3 indicators
-            for field, value in all_fields.items():
-                if field.endswith('.supported_versions') and value == "0x0304":
-                    tls_version = "TLSv1.3"
-                    self.gui.update_output("Detected TLS 1.3 from supported_versions field")
-                    break
-            
-            # Step 4: Fill in defaults for missing data
+            # IMPROVED: Fill in defaults for missing data
             if not tls_version:
-                # Check if client sent a list of supported versions
-                supported_versions = None
-                for field, value in all_fields.items():
-                    if field.endswith('.supported_versions'):
-                        supported_versions = value
-                        break
-                        
-                if supported_versions:
-                    # Parse the supported versions
-                    if isinstance(supported_versions, list):
-                        # Get highest version
-                        highest_version = None
-                        for version in supported_versions:
-                            if version in version_map:
-                                if highest_version is None or version > highest_version:
-                                    highest_version = version
-                        if highest_version:
-                            tls_version = version_map.get(highest_version)
-                            self.gui.update_output(f"Using highest supported version: {tls_version}")
-                
-                # If still no version and this is port 443, assume TLS 1.2
-                if not tls_version and dst_port == 443:
+                # If this is port 443, assume TLS 1.2 if we can't detect it
+                if dst_port == 443:
                     tls_version = "TLSv1.2 (assumed)"
                     self.gui.update_output("Assuming TLSv1.2 for HTTPS traffic")
                 else:
                     tls_version = "Unknown"
-            
-            # Step 5: Handle TLS 1.3 cipher suites differently (they're often in a different field)
-            if tls_version == "TLSv1.3" and not cipher_suite:
-                for field, value in all_fields.items():
-                    if field.endswith('.cipher_suites_tls13') or 'tls13' in field:
+                    
+            if not cipher_suite:
+                # Check if we have cipher info in other TLS fields
+                cipher_found = False
+                for key, value in tls_layer.items():
+                    if 'cipher' in key.lower() and isinstance(value, str):
                         cipher_suite = value
-                        self.gui.update_output(f"Found TLS 1.3 cipher suite: {cipher_suite}")
+                        cipher_found = True
+                        self.gui.update_output(f"Found cipher from field {key}: {value}")
                         break
                         
-            if not cipher_suite:
-                cipher_suite = "Unknown"
+                if not cipher_found:
+                    cipher_suite = "Unknown"
             
             # Store in database with whatever information we have
             success = self.db_manager.add_tls_connection(
@@ -1053,38 +1035,22 @@ class TrafficCaptureEngine:
             
             if success:
                 self.gui.update_output(f"Stored TLS connection: {server_name} ({tls_version})")
-                return True
+                # Trigger a refresh of the TLS tab if it's currently visible
+                if hasattr(self.gui, 'subtabs') and self.gui.subtabs:
+                    for subtab in self.gui.subtabs:
+                        if hasattr(subtab, 'name') and subtab.name == "HTTP/TLS Monitor":
+                            self.gui.master.after(5000, subtab.refresh_tls_connections)
+                            break
             else:
                 self.gui.update_output(f"Failed to store TLS connection for {connection_key}")
-                return False
+                
+            return success
             
         except Exception as e:
             self.gui.update_output(f"Error processing TLS packet: {e}")
             import traceback
             traceback.print_exc()
             return False
-        
-    def _extract_all_fields(self, layers):
-        """Extract all fields from all layers recursively, with flattened keys for easier searching"""
-        all_fields = {}
-        
-        def extract_fields(obj, prefix=""):
-            if isinstance(obj, dict):
-                for key, value in obj.items():
-                    full_key = f"{prefix}{key}" if prefix else key
-                    if isinstance(value, (dict, list)):
-                        extract_fields(value, f"{full_key}.")
-                    else:
-                        all_fields[full_key] = value
-            elif isinstance(obj, list):
-                for i, item in enumerate(obj):
-                    extract_fields(item, f"{prefix}{i}.")
-        
-        # Extract from all layers
-        for layer_name, layer_data in layers.items():
-            extract_fields(layer_data, f"{layer_name}.")
-        
-        return all_fields
 
     def _detect_application_protocol(self, src_ip, dst_ip, src_port, dst_port, layers, is_tcp=True):
         """Detect application protocol based on port numbers and packet content"""

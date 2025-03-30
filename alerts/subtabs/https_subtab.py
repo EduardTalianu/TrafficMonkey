@@ -581,7 +581,7 @@ class HttpTlsMonitor(SubtabBase):
         self.add_security_assessment(tls_version, cipher_suite)
     
     def add_security_assessment(self, tls_version, cipher_suite):
-        """Add security assessment for TLS version and cipher suite with detailed analysis"""
+        """Add security assessment for TLS version and cipher suite with more detailed analysis"""
         self.tls_details_text.insert(tk.END, "\n--- Security Assessment ---\n")
         
         # Check TLS version
@@ -617,38 +617,72 @@ class HttpTlsMonitor(SubtabBase):
         
         self.tls_details_text.insert(tk.END, f"TLS Version: {version_status} - {version_message}\n\n")
         
-        # Get detailed cipher suite information
-        cipher_info = self._get_cipher_suite_info(cipher_suite)
+        # Check cipher suite
+        cipher_status = "Unknown"
+        cipher_message = "Could not determine cipher suite"
         
-        if isinstance(cipher_info, dict):
-            strength = cipher_info.get("strength", "Unknown")
-            description = cipher_info.get("description", cipher_suite)
-            components = cipher_info.get("components", [])
+        if cipher_suite and "Unknown" not in cipher_suite:
+            cipher_suite_lower = cipher_suite.lower()
             
-            self.tls_details_text.insert(tk.END, f"Cipher Suite: {strength} - {description}\n")
-            
-            if components:
-                self.tls_details_text.insert(tk.END, "Components:\n")
-                for component in components:
-                    self.tls_details_text.insert(tk.END, f"  - {component}\n")
-        else:
-            # Simple description
-            self.tls_details_text.insert(tk.END, f"Cipher Suite: Unknown - {cipher_suite}\n")
+            # Check for weak ciphers
+            if any(weak in cipher_suite_lower for weak in ["null", "export", "des", "rc4", "md5"]):
+                cipher_status = "Weak"
+                cipher_message = "This cipher suite is considered weak and should not be used:\n"
+                
+                if "null" in cipher_suite_lower:
+                    cipher_message += "  - NULL ciphers provide no encryption\n"
+                if "export" in cipher_suite_lower:
+                    cipher_message += "  - EXPORT grade ciphers use deliberately weakened encryption\n"
+                if "des" in cipher_suite_lower and "3des" not in cipher_suite_lower:
+                    cipher_message += "  - DES is vulnerable to brute force attacks\n"
+                if "rc4" in cipher_suite_lower:
+                    cipher_message += "  - RC4 has multiple cryptographic weaknesses\n"
+                if "md5" in cipher_suite_lower:
+                    cipher_message += "  - MD5 is cryptographically broken\n"
+                    
+            # Check for medium-strength ciphers
+            elif any(medium in cipher_suite_lower for medium in ["sha1", "cbc", "3des"]):
+                cipher_status = "Medium"
+                cipher_message = "This cipher suite provides moderate security but stronger options are available:\n"
+                
+                if "sha1" in cipher_suite_lower:
+                    cipher_message += "  - SHA1 is no longer considered collision-resistant\n"
+                if "cbc" in cipher_suite_lower:
+                    cipher_message += "  - CBC mode is vulnerable to padding oracle attacks if not implemented correctly\n"
+                if "3des" in cipher_suite_lower:
+                    cipher_message += "  - 3DES provides less than optimal performance and security margins\n"
+                    
+            # Check for strong ciphers
+            elif any(strong in cipher_suite_lower for strong in ["aes_256", "aes256", "chacha20", "poly1305", "gcm", "sha384", "sha256"]):
+                cipher_status = "Strong"
+                cipher_message = "This cipher suite provides strong security:\n"
+                
+                if any(aes in cipher_suite_lower for aes in ["aes_256", "aes256"]):
+                    cipher_message += "  - AES-256 provides a high security margin\n"
+                if "gcm" in cipher_suite_lower:
+                    cipher_message += "  - GCM mode provides authenticated encryption\n"
+                if any(chacha in cipher_suite_lower for chacha in ["chacha20", "chacha", "poly1305"]):
+                    cipher_message += "  - ChaCha20-Poly1305 is a strong modern AEAD cipher\n"
+                if "sha384" in cipher_suite_lower:
+                    cipher_message += "  - SHA-384 provides strong integrity protection\n"
+                elif "sha256" in cipher_suite_lower:
+                    cipher_message += "  - SHA-256 provides good integrity protection\n"
+            else:
+                cipher_status = "Unrecognized"
+                cipher_message = f"This cipher suite ({cipher_suite}) is not recognized in our security database.\nPlease consult current cryptographic standards for its security assessment."
+        
+        self.tls_details_text.insert(tk.END, f"Cipher Suite: {cipher_status} - {cipher_message}\n")
         
         # Overall assessment
         self.tls_details_text.insert(tk.END, "\nOverall Security Assessment: ")
         
-        cipher_strength = "Unknown"
-        if isinstance(cipher_info, dict):
-            cipher_strength = cipher_info.get("strength", "Unknown")
-        
-        if version_status == "Vulnerable" or cipher_strength == "Vulnerable":
+        if version_status == "Vulnerable" or cipher_status == "Weak":
             self.tls_details_text.insert(tk.END, "VULNERABLE - This connection has serious security issues.\n")
-        elif version_status == "Unknown" or cipher_strength == "Unknown":
+        elif version_status == "Unknown" or cipher_status == "Unknown" or cipher_status == "Unrecognized":
             self.tls_details_text.insert(tk.END, "UNCERTAIN - Some aspects of this connection could not be fully assessed.\n")
-        elif version_status == "Acceptable" and cipher_strength in ["Medium", "Strong"]:
+        elif version_status == "Acceptable" and cipher_status in ["Medium", "Strong"]:
             self.tls_details_text.insert(tk.END, "ACCEPTABLE - This connection uses adequate security but could be improved.\n")
-        elif version_status == "Good" and cipher_strength == "Strong":
+        elif version_status == "Good" and cipher_status == "Strong":
             self.tls_details_text.insert(tk.END, "STRONG - This connection uses recommended security settings.\n")
         else:
             self.tls_details_text.insert(tk.END, "MIXED - This connection has mixed security characteristics.\n")
@@ -698,163 +732,3 @@ class HttpTlsMonitor(SubtabBase):
         
         self.update_output("=== END OF REPORT ===")
         self.update_output(f"Exported {len(items)} suspicious TLS connections")
-
-    def _get_cipher_suite_info(self, cipher_suite):
-        """Get detailed information about a TLS cipher suite"""
-        if not cipher_suite or cipher_suite == "Unknown":
-            return "Unknown cipher suite"
-            
-        # Clean up the cipher suite string
-        cipher = cipher_suite.strip().upper()
-        
-        # Common cipher suite mappings
-        cipher_info = {
-            # Strong modern ciphers
-            "TLS_AES_256_GCM_SHA384": {
-                "strength": "Strong",
-                "description": "AES-256 in GCM mode with SHA-384 (TLS 1.3)",
-                "components": ["AES-256", "GCM", "SHA-384"]
-            },
-            "TLS_CHACHA20_POLY1305_SHA256": {
-                "strength": "Strong",
-                "description": "ChaCha20-Poly1305 with SHA-256 (TLS 1.3)",
-                "components": ["ChaCha20", "Poly1305", "SHA-256"]
-            },
-            "TLS_AES_128_GCM_SHA256": {
-                "strength": "Strong",
-                "description": "AES-128 in GCM mode with SHA-256 (TLS 1.3)",
-                "components": ["AES-128", "GCM", "SHA-256"]
-            },
-            
-            # Strong TLS 1.2 ciphers
-            "ECDHE-RSA-AES256-GCM-SHA384": {
-                "strength": "Strong",
-                "description": "ECDHE key exchange, RSA authentication, AES-256 in GCM mode, SHA-384 HMAC",
-                "components": ["ECDHE", "RSA", "AES-256", "GCM", "SHA-384"]
-            },
-            "ECDHE-ECDSA-AES256-GCM-SHA384": {
-                "strength": "Strong",
-                "description": "ECDHE key exchange, ECDSA authentication, AES-256 in GCM mode, SHA-384 HMAC",
-                "components": ["ECDHE", "ECDSA", "AES-256", "GCM", "SHA-384"]
-            },
-            "ECDHE-RSA-CHACHA20-POLY1305": {
-                "strength": "Strong",
-                "description": "ECDHE key exchange, RSA authentication, ChaCha20-Poly1305 encryption",
-                "components": ["ECDHE", "RSA", "ChaCha20", "Poly1305"]
-            },
-            
-            # Medium-strength ciphers
-            "ECDHE-RSA-AES128-SHA256": {
-                "strength": "Medium",
-                "description": "ECDHE key exchange, RSA authentication, AES-128 in CBC mode, SHA-256 HMAC",
-                "components": ["ECDHE", "RSA", "AES-128", "CBC", "SHA-256"]
-            },
-            "DHE-RSA-AES256-SHA256": {
-                "strength": "Medium",
-                "description": "DHE key exchange, RSA authentication, AES-256 in CBC mode, SHA-256 HMAC",
-                "components": ["DHE", "RSA", "AES-256", "CBC", "SHA-256"]
-            },
-            
-            # Weak/vulnerable ciphers
-            "TLS_RSA_WITH_AES_128_CBC_SHA": {
-                "strength": "Weak",
-                "description": "RSA key exchange (no forward secrecy), AES-128 in CBC mode, SHA-1 HMAC",
-                "components": ["RSA", "AES-128", "CBC", "SHA-1"]
-            },
-            "TLS_RSA_WITH_3DES_EDE_CBC_SHA": {
-                "strength": "Weak",
-                "description": "RSA key exchange (no forward secrecy), 3DES in CBC mode, SHA-1 HMAC",
-                "components": ["RSA", "3DES", "CBC", "SHA-1"]
-            },
-            "TLS_RSA_WITH_RC4_128_SHA": {
-                "strength": "Vulnerable",
-                "description": "RSA key exchange, RC4 stream cipher (broken), SHA-1 HMAC",
-                "components": ["RSA", "RC4", "SHA-1"]
-            }
-        }
-        
-        # Check for exact matches
-        if cipher in cipher_info:
-            return cipher_info[cipher]
-        
-        # If no exact match, check for common patterns
-        components = []
-        strength = "Unknown"
-        
-        # Key Exchange
-        if "ECDHE" in cipher:
-            components.append("ECDHE key exchange (forward secrecy)")
-        elif "DHE" in cipher:
-            components.append("DHE key exchange (forward secrecy)")
-        elif "ECDH" in cipher:
-            components.append("ECDH static key exchange")
-        elif "DH" in cipher:
-            components.append("DH static key exchange")
-        
-        # Authentication
-        if "ECDSA" in cipher:
-            components.append("ECDSA authentication")
-        elif "RSA" in cipher and not cipher.startswith("RSA"):
-            components.append("RSA authentication")
-        
-        # Encryption
-        if "AES256" in cipher or "AES_256" in cipher:
-            components.append("AES-256 encryption")
-        elif "AES128" in cipher or "AES_128" in cipher:
-            components.append("AES-128 encryption")
-        elif "CHACHA20" in cipher:
-            components.append("ChaCha20 encryption")
-        elif "3DES" in cipher:
-            components.append("3DES encryption (weak)")
-        elif "DES" in cipher:
-            components.append("DES encryption (very weak)")
-        elif "RC4" in cipher:
-            components.append("RC4 encryption (broken)")
-        elif "NULL" in cipher:
-            components.append("NULL encryption (no encryption)")
-        
-        # Mode
-        if "GCM" in cipher:
-            components.append("GCM mode (AEAD)")
-            strength = strength if strength == "Vulnerable" else "Strong"
-        elif "CCM" in cipher:
-            components.append("CCM mode (AEAD)")
-            strength = strength if strength == "Vulnerable" else "Strong"
-        elif "POLY1305" in cipher:
-            components.append("Poly1305 authentication")
-            strength = strength if strength == "Vulnerable" else "Strong"
-        elif "CBC" in cipher:
-            components.append("CBC mode (potentially vulnerable to padding oracle attacks)")
-            strength = strength if strength == "Vulnerable" else "Medium"
-        
-        # Hash
-        if "SHA384" in cipher or "SHA_384" in cipher:
-            components.append("SHA-384 HMAC")
-        elif "SHA256" in cipher or "SHA_256" in cipher:
-            components.append("SHA-256 HMAC")
-        elif "SHA1" in cipher or "SHA" in cipher:
-            components.append("SHA-1 HMAC (weak)")
-            strength = "Weak" if strength == "Unknown" else strength
-        elif "MD5" in cipher:
-            components.append("MD5 HMAC (broken)")
-            strength = "Vulnerable"
-        
-        # Determine overall strength if not already set
-        if "NULL" in cipher or "EXPORT" in cipher or "RC4" in cipher or "MD5" in cipher:
-            strength = "Vulnerable"
-        elif "DES" in cipher and "3DES" not in cipher:
-            strength = "Vulnerable"
-        elif strength == "Unknown":
-            if any(weak in cipher for weak in ["3DES", "CBC", "SHA1", "SHA_1"]):
-                strength = "Weak"
-            elif any(strong in cipher for strong in ["AES256", "AES_256", "CHACHA20", "GCM", "SHA384"]):
-                strength = "Strong"
-            else:
-                strength = "Medium"
-        
-        # Return structured info
-        return {
-            "strength": strength,
-            "description": cipher,
-            "components": components
-        }
