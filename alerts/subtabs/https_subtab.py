@@ -104,7 +104,7 @@ class HttpTlsMonitor(SubtabBase):
         self.http_tree.bind("<<TreeviewSelect>>", self.show_http_details)
     
     def create_tls_tab(self):
-        """Create TLS/SSL monitoring components"""
+        """Create TLS/SSL monitoring components with added debug button"""
         # Filter frame
         filter_frame = ttk.Frame(self.tls_tab)
         filter_frame.pack(fill="x", padx=10, pady=5)
@@ -114,9 +114,15 @@ class HttpTlsMonitor(SubtabBase):
         tls_filter.pack(side="left", padx=5)
         
         ttk.Button(filter_frame, text="Apply Filter", 
-                  command=lambda: self.refresh_tls_connections(self.tls_filter.get())).pack(side="left", padx=5)
+                command=lambda: self.refresh_tls_connections(self.tls_filter.get())).pack(side="left", padx=5)
         ttk.Button(filter_frame, text="Clear Filter", 
-                  command=lambda: (self.tls_filter.set(""), self.refresh_tls_connections())).pack(side="left", padx=5)
+                command=lambda: (self.tls_filter.set(""), self.refresh_tls_connections())).pack(side="left", padx=5)
+        
+        # Add debug button for TLS troubleshooting
+        ttk.Button(filter_frame, text="Debug TLS", 
+                command=self.debug_tls_processing).pack(side="right", padx=5)
+        ttk.Button(filter_frame, text="Force Refresh", 
+                command=lambda: self.refresh_tls_connections(None)).pack(side="right", padx=5)
         
         # TLS connections tree
         frame = ttk.Frame(self.tls_tab)
@@ -155,6 +161,11 @@ class HttpTlsMonitor(SubtabBase):
         
         # Bind tree selection event
         self.tls_tree.bind("<<TreeviewSelect>>", self.show_tls_details)
+        
+        # Initial message
+        self.tls_details_text.insert(tk.END, "Select a TLS connection to view details.\n\n")
+        self.tls_details_text.insert(tk.END, "If no connections are showing, visit an HTTPS website to generate TLS traffic.\n")
+        self.tls_details_text.insert(tk.END, "Use the 'Debug TLS' button to check database status.")
     
     def create_suspicious_tls_tab(self):
         """Create suspicious TLS connections tab"""
@@ -255,41 +266,113 @@ class HttpTlsMonitor(SubtabBase):
         self.update_output(f"Loaded {len(http_requests)} HTTP requests")
     
     def refresh_tls_connections(self, filter_pattern=None):
-        """Refresh TLS connection data"""
+        """Refresh TLS connection data with improved error handling and debugging"""
         if not self.gui or not hasattr(self.gui, 'db_manager'):
+            self.update_output("GUI or database manager not available")
             return
             
         # Clear tree
         for item in self.tls_tree.get_children():
             self.tls_tree.delete(item)
         
-        # Get TLS connections
         db_manager = self.gui.db_manager
         
-        # Format query results
+        # Check TLS table status for debugging
+        if hasattr(db_manager, 'check_tls_tables'):
+            status = db_manager.check_tls_tables()
+            if status:
+                self.update_output(f"TLS status: {status['tls_connections']} records, {status['successful_joins']} successful joins")
+        
+        # Get TLS connections
         tls_connections = db_manager.get_tls_connections(filter_pattern, limit=200)
         
         if not tls_connections:
-            self.update_output("No TLS connections found")
+            self.update_output("No TLS connections found in database")
+            
+            # Add debug information to help diagnose the issue
+            self.tls_details_text.delete(1.0, tk.END)
+            self.tls_details_text.insert(tk.END, "TLS Debug Information:\n\n")
+            
+            # Check if capture is running
+            if hasattr(self.gui, 'running') and self.gui.running:
+                self.tls_details_text.insert(tk.END, "Capture is RUNNING\n")
+            else:
+                self.tls_details_text.insert(tk.END, "Capture is NOT running\n")
+            
+            # Check TShark command
+            if hasattr(self.gui, 'capture_engine') and hasattr(self.gui.capture_engine, 'tshark_process'):
+                if self.gui.capture_engine.tshark_process:
+                    self.tls_details_text.insert(tk.END, "TShark process is active\n")
+                else:
+                    self.tls_details_text.insert(tk.END, "TShark process is not active\n")
+            
+            # Suggest possible solutions
+            self.tls_details_text.insert(tk.END, "\nPossible solutions:\n")
+            self.tls_details_text.insert(tk.END, "1. Make sure capture is started\n")
+            self.tls_details_text.insert(tk.END, "2. Visit some HTTPS sites to generate TLS traffic\n")
+            self.tls_details_text.insert(tk.END, "3. Check log for any TLS processing errors\n")
+            
             return
-            
-        # Add to tree
+        
+        # Add to tree - with better error handling
         for conn in tls_connections:
-            server_name = conn[0] if conn[0] else "Unknown"
-            tls_version = conn[1] if conn[1] else "Unknown"
-            cipher_suite = conn[2] if conn[2] else "Unknown"
-            src_ip = conn[4]
-            dst_ip = conn[5]
-            timestamp = conn[8]
-            
-            # Format the timestamp
-            if isinstance(timestamp, float):
-                timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
-            
-            # Add to tree
-            self.tls_tree.insert("", "end", values=(server_name, tls_version, cipher_suite, src_ip, dst_ip, timestamp))
+            try:
+                # Make sure we have enough elements in the tuple
+                if len(conn) < 6:
+                    self.update_output(f"Warning: Incomplete TLS data: {conn}")
+                    continue
+                    
+                server_name = conn[0] if conn[0] else "Unknown"
+                tls_version = conn[1] if conn[1] else "Unknown"
+                cipher_suite = conn[2] if conn[2] else "Unknown"
+                src_ip = conn[4] if len(conn) > 4 else "Unknown"
+                dst_ip = conn[5] if len(conn) > 5 else "Unknown"
+                timestamp = conn[8] if len(conn) > 8 else time.time()
+                
+                # Format the timestamp
+                if isinstance(timestamp, float):
+                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+                
+                # Add to tree
+                self.tls_tree.insert("", "end", values=(server_name, tls_version, cipher_suite, src_ip, dst_ip, timestamp))
+            except Exception as e:
+                self.update_output(f"Error displaying TLS connection: {e}")
         
         self.update_output(f"Loaded {len(tls_connections)} TLS connections")
+
+    def debug_tls_processing(self):
+        """Force a check of TLS processing and database status"""
+        if not self.gui or not hasattr(self.gui, 'db_manager'):
+            self.update_output("GUI or database manager not available")
+            return
+            
+        db_manager = self.gui.db_manager
+        
+        # Clear the details text area
+        self.tls_details_text.delete(1.0, tk.END)
+        self.tls_details_text.insert(tk.END, "TLS Debug Information:\n\n")
+        
+        # Check database tables
+        if hasattr(db_manager, 'check_tls_tables'):
+            status = db_manager.check_tls_tables()
+            if status:
+                self.tls_details_text.insert(tk.END, f"Database Status:\n")
+                self.tls_details_text.insert(tk.END, f"- Total connections: {status['connections']}\n")
+                self.tls_details_text.insert(tk.END, f"- Total TLS connections: {status['tls_connections']}\n")
+                self.tls_details_text.insert(tk.END, f"- Successful joins: {status['successful_joins']}\n\n")
+                
+                if status['tls_keys']:
+                    self.tls_details_text.insert(tk.END, f"Sample TLS keys:\n")
+                    for key in status['tls_keys']:
+                        self.tls_details_text.insert(tk.END, f"- {key}\n")
+                    self.tls_details_text.insert(tk.END, "\n")
+                    
+                if status['conn_keys']:
+                    self.tls_details_text.insert(tk.END, f"Sample connection keys:\n")
+                    for key in status['conn_keys']:
+                        self.tls_details_text.insert(tk.END, f"- {key}\n")
+            else:
+                self.tls_details_text.insert(tk.END, "Could not retrieve database status\n")
     
     def refresh_suspicious_tls(self):
         """Refresh suspicious TLS connection data"""

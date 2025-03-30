@@ -812,17 +812,23 @@ class TrafficCaptureEngine:
             return False
 
     def _process_tls_packet(self, layers, src_ip, dst_ip, src_port, dst_port):
-        """Extract and store TLS/SSL packet information"""
+        """Extract and store TLS/SSL packet information with improved detection and logging"""
         try:
-            if "tls" not in layers:
-                return False
+            # Check for any TLS/SSL layer
+            tls_layer = None
+            if "tls" in layers and isinstance(layers["tls"], dict):
+                tls_layer = layers["tls"]
+            elif "ssl" in layers and isinstance(layers["ssl"], dict):
+                tls_layer = layers["ssl"]
                 
-            tls_layer = layers["tls"]
-            if not isinstance(tls_layer, dict):
+            if not tls_layer:
                 return False
             
             # Create connection key
             connection_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
+            
+            # Log detection of TLS traffic (for debugging)
+            self.gui.update_output(f"Detected TLS traffic: {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
             
             # Record application protocol
             self.db_manager.add_app_protocol(connection_key, "TLS/SSL", detection_method="direct")
@@ -842,33 +848,37 @@ class TrafficCaptureEngine:
             cert_serial = None
             
             # TLS version
-            if "tls.record.version" in tls_layer:
-                # Map numerical versions to human-readable form
-                version_map = {
-                    "0x0300": "SSLv3",
-                    "0x0301": "TLSv1.0",
-                    "0x0302": "TLSv1.1",
-                    "0x0303": "TLSv1.2",
-                    "0x0304": "TLSv1.3"
-                }
-                version_raw = tls_layer["tls.record.version"]
-                tls_version = version_map.get(version_raw, version_raw)
+            for version_field in ["tls.record.version", "ssl.record.version", "tls.handshake.version", "ssl.handshake.version"]:
+                if version_field in tls_layer:
+                    # Map numerical versions to human-readable form
+                    version_map = {
+                        "0x0300": "SSLv3",
+                        "0x0301": "TLSv1.0",
+                        "0x0302": "TLSv1.1",
+                        "0x0303": "TLSv1.2",
+                        "0x0304": "TLSv1.3"
+                    }
+                    version_raw = tls_layer[version_field]
+                    tls_version = version_map.get(version_raw, version_raw)
+                    break
             
             # Cipher suite
-            if "tls.handshake.ciphersuite" in tls_layer:
-                cipher_suite = tls_layer["tls.handshake.ciphersuite"]
-                
+            for cipher_field in ["tls.handshake.ciphersuite", "ssl.handshake.ciphersuite"]:
+                if cipher_field in tls_layer:
+                    cipher_suite = tls_layer[cipher_field]
+                    break
+                    
             # SNI (Server Name Indication)
-            if "tls.handshake.extensions_server_name" in tls_layer:
-                server_name = tls_layer["tls.handshake.extensions_server_name"]
+            for sni_field in ["tls.handshake.extensions_server_name", "ssl.handshake.extensions_server_name"]:
+                if sni_field in tls_layer:
+                    server_name = tls_layer[sni_field]
+                    break
             
-            # JA3 Fingerprint (client)
-            # We need to calculate this from the ClientHello parameters
-            # For a true implementation, we'd extract the raw values and hash them according to the JA3 spec
-            # For this example, we'll use a placeholder that notes we'd need to implement JA3 calculation
-            if "tls.handshake.type" in tls_layer and tls_layer["tls.handshake.type"] == "1":  # ClientHello
-                # In real implementation, we would calculate: MD5(SSLVersion,Cipher,SSLExtension,EllipticCurve,EllipticCurvePointFormat)
-                # For demonstration, simulate with a hash of available parameters
+            # Client Hello (JA3 fingerprint simulation)
+            handshake_type = tls_layer.get("tls.handshake.type") or tls_layer.get("ssl.handshake.type")
+            if handshake_type == "1":  # ClientHello
+                # Create a simplified JA3 fingerprint
+                import hashlib
                 ja3_components = []
                 
                 # Add TLS version if available
@@ -876,19 +886,18 @@ class TrafficCaptureEngine:
                     ja3_components.append(tls_version)
                     
                 # Add cipher suites if available
-                if "tls.handshake.ciphersuites" in tls_layer:
-                    ja3_components.append(tls_layer["tls.handshake.ciphersuites"])
+                ciphersuites = tls_layer.get("tls.handshake.ciphersuites") or tls_layer.get("ssl.handshake.ciphersuites")
+                if ciphersuites:
+                    ja3_components.append(ciphersuites)
                 
-                # Generate a simulated fingerprint
+                # Generate a simplified fingerprint
                 if ja3_components:
-                    import hashlib
                     fingerprint_input = ','.join(ja3_components)
                     ja3_fingerprint = hashlib.md5(fingerprint_input.encode()).hexdigest()
             
-            # JA3S Fingerprint (server)
-            # Similar to JA3, but for server responses
-            if "tls.handshake.type" in tls_layer and tls_layer["tls.handshake.type"] == "2":  # ServerHello
-                # In real implementation: MD5(SSLVersion,Cipher,SSLExtension)
+            # Server Hello (JA3S fingerprint)
+            if handshake_type == "2":  # ServerHello
+                import hashlib
                 ja3s_components = []
                 
                 # Add TLS version if available
@@ -899,39 +908,66 @@ class TrafficCaptureEngine:
                 if cipher_suite:
                     ja3s_components.append(cipher_suite)
                 
-                # Generate a simulated fingerprint
+                # Generate a simplified fingerprint
                 if ja3s_components:
-                    import hashlib
                     fingerprint_input = ','.join(ja3s_components)
                     ja3s_fingerprint = hashlib.md5(fingerprint_input.encode()).hexdigest()
             
             # Certificate information
-            # TShark can extract this information from the Certificate message
-            if "tls.handshake.certificate" in tls_layer:
-                # Look for certificate fields
-                for key, value in tls_layer.items():
-                    if key == "tls.handshake.certificate.issuer":
-                        cert_issuer = value
-                    elif key == "tls.handshake.certificate.subject":
-                        cert_subject = value
-                    elif key == "tls.handshake.certificate.not_before":
-                        cert_valid_from = value
-                    elif key == "tls.handshake.certificate.not_after":
-                        cert_valid_to = value
-                    elif key == "tls.handshake.certificate.serial":
-                        cert_serial = value
+            cert_fields = [
+                "tls.handshake.certificate", "ssl.handshake.certificate",
+                "tls.x509cert", "ssl.x509cert"
+            ]
+            for cert_field in cert_fields:
+                if cert_field in tls_layer:
+                    # Certificate is present
+                    for key, value in tls_layer.items():
+                        if key.endswith(".issuer"):
+                            cert_issuer = value
+                        elif key.endswith(".subject"):
+                            cert_subject = value
+                        elif key.endswith(".not_before"):
+                            cert_valid_from = value
+                        elif key.endswith(".not_after"):
+                            cert_valid_to = value
+                        elif key.endswith(".serial"):
+                            cert_serial = value
+                    break
+            
+            # If server_name is missing but we have a certificate subject, extract domain from subject
+            if not server_name and cert_subject:
+                # Look for CN=domain.com in the subject
+                import re
+                cn_match = re.search(r'CN=([^,]+)', cert_subject)
+                if cn_match:
+                    server_name = cn_match.group(1)
+                    
+            # For HTTPS traffic, check if the destination port is 443 and use that for server name
+            if not server_name and dst_port == 443:
+                server_name = dst_ip
             
             # Store in database only if we have meaningful TLS information
             if tls_version or cipher_suite or server_name or ja3_fingerprint or ja3s_fingerprint or cert_subject:
-                return self.db_manager.add_tls_connection(
+                success = self.db_manager.add_tls_connection(
                     connection_key, tls_version, cipher_suite, server_name, 
                     ja3_fingerprint, ja3s_fingerprint, cert_issuer, cert_subject,
                     cert_valid_from, cert_valid_to, cert_serial
                 )
+                
+                # Log TLS connection details for debugging
+                if success:
+                    self.gui.update_output(f"Stored TLS connection: {server_name or 'Unknown'} ({tls_version or 'Unknown'})")
+                else:
+                    self.gui.update_output(f"Failed to store TLS connection for {connection_key}")
+                    
+                return success
             
+            self.gui.update_output(f"Insufficient TLS data for {connection_key}")
             return False
         except Exception as e:
             self.gui.update_output(f"Error processing TLS packet: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def _detect_application_protocol(self, src_ip, dst_ip, src_port, dst_port, layers, is_tcp=True):

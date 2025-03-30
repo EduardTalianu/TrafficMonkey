@@ -967,37 +967,134 @@ class DatabaseManager:
             return []
 
     def get_tls_connections(self, filter_pattern=None, limit=100):
-        """Get TLS connections with optional filtering"""
+        """Get TLS connections with optional filtering and improved error handling"""
         try:
             cursor = self.analysis_conn.cursor()
             
+            # First check if we have any TLS connections at all (for debugging)
+            count = cursor.execute("SELECT COUNT(*) FROM tls_connections").fetchone()[0]
+            logger.info(f"Total TLS connections in database: {count}")
+            
+            if count == 0:
+                cursor.close()
+                return []
+            
+            # Try the query with modified JOIN logic that's more tolerant
             if filter_pattern:
                 pattern = f"%{filter_pattern}%"
-                cursor.execute("""
+                query = """
                     SELECT t.server_name, t.tls_version, t.cipher_suite, t.ja3_fingerprint,
-                        c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp
+                        c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp,
+                        t.connection_key
                     FROM tls_connections t
-                    JOIN connections c ON t.connection_key = c.connection_key
-                    WHERE t.server_name LIKE ? OR t.ja3_fingerprint LIKE ?
+                    LEFT JOIN connections c ON t.connection_key = c.connection_key
+                    WHERE (t.server_name LIKE ? OR t.ja3_fingerprint LIKE ?)
                     ORDER BY t.timestamp DESC
                     LIMIT ?
-                """, (pattern, pattern, limit))
+                """
+                cursor.execute(query, (pattern, pattern, limit))
             else:
-                cursor.execute("""
+                query = """
                     SELECT t.server_name, t.tls_version, t.cipher_suite, t.ja3_fingerprint,
-                        c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp
+                        c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp,
+                        t.connection_key
                     FROM tls_connections t
-                    JOIN connections c ON t.connection_key = c.connection_key
+                    LEFT JOIN connections c ON t.connection_key = c.connection_key
                     ORDER BY t.timestamp DESC
                     LIMIT ?
-                """, (limit,))
+                """
+                cursor.execute(query, (limit,))
             
-            results = cursor.fetchall()
+            rows = cursor.fetchall()
+            
+            # Process results to handle possible NULL values from LEFT JOIN
+            results = []
+            for row in rows:
+                server_name, tls_version, cipher_suite, ja3_fp, src_ip, dst_ip, src_port, dst_port, timestamp, conn_key = row
+                
+                # If the JOIN failed (connection record not found), extract IPs from connection_key
+                if src_ip is None or dst_ip is None:
+                    try:
+                        # Try to parse connection key in format "src_ip:src_port->dst_ip:dst_port"
+                        parts = conn_key.split('->')
+                        if len(parts) == 2:
+                            src_part = parts[0].split(':')
+                            dst_part = parts[1].split(':')
+                            if len(src_part) == 2 and len(dst_part) == 2:
+                                src_ip = src_part[0]
+                                src_port = int(src_part[1])
+                                dst_ip = dst_part[0]
+                                dst_port = int(dst_part[1])
+                    except Exception:
+                        # If parsing fails, use placeholders
+                        src_ip = src_ip or "Unknown"
+                        dst_ip = dst_ip or "Unknown"
+                        src_port = src_port or 0
+                        dst_port = dst_port or 0
+                
+                # Create a new result tuple with guaranteed non-NULL values
+                result = (
+                    server_name or "Unknown",
+                    tls_version or "Unknown",
+                    cipher_suite or "Unknown",
+                    ja3_fp or "N/A",
+                    src_ip or "Unknown",
+                    dst_ip or "Unknown",
+                    src_port or 0,
+                    dst_port or 0,
+                    timestamp
+                )
+                results.append(result)
+            
             cursor.close()
             return results
         except Exception as e:
             logger.error(f"Error retrieving TLS connections: {e}")
+            import traceback
+            traceback.print_exc()
             return []
+
+    def check_tls_tables(self):
+        """Check TLS tables and log status for debugging"""
+        try:
+            cursor = self.analysis_conn.cursor()
+            
+            # Check connections table
+            conn_count = cursor.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
+            logger.info(f"Total connections: {conn_count}")
+            
+            # Check TLS connections table
+            tls_count = cursor.execute("SELECT COUNT(*) FROM tls_connections").fetchone()[0]
+            logger.info(f"Total TLS connections: {tls_count}")
+            
+            # Check for successful joins
+            join_count = cursor.execute("""
+                SELECT COUNT(*) FROM tls_connections t
+                JOIN connections c ON t.connection_key = c.connection_key
+            """).fetchone()[0]
+            logger.info(f"Successful TLS-connections joins: {join_count}")
+            
+            # Sample TLS connection keys
+            cursor.execute("SELECT connection_key FROM tls_connections LIMIT 5")
+            tls_keys = [row[0] for row in cursor.fetchall()]
+            logger.info(f"Sample TLS connection keys: {tls_keys}")
+            
+            # Sample connection keys
+            cursor.execute("SELECT connection_key FROM connections LIMIT 5")
+            conn_keys = [row[0] for row in cursor.fetchall()]
+            logger.info(f"Sample connection keys: {conn_keys}")
+            
+            cursor.close()
+            return {
+                "connections": conn_count,
+                "tls_connections": tls_count,
+                "successful_joins": join_count,
+                "tls_keys": tls_keys,
+                "conn_keys": conn_keys
+            }
+        except Exception as e:
+            logger.error(f"Error checking TLS tables: {e}")
+            return None
 
     def get_suspicious_tls_connections(self):
         """Get potentially suspicious TLS connections based on version and cipher suite"""
