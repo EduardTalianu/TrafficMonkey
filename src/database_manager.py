@@ -351,7 +351,7 @@ class DatabaseManager:
                 logger.error(f"Error in alert processor: {e}")
     
     def sync_databases(self):
-        """Synchronize data from capture DB to analysis DB"""
+        """Synchronize data from capture DB to analysis DB with DNS resolution"""
         try:
             with self.sync_lock:
                 current_time = time.time()
@@ -377,10 +377,11 @@ class DatabaseManager:
                 )
                 
                 for row in sync_capture_cursor.fetchall():
-                    sync_analysis_cursor.execute(
-                        "INSERT OR REPLACE INTO connections VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        row
-                    )
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO connections VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
                     sync_count += 1
                 
                 # Sync alerts table
@@ -394,19 +395,21 @@ class DatabaseManager:
                 )
                 
                 for row in sync_capture_cursor.fetchall():
-                    sync_analysis_cursor.execute(
-                        "INSERT OR REPLACE INTO alerts VALUES (?, ?, ?, ?, ?)",
-                        row
-                    )
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO alerts VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
                     sync_count += 1
                 
                 # Sync port_scan_timestamps table
                 sync_capture_cursor.execute("SELECT * FROM port_scan_timestamps")
                 for row in sync_capture_cursor.fetchall():
-                    sync_analysis_cursor.execute(
-                        "INSERT OR REPLACE INTO port_scan_timestamps VALUES (?, ?, ?, ?)",
-                        row
-                    )
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO port_scan_timestamps VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
                     sync_count += 1
                 
                 # Sync dns_queries table (last 24 hours only)
@@ -423,10 +426,11 @@ class DatabaseManager:
                 )
                 
                 for row in sync_capture_cursor.fetchall():
-                    sync_analysis_cursor.execute(
-                        "INSERT OR REPLACE INTO dns_queries VALUES (?, ?, ?, ?)",
-                        row
-                    )
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO dns_queries VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
                     sync_count += 1
                 
                 # Sync icmp_packets table (last 24 hours only)
@@ -442,10 +446,11 @@ class DatabaseManager:
                 )
                 
                 for row in sync_capture_cursor.fetchall():
-                    sync_analysis_cursor.execute(
-                        "INSERT OR REPLACE INTO icmp_packets VALUES (?, ?, ?, ?)",
-                        row
-                    )
+                    # Get column count to ensure we use the right number of placeholders
+                    column_count = len(row)
+                    placeholders = ", ".join(["?"] * column_count)
+                    query = f"INSERT OR REPLACE INTO icmp_packets VALUES ({placeholders})"
+                    sync_analysis_cursor.execute(query, row)
                     sync_count += 1
                     
                 # Sync HTTP requests (new)
@@ -484,6 +489,28 @@ class DatabaseManager:
                     sync_analysis_cursor.execute(query, row)
                     sync_count += 1
                 
+                # Sync HTTP headers if the table exists
+                try:
+                    last_headers_timestamp = sync_analysis_cursor.execute(
+                        "SELECT MAX(timestamp) FROM http_headers"
+                    ).fetchone()[0] or 0
+                    
+                    sync_capture_cursor.execute(
+                        "SELECT * FROM http_headers WHERE timestamp > ?",
+                        (last_headers_timestamp,)
+                    )
+                    
+                    for row in sync_capture_cursor.fetchall():
+                        # Get column count to ensure we use the right number of placeholders
+                        column_count = len(row)
+                        placeholders = ", ".join(["?"] * column_count)
+                        query = f"INSERT OR REPLACE INTO http_headers VALUES ({placeholders})"
+                        sync_analysis_cursor.execute(query, row)
+                        sync_count += 1
+                except sqlite3.OperationalError:
+                    # HTTP headers table might not exist yet - ignore
+                    pass
+                
                 # Sync TLS connections (new)
                 last_tls_timestamp = sync_analysis_cursor.execute(
                     "SELECT MAX(timestamp) FROM tls_connections"
@@ -520,6 +547,13 @@ class DatabaseManager:
                     sync_analysis_cursor.execute(query, row)
                     sync_count += 1
                 
+                # After all syncing is done, perform DNS resolution for TLS connections
+                # that have IP addresses instead of hostnames
+                resolved = self.resolve_domain_names(sync_analysis_cursor)
+                if resolved > 0:
+                    logger.info(f"Resolved {resolved} domain names")
+                    sync_count += resolved
+                
                 # Commit the transaction
                 self.analysis_conn.commit()
                 self.last_sync_time = current_time
@@ -538,6 +572,8 @@ class DatabaseManager:
             except:
                 pass
             logger.error(f"Database sync error: {e}")
+            import traceback
+            traceback.print_exc()
             return 0
     
     def _process_queue(self):
@@ -1394,3 +1430,74 @@ class DatabaseManager:
             logger.info("Database connections and threads closed")
         except Exception as e:
             logger.error(f"Error closing database connections: {e}")
+    
+    def resolve_domain_names(self, db_cursor):
+        """Add this method to DatabaseManager to resolve IP addresses to hostnames"""
+        import socket
+        
+        try:
+            # Get all TLS connections with server names that look like IP addresses
+            db_cursor.execute("""
+                SELECT id, server_name, connection_key
+                FROM tls_connections
+                WHERE server_name LIKE '%\\.%\\.%\\.%' 
+                OR server_name IS NULL
+                LIMIT 100
+            """)
+            
+            rows = db_cursor.fetchall()
+            updates = 0
+            
+            for row in rows:
+                tls_id, server_name, connection_key = row
+                
+                # Extract destination IP from connection key
+                try:
+                    dst_ip = connection_key.split('->')[1].split(':')[0]
+                except IndexError:
+                    continue
+                    
+                # Skip if we already have a non-IP server name
+                if server_name and not self._is_ip_address(server_name):
+                    continue
+                    
+                # Try reverse DNS lookup
+                try:
+                    hostname, _, _ = socket.gethostbyaddr(dst_ip)
+                    if hostname and hostname != dst_ip and not self._is_ip_address(hostname):
+                        # Update the server name in the database
+                        db_cursor.execute("""
+                            UPDATE tls_connections
+                            SET server_name = ?
+                            WHERE id = ?
+                        """, (hostname, tls_id))
+                        
+                        updates += 1
+                        logger.info(f"Resolved {dst_ip} to {hostname}")
+                except (socket.herror, socket.gaierror):
+                    # If reverse lookup fails, that's okay
+                    pass
+                    
+            if updates > 0:
+                logger.info(f"Resolved {updates} domain names for TLS connections")
+            
+            return updates
+            
+        except Exception as e:
+            logger.error(f"Error in resolve_domain_names: {e}")
+            return 0
+            
+    def _is_ip_address(self, value):
+        """Check if a string is an IP address"""
+        if not value:
+            return False
+            
+        # Simple IPv4 check
+        parts = value.split('.')
+        if len(parts) != 4:
+            return False
+            
+        try:
+            return all(0 <= int(p) <= 255 for p in parts)
+        except ValueError:
+            return False
