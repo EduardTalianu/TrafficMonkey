@@ -47,9 +47,16 @@ class SubtabLoader:
                         'gui': self.gui,  # Provide access to the GUI
                     }
                     
-                    # Load the module content
-                    with open(module_path, 'r') as f:
-                        module_code = f.read()
+                    # Load the module content with proper encoding handling
+                    try:
+                        # Try UTF-8 encoding first (recommended)
+                        with open(module_path, 'r', encoding='utf-8') as f:
+                            module_code = f.read()
+                    except UnicodeDecodeError:
+                        # Fall back to latin-1 which can read any byte values
+                        with open(module_path, 'r', encoding='latin-1') as f:
+                            module_code = f.read()
+                            logging.warning(f"File {filename} had to be read with latin-1 encoding. Consider saving it as UTF-8.")
                     
                     # Execute the module code in the custom namespace
                     exec(module_code, subtab_namespace)

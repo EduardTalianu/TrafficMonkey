@@ -3,6 +3,7 @@
 import tkinter as tk
 from tkinter import ttk
 import time
+import datetime
 from subtab_base import SubtabBase
 
 class HttpTlsMonitor(SubtabBase):
@@ -43,6 +44,8 @@ class HttpTlsMonitor(SubtabBase):
         
         ttk.Button(refresh_frame, text="Refresh Data", 
                   command=self.refresh).pack(side="right", padx=5)
+        ttk.Button(refresh_frame, text="Check Tables", 
+                  command=self.check_database_status).pack(side="right", padx=5)
                   
         ttk.Label(refresh_frame, 
                  text="Monitor HTTP and TLS traffic for security issues").pack(side="left", padx=5)
@@ -122,7 +125,7 @@ class HttpTlsMonitor(SubtabBase):
         ttk.Button(filter_frame, text="Debug TLS", 
                 command=self.debug_tls_processing).pack(side="right", padx=5)
         ttk.Button(filter_frame, text="Force Refresh", 
-                command=lambda: self.refresh_tls_connections(None)).pack(side="right", padx=5)
+                command=lambda: self.refresh_tls_connections(None, force=True)).pack(side="right", padx=5)
         
         # TLS connections tree
         frame = ttk.Frame(self.tls_tab)
@@ -209,6 +212,168 @@ class HttpTlsMonitor(SubtabBase):
         ttk.Button(info_frame, text="Export to Log", 
                   command=self.export_suspicious_tls).pack(side="right", padx=5)
     
+    def check_database_status(self):
+        """Check database table status for debugging"""
+        self.update_output("Checking database tables...")
+        
+        # Create a debug information window
+        debug_window = tk.Toplevel(self.gui.master)
+        debug_window.title("Database Status")
+        debug_window.geometry("600x400")
+        
+        # Create text widget for display
+        debug_text = tk.Text(debug_window, wrap=tk.WORD)
+        debug_text.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(debug_text, command=debug_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        debug_text.config(yscrollcommand=scrollbar.set)
+        
+        # Collect database information
+        def get_table_counts():
+            conn = self.gui.db_manager.analysis_conn
+            cursor = conn.cursor()
+            
+            tables = {}
+            
+            # Get list of tables
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            for row in cursor.fetchall():
+                table_name = row[0]
+                # Get count
+                count_cursor = conn.cursor()
+                count_cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+                count = count_cursor.fetchone()[0]
+                tables[table_name] = count
+                count_cursor.close()
+            
+            cursor.close()
+            return tables
+        
+        # Check for TLS connections
+        def check_tls_connections():
+            conn = self.gui.db_manager.analysis_conn
+            cursor = conn.cursor()
+            
+            # Look for port 443 connections
+            cursor.execute("""
+                SELECT COUNT(*) FROM connections 
+                WHERE dst_port = 443
+            """)
+            https_connections = cursor.fetchone()[0]
+            
+            # Check actual TLS connections
+            cursor.execute("SELECT COUNT(*) FROM tls_connections")
+            tls_records = cursor.fetchone()[0]
+            
+            # Get recent connections
+            cursor.execute("""
+                SELECT src_ip, dst_ip, dst_port, timestamp 
+                FROM connections 
+                WHERE dst_port = 443
+                ORDER BY timestamp DESC
+                LIMIT 5
+            """)
+            recent_https = cursor.fetchall()
+            
+            cursor.close()
+            
+            return {
+                "https_connections": https_connections,
+                "tls_records": tls_records,
+                "recent_https": recent_https
+            }
+            
+        # Get HTTP requests info
+        def check_http_requests():
+            conn = self.gui.db_manager.analysis_conn
+            cursor = conn.cursor()
+            
+            # Count HTTP requests
+            cursor.execute("SELECT COUNT(*) FROM http_requests")
+            http_requests = cursor.fetchone()[0]
+            
+            # Count HTTP responses
+            cursor.execute("SELECT COUNT(*) FROM http_responses")
+            http_responses = cursor.fetchone()[0]
+            
+            # Get sample HTTP requests
+            cursor.execute("""
+                SELECT method, host, uri, timestamp
+                FROM http_requests
+                ORDER BY timestamp DESC
+                LIMIT 5
+            """)
+            recent_requests = cursor.fetchall()
+            
+            cursor.close()
+            
+            return {
+                "http_requests": http_requests,
+                "http_responses": http_responses,
+                "recent_requests": recent_requests
+            }
+            
+        # Get table counts
+        tables = get_table_counts()
+        tls_info = check_tls_connections()
+        http_info = check_http_requests()
+        
+        # Display the information
+        debug_text.insert(tk.END, "=== DATABASE TABLE COUNTS ===\n\n")
+        for table, count in tables.items():
+            debug_text.insert(tk.END, f"{table}: {count} rows\n")
+            
+        debug_text.insert(tk.END, "\n=== TLS CONNECTION INFO ===\n\n")
+        debug_text.insert(tk.END, f"HTTPS Connections (port 443): {tls_info['https_connections']}\n")
+        debug_text.insert(tk.END, f"TLS Connection Records: {tls_info['tls_records']}\n\n")
+        
+        if tls_info['recent_https']:
+            debug_text.insert(tk.END, "Recent HTTPS Connections:\n")
+            for conn in tls_info['recent_https']:
+                src_ip, dst_ip, dst_port, timestamp = conn
+                debug_text.insert(tk.END, f"  {src_ip} -> {dst_ip}:{dst_port} at {timestamp}\n")
+        else:
+            debug_text.insert(tk.END, "No recent HTTPS connections found\n")
+            
+        debug_text.insert(tk.END, "\n=== HTTP REQUEST INFO ===\n\n")
+        debug_text.insert(tk.END, f"HTTP Requests: {http_info['http_requests']}\n")
+        debug_text.insert(tk.END, f"HTTP Responses: {http_info['http_responses']}\n\n")
+        
+        if http_info['recent_requests']:
+            debug_text.insert(tk.END, "Recent HTTP Requests:\n")
+            for req in http_info['recent_requests']:
+                method, host, uri, timestamp = req
+                debug_text.insert(tk.END, f"  {method} {host}{uri} at {timestamp}\n")
+        else:
+            debug_text.insert(tk.END, "No recent HTTP requests found\n")
+            
+        # Add suggestions
+        debug_text.insert(tk.END, "\n=== TROUBLESHOOTING SUGGESTIONS ===\n\n")
+        
+        if tls_info['https_connections'] > 0 and tls_info['tls_records'] == 0:
+            debug_text.insert(tk.END, "⚠️ HTTPS connections detected but no TLS records found!\n")
+            debug_text.insert(tk.END, "This indicates that TLS field extraction is failing.\n")
+            debug_text.insert(tk.END, "Check that tshark is capturing TLS handshake fields.\n")
+        
+        if http_info['http_requests'] == 0:
+            debug_text.insert(tk.END, "ℹ️ No HTTP requests found.\n")
+            debug_text.insert(tk.END, "Visit some HTTP websites to generate traffic.\n")
+            
+        debug_text.insert(tk.END, "\nIf tables have low counts, try these steps:\n")
+        debug_text.insert(tk.END, "1. Make sure capture is running\n")
+        debug_text.insert(tk.END, "2. Visit multiple websites to generate traffic\n")
+        debug_text.insert(tk.END, "3. Check tshark command has correct -e parameters\n")
+        debug_text.insert(tk.END, "4. Force a database sync\n")
+        
+        # Make text read-only
+        debug_text.config(state=tk.DISABLED)
+        
+        # Close button
+        ttk.Button(debug_window, text="Close", 
+                 command=debug_window.destroy).pack(pady=10)
+    
     def refresh(self):
         """Refresh all data in the subtab"""
         # Check if enough time has passed since last refresh
@@ -265,7 +430,7 @@ class HttpTlsMonitor(SubtabBase):
         
         self.update_output(f"Loaded {len(http_requests)} HTTP requests")
     
-    def refresh_tls_connections(self, filter_pattern=None):
+    def refresh_tls_connections(self, filter_pattern=None, force=False):
         """Refresh TLS connection data with improved error handling and debugging"""
         if not self.gui or not hasattr(self.gui, 'db_manager'):
             self.update_output("GUI or database manager not available")
@@ -276,6 +441,12 @@ class HttpTlsMonitor(SubtabBase):
             self.tls_tree.delete(item)
         
         db_manager = self.gui.db_manager
+        
+        # Force a database sync if requested
+        if force:
+            self.update_output("Forcing database sync before refreshing TLS data...")
+            sync_count = db_manager.sync_databases()
+            self.update_output(f"Synced {sync_count} records between databases")
         
         # Check TLS table status for debugging
         if hasattr(db_manager, 'check_tls_tables'):
@@ -306,11 +477,22 @@ class HttpTlsMonitor(SubtabBase):
                 else:
                     self.tls_details_text.insert(tk.END, "TShark process is not active\n")
             
+            # Check connection counts
+            try:
+                conn_cursor = db_manager.analysis_conn.cursor()
+                https_count = conn_cursor.execute("SELECT COUNT(*) FROM connections WHERE dst_port = 443").fetchone()[0]
+                self.tls_details_text.insert(tk.END, f"\nHTTPS connections in database: {https_count}\n")
+                conn_cursor.close()
+            except Exception as e:
+                self.tls_details_text.insert(tk.END, f"\nError checking connections: {e}\n")
+            
             # Suggest possible solutions
             self.tls_details_text.insert(tk.END, "\nPossible solutions:\n")
             self.tls_details_text.insert(tk.END, "1. Make sure capture is started\n")
             self.tls_details_text.insert(tk.END, "2. Visit some HTTPS sites to generate TLS traffic\n")
             self.tls_details_text.insert(tk.END, "3. Check log for any TLS processing errors\n")
+            self.tls_details_text.insert(tk.END, "4. Use the 'Debug TLS' button for more information\n")
+            self.tls_details_text.insert(tk.END, "5. Use 'Check Tables' button to verify database status\n")
             
             return
         
@@ -373,6 +555,49 @@ class HttpTlsMonitor(SubtabBase):
                         self.tls_details_text.insert(tk.END, f"- {key}\n")
             else:
                 self.tls_details_text.insert(tk.END, "Could not retrieve database status\n")
+                
+        # Check HTTPS connections
+        try:
+            cursor = db_manager.analysis_conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*) FROM connections WHERE dst_port = 443
+            """)
+            https_count = cursor.fetchone()[0]
+            
+            self.tls_details_text.insert(tk.END, f"\nHTTPS Connections (port 443): {https_count}\n")
+            
+            # Check recent HTTPS connections
+            if https_count > 0:
+                cursor.execute("""
+                    SELECT src_ip, dst_ip, timestamp FROM connections 
+                    WHERE dst_port = 443
+                    ORDER BY timestamp DESC
+                    LIMIT 5
+                """)
+                
+                recent = cursor.fetchall()
+                if recent:
+                    self.tls_details_text.insert(tk.END, "\nRecent HTTPS connections:\n")
+                    for row in recent:
+                        src, dst, ts = row
+                        self.tls_details_text.insert(tk.END, f"- {src} → {dst} at {ts}\n")
+            
+            cursor.close()
+        except Exception as e:
+            self.tls_details_text.insert(tk.END, f"\nError checking HTTPS connections: {e}\n")
+            
+        # Add suggestions
+        self.tls_details_text.insert(tk.END, "\nTroubleshooting steps:\n")
+        
+        if status and status['connections'] > 0 and status['tls_connections'] == 0:
+            self.tls_details_text.insert(tk.END, "1. ⚠️ You have connections but no TLS data - check tshark field extraction\n")
+        else:
+            self.tls_details_text.insert(tk.END, "1. Visit some HTTPS websites to generate TLS traffic\n")
+            
+        self.tls_details_text.insert(tk.END, "2. Verify tshark command includes TLS fields (-e tls.handshake.*)\n")
+        self.tls_details_text.insert(tk.END, "3. Check that TLS field extraction is working in traffic_capture.py\n")
+        self.tls_details_text.insert(tk.END, "4. Force a database sync using the 'Force Refresh' button\n")
+        self.tls_details_text.insert(tk.END, "5. Check sample packets in logs/packets directory for TLS fields\n")
     
     def refresh_suspicious_tls(self):
         """Refresh suspicious TLS connection data"""

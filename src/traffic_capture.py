@@ -27,9 +27,15 @@ class TrafficCaptureEngine:
         self.alerts_by_ip = defaultdict(set)
         self.packet_batch_count = 0
         self.packet_count = 0
+        self.packet_sample_count = 0  # For debug packet sampling
         
         # Use the database manager from the GUI
         self.db_manager = gui.db_manager
+        
+        # Create logs directory if it doesn't exist
+        self.logs_dir = os.path.join(gui.app_root, "logs", "packets")
+        os.makedirs(self.logs_dir, exist_ok=True)
+        self.gui.update_output(f"Packet samples will be saved to {self.logs_dir}")
     
     def get_interfaces(self):
         """Get network interfaces using tshark directly"""
@@ -103,6 +109,7 @@ class TrafficCaptureEngine:
         self.sliding_window_size = sliding_window_size
         self.packet_count = 0
         self.packet_batch_count = 0
+        self.packet_sample_count = 0
         self.capture_thread = threading.Thread(target=self.capture_packets, 
                                               args=(interface,), 
                                               daemon=True)
@@ -122,20 +129,70 @@ class TrafficCaptureEngine:
             self.capture_thread.join(timeout=5)
             self.capture_thread = None
     
+    def save_packet_sample(self, packet_data, packet_type="unknown"):
+        """Save a sample packet to the logs folder for debugging"""
+        try:
+            # Only save up to 20 samples to avoid filling disk
+            if self.packet_sample_count >= 20:
+                return
+                
+            self.packet_sample_count += 1
+            timestamp = int(time.time())
+            filename = f"packet_{packet_type}_{timestamp}_{self.packet_sample_count}.json"
+            filepath = os.path.join(self.logs_dir, filename)
+            
+            with open(filepath, 'w') as f:
+                json.dump(packet_data, f, indent=2)
+                
+            self.gui.update_output(f"Saved {packet_type} packet sample to {filename}")
+        except Exception as e:
+            self.gui.update_output(f"Error saving packet sample: {e}")
+    
     def capture_packets(self, interface):
-        """Capture packets with streaming JSON parser"""
+        """Capture packets with streaming EK format parser"""
         try:
             self.gui.update_output(f"Capturing on interface: {interface}")
             
-            # Construct tshark command with JSON output
+            # Expanded tshark command with more fields for protocol detection
             cmd = [
-                    "tshark",
-                    "-i", interface,
-                    "-T", "json",
-                    "-f", "tcp or udp or icmp",  # Capture all TCP, UDP, and ICMP traffic
-                    "-Y", "http or tls or ssl or http2 or dns or icmp",  # Filter by protocol, not port
-                    "-l"  # Line-buffered output
-                ]
+                "tshark",
+                "-i", interface,
+                "-T", "ek",  # Elasticsearch Kibana format
+                # Basic fields
+                "-e", "frame.time_epoch",
+                "-e", "ip.src", 
+                "-e", "ip.dst",
+                "-e", "ipv6.src", 
+                "-e", "ipv6.dst",
+                "-e", "tcp.srcport", 
+                "-e", "tcp.dstport",
+                "-e", "udp.srcport", 
+                "-e", "udp.dstport",
+                "-e", "frame.len",
+                # DNS fields
+                "-e", "dns.qry.name", 
+                "-e", "dns.qry.type",
+                "-e", "dns.resp.name",
+                "-e", "dns.resp.type",
+                # ICMP fields
+                "-e", "icmp.type",
+                # HTTP fields
+                "-e", "http.host",
+                "-e", "http.request.method",
+                "-e", "http.request.uri",
+                "-e", "http.response.code",
+                "-e", "http.user_agent",
+                "-e", "http.server",
+                "-e", "http.content_type",
+                "-e", "http.content_length",
+                # TLS fields
+                "-e", "tls.handshake.type",
+                "-e", "tls.handshake.version",
+                "-e", "tls.handshake.ciphersuite",
+                "-f", "tcp or udp or icmp",  # Capture filter
+                "-Y", "http or tls or ssl or http2 or dns or icmp",  # Display filter
+                "-l"  # Line-buffered output
+            ]
             
             self.gui.update_output(f"Running command: {' '.join(cmd)}")
             
@@ -143,12 +200,10 @@ class TrafficCaptureEngine:
             self.tshark_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                #bufsize=1  # Line buffered
-                # Remove text=True parameter
+                stderr=subprocess.PIPE
             )
             
-            buffer = ""  # Buffer to accumulate JSON output
+            buffer = ""  # Buffer to accumulate EK output
             last_buffer_log_time = time.time()
             
             # Process each line from tshark
@@ -162,7 +217,7 @@ class TrafficCaptureEngine:
                     continue
                 
                 # Add line to buffer
-                buffer += line
+                buffer += line + "\n"  # Add newline to keep lines separated
                 
                 # Log buffer size occasionally (not more than once every 30 seconds)
                 current_time = time.time()
@@ -171,24 +226,31 @@ class TrafficCaptureEngine:
                     last_buffer_log_time = current_time
                 
                 # Extract complete JSON objects from the buffer
-                objs = self.extract_json_objects(buffer)
-                if objs:
+                packet_objects = self.extract_ek_objects(buffer)
+                if packet_objects:
                     # Only log this for large batches (more than 10 objects)
-                    if len(objs) > 10:
-                        self.gui.update_output(f"Found {len(objs)} complete JSON objects")
+                    if len(packet_objects) > 10:
+                        self.gui.update_output(f"Found {len(packet_objects)} complete JSON objects")
                     
-                    for obj_str in objs:
+                    # Process each packet JSON object
+                    for packet_json in packet_objects:
                         try:
-                            packet_data = json.loads(obj_str)
-                            self.process_packet_json(packet_data)
+                            packet_data = json.loads(packet_json)
+                            # Save a sample of each packet type
+                            if random.random() < 0.05 and self.packet_sample_count < 20:
+                                # Determine packet type for better sample naming
+                                packet_type = self.determine_packet_type(packet_data)
+                                self.save_packet_sample(packet_data, packet_type)
+                                
+                            self.process_packet_ek(packet_data)
                             self.packet_count += 1
                             self.packet_batch_count += 1
                         except json.JSONDecodeError as e:
                             self.gui.update_output(f"JSON Decode Error: {e}")
                     
-                    # Remove parsed objects from buffer - find last closing brace
-                    last_obj_end = buffer.rfind(objs[-1]) + len(objs[-1])
-                    buffer = buffer[last_obj_end:]
+                    # Remove processed content from buffer
+                    # Keep only the last 1000 characters to handle any incomplete objects
+                    buffer = buffer[-1000:] if len(buffer) > 1000 else buffer
                     
                     # Commit database changes in batches
                     if self.packet_batch_count >= self.batch_size:
@@ -224,139 +286,161 @@ class TrafficCaptureEngine:
                 self.tshark_process.terminate()
                 self.tshark_process = None
     
-    def extract_json_objects(self, s):
+    def determine_packet_type(self, packet_data):
+        """Determine packet type for logging purposes"""
+        if not packet_data or "layers" not in packet_data:
+            return "unknown"
+            
+        layers = packet_data.get("layers", {})
+        
+        if "dns_qry_name" in layers:
+            return "dns"
+        elif "http_host" in layers or "http_request_method" in layers:
+            return "http"
+        elif "tls_handshake_type" in layers:
+            return "tls"
+        elif "icmp_type" in layers:
+            return "icmp"
+        elif "tcp_srcport" in layers:
+            return "tcp"
+        elif "udp_srcport" in layers:
+            return "udp"
+        
+        return "unknown"
+    
+    def extract_ek_objects(self, buffer):
         """
-        Extracts complete JSON object strings from a string 's' by scanning for balanced curly braces.
-        Returns a list of JSON object strings.
-        This version is more robust against malformed JSON.
+        Extract data objects from tshark -T ek output format
+        Returns a list of complete JSON data objects (without index lines)
         """
         objects = []
-        start_indices = []
-        bracket_counts = []
+        lines = buffer.strip().split('\n')
         
-        for i, char in enumerate(s):
-            if char == '{':
-                if not start_indices:  # This is the start of a new object
-                    start_indices.append(i)
-                    bracket_counts.append(1)
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            if not line:
+                i += 1
+                continue
+            
+            # Check if this appears to be an index line (first line of a pair)
+            if line.startswith('{"index"'):
+                # The next line should be the data line
+                if i + 1 < len(lines) and lines[i + 1].strip():
+                    data_line = lines[i + 1].strip()
+                    try:
+                        # Validate it's valid JSON before adding
+                        json.loads(data_line)
+                        objects.append(data_line)
+                        # Move past this pair
+                        i += 2
+                    except json.JSONDecodeError:
+                        # If we can't parse the data line, just move forward one line
+                        self.gui.update_output(f"Skipping malformed EK data line: {data_line[:50]}...")
+                        i += 1
                 else:
-                    # Increment the current bracket count
-                    bracket_counts[-1] += 1
-            elif char == '}':
-                if start_indices:  # Only process if we're tracking an object
-                    bracket_counts[-1] -= 1
-                    
-                    # Check if we've closed the current object
-                    if bracket_counts[-1] == 0:
-                        start = start_indices.pop()
-                        bracket_counts.pop()
-                        
-                        # Extract the JSON object
-                        json_obj = s[start:i+1]
-                        
-                        # Validate it's actually parseable JSON before adding
-                        try:
-                            json.loads(json_obj)
-                            objects.append(json_obj)
-                        except json.JSONDecodeError:
-                            self.gui.update_output(f"Skipping malformed JSON object: {json_obj[:50]}...")
+                    # Incomplete pair, just move forward
+                    i += 1
+            else:
+                # If this isn't an index line, try parsing it anyway in case it's a data line
+                try:
+                    json.loads(line)
+                    objects.append(line)
+                except json.JSONDecodeError:
+                    pass
+                i += 1
         
         return objects
     
-    def process_packet_json(self, packet_data):
-        """Process a packet with robust error handling and protocol-specific extraction"""
+    def get_array_value(self, array_field):
+        """
+        Extract first value from an array field, which is the typical structure in EK format.
+        Returns None if the field is not an array or is empty.
+        """
+        if isinstance(array_field, list) and array_field:
+            return array_field[0]
+        return None
+    
+    def get_layer_value(self, layers, field_name):
+        """
+        Get a value from the layers object, handling the EK array format.
+        Returns the first value from the array if present, otherwise None.
+        """
+        if field_name in layers:
+            return self.get_array_value(layers[field_name])
+        return None
+    
+    def process_packet_ek(self, packet_data):
+        """Process a packet in Elasticsearch Kibana format with directly accessed fields"""
         try:
-            # Verify we have a dictionary
-            if not isinstance(packet_data, dict):
-                self.gui.update_output(f"Skipping packet: not a valid dict: {type(packet_data)}")
-                return
-                
-            # Extract source and destination IPs from packet
-            source = packet_data.get("_source", {})
-            if not source:
-                self.gui.update_output("Skipping packet: No _source in packet_data")
-                return
-                
-            layers = source.get("layers", {})
-            if not layers or not isinstance(layers, dict):
-                self.gui.update_output("Skipping packet: No valid layers in packet_data._source")
-                return
+            # Get the layers
+            layers = packet_data.get("layers", {})
+            if not layers:
+                return False
             
-            # Get IP info if available
-            if "ip" not in layers:
-                # This is probably not an IP packet - could be ARP, etc.
-                # Handle non-IP protocols if needed
-                return
-                
-            ip_layer = layers["ip"]
-            if not isinstance(ip_layer, dict):
-                self.gui.update_output(f"Skipping packet: IP layer is not a dict: {type(ip_layer)}")
-                return
-                
-            src_ip = ip_layer.get("ip.src")
-            if not src_ip:
-                self.gui.update_output("Skipping packet: No source IP in packet")
-                return
-                
-            dst_ip = ip_layer.get("ip.dst")
-            if not dst_ip:
-                self.gui.update_output("Skipping packet: No destination IP in packet")
-                return
+            # Extract IP addresses (supporting both IPv4 and IPv6)
+            src_ip = self.get_layer_value(layers, "ip_src") or self.get_layer_value(layers, "ipv6_src")
+            dst_ip = self.get_layer_value(layers, "ip_dst") or self.get_layer_value(layers, "ipv6_dst")
             
-            # Extract port information if available (TCP or UDP)
+            # Basic data validation - we need IPs to proceed
+            if not src_ip or not dst_ip:
+                # Don't log this too frequently
+                if random.random() < 0.05:
+                    self.gui.update_output(f"Missing IP addresses in packet - src:{src_ip}, dst:{dst_ip}")
+                return False
+            
+            # Extract port information (TCP or UDP)
             src_port = None
             dst_port = None
             
-            # Check for TCP layer
-            if "tcp" in layers and isinstance(layers["tcp"], dict):
-                tcp_layer = layers["tcp"]
+            # Get TCP ports
+            tcp_src = self.get_layer_value(layers, "tcp_srcport")
+            if tcp_src:
                 try:
-                    src_port = int(tcp_layer.get("tcp.srcport", 0))
-                    dst_port = int(tcp_layer.get("tcp.dstport", 0))
-                    
-                    # For port scan detection
-                    self._update_port_scan_data(src_ip, dst_ip, dst_port)
+                    src_port = int(tcp_src)
                 except (ValueError, TypeError):
-                    self.gui.update_output("Warning: Could not convert TCP port to integer")
+                    src_port = None
             
-            # Check for UDP layer if TCP not found
-            elif "udp" in layers and isinstance(layers["udp"], dict):
-                udp_layer = layers["udp"]
+            tcp_dst = self.get_layer_value(layers, "tcp_dstport")
+            if tcp_dst:
                 try:
-                    src_port = int(udp_layer.get("udp.srcport", 0))
-                    dst_port = int(udp_layer.get("udp.dstport", 0))
-                    
-                    # For port scan detection
-                    self._update_port_scan_data(src_ip, dst_ip, dst_port)
-                    
-                    # Process DNS over UDP (port 53)
-                    if dst_port == 53 or src_port == 53:
-                        self._process_dns_packet(layers, src_ip, dst_ip)
+                    dst_port = int(tcp_dst)
                 except (ValueError, TypeError):
-                    self.gui.update_output("Warning: Could not convert UDP port to integer")
+                    dst_port = None
             
-            # Check for ICMP
-            elif "icmp" in layers:
-                self._process_icmp_packet(layers, src_ip, dst_ip)
+            # If TCP ports not found, try UDP
+            if src_port is None:
+                udp_src = self.get_layer_value(layers, "udp_srcport")
+                if udp_src:
+                    try:
+                        src_port = int(udp_src)
+                    except (ValueError, TypeError):
+                        src_port = None
             
-            # Get frame info
-            frame = layers.get("frame", {})
-            if not frame:
-                self.gui.update_output("Warning: No frame info in packet, using default length 0")
-                length = 0
-            else:
+            if dst_port is None:
+                udp_dst = self.get_layer_value(layers, "udp_dstport")
+                if udp_dst:
+                    try:
+                        dst_port = int(udp_dst)
+                    except (ValueError, TypeError):
+                        dst_port = None
+            
+            # Get frame length
+            length = 0
+            frame_len = self.get_layer_value(layers, "frame_len")
+            if frame_len:
                 try:
-                    length = int(frame.get("frame.len", 0))
+                    length = int(frame_len)
                 except (ValueError, TypeError):
-                    self.gui.update_output(f"Error converting frame.len to int: {frame.get('frame.len')}")
                     length = 0
             
             # Skip processing if the IP is in the false positives list
             if src_ip in self.gui.false_positives or dst_ip in self.gui.false_positives:
-                return
+                return False
             
             # Create a connection key that includes ports if available
-            if src_port and dst_port:
+            if src_port is not None and dst_port is not None:
                 connection_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
             else:
                 connection_key = f"{src_ip}->{dst_ip}"
@@ -367,6 +451,47 @@ class TrafficCaptureEngine:
                 is_rdp = 1
                 self.gui.update_output(f"Detected RDP connection from {src_ip}:{src_port} to {dst_ip}:{dst_port}")
             
+            # Process specific protocol data if present
+            protocol_detected = False
+            
+            # Process DNS data if present
+            if "dns_qry_name" in layers:
+                self._process_dns_packet_ek(layers, src_ip, dst_ip)
+                protocol_detected = True
+            
+            # Process ICMP data if present
+            if "icmp_type" in layers:
+                self._process_icmp_packet_ek(layers, src_ip, dst_ip)
+                protocol_detected = True
+            
+            # Process HTTP data if present
+            if any(field in layers for field in ["http_host", "http_request_method", "http_request_uri", "http_response_code"]):
+                self._process_http_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
+                protocol_detected = True
+            
+            # Process TLS data if present
+            if any(field in layers for field in ["tls_handshake_type", "tls_handshake_version", "tls_handshake_extensions_server_name"]):
+                self._process_tls_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
+                protocol_detected = True
+            
+            # Port scan detection
+            if dst_port:
+                self._update_port_scan_data(src_ip, dst_ip, dst_port)
+            
+            # Protocol detection based on ports if not already detected
+            if not protocol_detected:
+                # Check standard ports
+                if dst_port == 80:
+                    self.db_manager.add_app_protocol(connection_key, "HTTP", detection_method="port-based")
+                elif dst_port == 443:
+                    self.db_manager.add_app_protocol(connection_key, "HTTPS", detection_method="port-based")
+                elif dst_port == 53 or src_port == 53:
+                    self.db_manager.add_app_protocol(connection_key, "DNS", detection_method="port-based")
+                else:
+                    # Try other protocol detection
+                    self._detect_application_protocol(src_ip, dst_ip, src_port, dst_port, layers, 
+                                                    is_tcp=(src_port is not None and "tcp_srcport" in layers))
+            
             # Use database manager to add packet
             return self.db_manager.add_packet(
                 connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp
@@ -374,6 +499,8 @@ class TrafficCaptureEngine:
                     
         except Exception as e:
             self.gui.update_output(f"Error processing packet: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def _update_port_scan_data(self, src_ip, dst_ip, dst_port):
@@ -384,25 +511,19 @@ class TrafficCaptureEngine:
         # Use database manager to store port scan data
         self.db_manager.add_port_scan_data(src_ip, dst_ip, dst_port)
 
-    def _process_dns_packet(self, layers, src_ip, dst_ip):
-        """Extract and store DNS query information"""
+    def _process_dns_packet_ek(self, layers, src_ip, dst_ip):
+        """Extract and store DNS query information from EK format"""
         try:
-            if "dns" not in layers:
-                return
-                
-            dns_layer = layers["dns"]
-            if not isinstance(dns_layer, dict):
-                return
-                
-            # Extract DNS query name
-            query_name = dns_layer.get("dns.qry.name")
-            if not query_name:
-                return
-                
+            # Extract query name directly from layers
+            query_name = self.get_layer_value(layers, "dns_qry_name")
+            
             # Extract query type
-            query_type = dns_layer.get("dns.qry.type")
-            if not query_type:
-                query_type = "unknown"
+            query_type_raw = self.get_layer_value(layers, "dns_qry_type")
+            query_type = query_type_raw or "unknown"
+            
+            # If we don't have a query name, can't process this DNS packet
+            if not query_name:
+                return False
                 
             # Store DNS query using database manager
             self.db_manager.add_dns_query(src_ip, query_name, query_type)
@@ -410,26 +531,26 @@ class TrafficCaptureEngine:
             # Periodically log DNS activity
             if random.random() < 0.01:  # Log approximately 1% of DNS queries
                 self.gui.update_output(f"DNS Query: {src_ip} -> {query_name} (Type: {query_type})")
+            
+            return True
                 
         except Exception as e:
             self.gui.update_output(f"Error processing DNS packet: {e}")
+            return False
 
-    def _process_icmp_packet(self, layers, src_ip, dst_ip):
-        """Extract and store ICMP packet information"""
+    def _process_icmp_packet_ek(self, layers, src_ip, dst_ip):
+        """Extract and store ICMP packet information from EK format"""
         try:
-            if "icmp" not in layers:
-                return
-                
-            icmp_layer = layers["icmp"]
-            if not isinstance(icmp_layer, dict):
-                return
-                
-            # Extract ICMP type
-            icmp_type = None
-            try:
-                icmp_type = int(icmp_layer.get("icmp.type", 0))
-            except (ValueError, TypeError):
-                icmp_type = 0
+            # Extract ICMP type directly from layers
+            icmp_type_raw = self.get_layer_value(layers, "icmp_type")
+            
+            # Parse ICMP type
+            icmp_type = 0
+            if icmp_type_raw is not None:
+                try:
+                    icmp_type = int(icmp_type_raw)
+                except (ValueError, TypeError):
+                    icmp_type = 0
                 
             # Store ICMP packet using database manager
             self.db_manager.add_icmp_packet(src_ip, dst_ip, icmp_type)
@@ -450,9 +571,12 @@ class TrafficCaptureEngine:
             
             # Queue the ICMP flood check
             self.db_manager.queue_query(check_icmp_flood)
+            
+            return True
                 
         except Exception as e:
             self.gui.update_output(f"Error processing ICMP packet: {e}")
+            return False
             
     def add_alert(self, ip_address, alert_message, rule_name):
         """Add an alert through the database manager's queue"""
@@ -464,270 +588,156 @@ class TrafficCaptureEngine:
             return self.db_manager.queue_alert(ip_address, alert_message, rule_name)
         return False
     
-    def process_packet_json(self, packet_data):
-        """Process a packet with robust error handling and protocol-specific extraction (updated)"""
+    def _process_http_packet_ek(self, layers, src_ip, dst_ip, src_port, dst_port):
+        """Extract and store HTTP packet information from EK format"""
         try:
-            # Verify we have a dictionary
-            if not isinstance(packet_data, dict):
-                self.gui.update_output(f"Skipping packet: not a valid dict: {type(packet_data)}")
-                return
-                
-            # Extract source and destination IPs from packet
-            source = packet_data.get("_source", {})
-            if not source:
-                self.gui.update_output("Skipping packet: No _source in packet_data")
-                return
-                
-            layers = source.get("layers", {})
-            if not layers or not isinstance(layers, dict):
-                self.gui.update_output("Skipping packet: No valid layers in packet_data._source")
-                return
-            
-            # Get IP info if available
-            if "ip" not in layers:
-                # This is probably not an IP packet - could be ARP, etc.
-                # Handle non-IP protocols if needed
-                return
-                
-            ip_layer = layers["ip"]
-            if not isinstance(ip_layer, dict):
-                self.gui.update_output(f"Skipping packet: IP layer is not a dict: {type(ip_layer)}")
-                return
-                
-            src_ip = ip_layer.get("ip.src")
-            if not src_ip:
-                self.gui.update_output("Skipping packet: No source IP in packet")
-                return
-                
-            dst_ip = ip_layer.get("ip.dst")
-            if not dst_ip:
-                self.gui.update_output("Skipping packet: No destination IP in packet")
-                return
-            
-            # Extract port information if available (TCP or UDP)
-            src_port = None
-            dst_port = None
-            protocol_detected = False
-            
-            # Check for TCP layer
-            if "tcp" in layers and isinstance(layers["tcp"], dict):
-                tcp_layer = layers["tcp"]
-                try:
-                    src_port = int(tcp_layer.get("tcp.srcport", 0))
-                    dst_port = int(tcp_layer.get("tcp.dstport", 0))
-                    
-                    # For port scan detection
-                    self._update_port_scan_data(src_ip, dst_ip, dst_port)
-                    
-                    # Check for HTTP or HTTPS (TLS)
-                    if "tls" in layers or "ssl" in layers:
-                        tls_layer = layers.get("tls", layers.get("ssl", {}))
-                        if isinstance(tls_layer, dict):
-                            self._process_tls_packet(layers, src_ip, dst_ip, src_port, dst_port)
-                            protocol_detected = True
-                        
-                    # Check for HTTP (non-TLS)
-                    elif "http" in layers:
-                        protocol_detected = True
-                        self._process_http_packet(layers, src_ip, dst_ip, src_port, dst_port)
-                        
-                    # Application protocol detection based on ports
-                    elif not protocol_detected:
-                        self._detect_application_protocol(src_ip, dst_ip, src_port, dst_port, layers)
-                        
-                except (ValueError, TypeError):
-                    self.gui.update_output("Warning: Could not convert TCP port to integer")
-            
-            # Check for UDP layer if TCP not found
-            elif "udp" in layers and isinstance(layers["udp"], dict):
-                udp_layer = layers["udp"]
-                try:
-                    src_port = int(udp_layer.get("udp.srcport", 0))
-                    dst_port = int(udp_layer.get("udp.dstport", 0))
-                    
-                    # For port scan detection
-                    self._update_port_scan_data(src_ip, dst_ip, dst_port)
-                    
-                    # Process DNS over UDP (port 53)
-                    if dst_port == 53 or src_port == 53:
-                        self._process_dns_packet(layers, src_ip, dst_ip)
-                        protocol_detected = True
-                    
-                    # Application protocol detection for UDP
-                    if not protocol_detected:
-                        self._detect_application_protocol(src_ip, dst_ip, src_port, dst_port, layers, is_tcp=False)
-                        
-                except (ValueError, TypeError):
-                    self.gui.update_output("Warning: Could not convert UDP port to integer")
-            
-            # Check for ICMP
-            elif "icmp" in layers:
-                self._process_icmp_packet(layers, src_ip, dst_ip)
-            
-            # Get frame info
-            frame = layers.get("frame", {})
-            if not frame:
-                self.gui.update_output("Warning: No frame info in packet, using default length 0")
-                length = 0
-            else:
-                try:
-                    length = int(frame.get("frame.len", 0))
-                except (ValueError, TypeError):
-                    self.gui.update_output(f"Error converting frame.len to int: {frame.get('frame.len')}")
-                    length = 0
-            
-            # Skip processing if the IP is in the false positives list
-            if src_ip in self.gui.false_positives or dst_ip in self.gui.false_positives:
-                return
-            
-            # Create a connection key that includes ports if available
-            if src_port and dst_port:
-                connection_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
-            else:
-                connection_key = f"{src_ip}->{dst_ip}"
-            
-            # Check for RDP connection (port 3389)
-            is_rdp = 0
-            if dst_port == 3389:
-                is_rdp = 1
-                self.gui.update_output(f"Detected RDP connection from {src_ip}:{src_port} to {dst_ip}:{dst_port}")
-            
-            # Use database manager to add packet
-            return self.db_manager.add_packet(
-                connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp
-            )
-                    
-        except Exception as e:
-            self.gui.update_output(f"Error processing packet: {e}")
-            return False
-
-    def _process_http_packet(self, layers, src_ip, dst_ip, src_port, dst_port):
-        """Extract and store HTTP packet information"""
-        try:
-            if "http" not in layers:
-                return False
-                
-            http_layer = layers["http"]
-            if not isinstance(http_layer, dict):
-                return False
-            
             # Create connection key
             connection_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
             
             # Record application protocol
             self.db_manager.add_app_protocol(connection_key, "HTTP", detection_method="direct")
             
-            # Check if packet is a request or response
-            if "http.request" in http_layer:
-                # Process HTTP request
-                return self._process_http_request(http_layer, connection_key)
-            elif "http.response" in http_layer:
-                # Process HTTP response
-                return self._process_http_response(http_layer, connection_key)
-                
-            # This is an HTTP packet but not a complete request or response
-            # Could be a continuation packet or other HTTP data
-            # Attempt to extract any useful information
-            host = http_layer.get("http.host")
-            path = http_layer.get("http.request.uri")
-            method = http_layer.get("http.request.method")
+            # Extract HTTP fields directly from layers
+            method = self.get_layer_value(layers, "http_request_method")
+            uri = self.get_layer_value(layers, "http_request_uri")
+            host = self.get_layer_value(layers, "http_host")
+            user_agent = self.get_layer_value(layers, "http_user_agent")
+            status_code_raw = self.get_layer_value(layers, "http_response_code")
+            server = self.get_layer_value(layers, "http_server")
+            content_type = self.get_layer_value(layers, "http_content_type")
+            content_length_raw = self.get_layer_value(layers, "http_content_length")
             
-            if host or path or method:
-                # This is likely part of a request
-                headers = {}
+            # Parse content length if present
+            content_length = 0
+            if content_length_raw:
+                try:
+                    content_length = int(content_length_raw)
+                except (ValueError, TypeError):
+                    content_length = 0
+            
+            # Determine if this is a request or response
+            is_request = method is not None or uri is not None or host is not None
+            is_response = status_code_raw is not None
+            
+            # Process as a request
+            if is_request:
+                return self._process_http_request(
+                    connection_key, 
+                    method or "GET",  # Default method
+                    host or dst_ip,   # Use destination IP if host not available
+                    uri or "/",       # Default URI
+                    user_agent or "", 
+                    content_type or "",
+                    content_length
+                )
+            # Process as a response
+            elif is_response:
+                # Try to find the corresponding request
+                cursor = self.db_manager.get_cursor_for_rules()
+                cursor.execute("""
+                    SELECT id FROM http_requests 
+                    WHERE connection_key = ? 
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (connection_key,))
                 
-                # Extract available HTTP headers
-                for key, value in http_layer.items():
-                    if key.startswith("http.") and not key.startswith("http.response"):
-                        header_name = key[5:].replace("_", "-").title()
-                        headers[header_name] = value
+                result = cursor.fetchone()
+                cursor.close()
                 
-                # Convert headers to JSON
+                if result:
+                    request_id = result[0]
+                    
+                    # Parse status code
+                    status_code = 0
+                    if status_code_raw:
+                        try:
+                            status_code = int(status_code_raw)
+                        except (ValueError, TypeError):
+                            status_code = 0
+                    
+                    # Create headers dictionary
+                    headers = {}
+                    if server:
+                        headers["Server"] = server
+                    if content_type:
+                        headers["Content-Type"] = content_type
+                    if content_length > 0:
+                        headers["Content-Length"] = str(content_length)
+                    
+                    # Convert headers to JSON
+                    headers_json = json.dumps(headers)
+                    
+                    # Store the response
+                    return self.db_manager.add_http_response(
+                        request_id,
+                        status_code,
+                        content_type or "",
+                        content_length,
+                        server or "",
+                        headers_json
+                    )
+            
+            # If it has host information but doesn't clearly fit request/response pattern
+            if host:
+                # Create minimal request
+                headers = {"Host": host}
+                if user_agent:
+                    headers["User-Agent"] = user_agent
+                
                 headers_json = json.dumps(headers)
                 
-                # If we have at least some request information, store it
-                if host or path or method:
-                    self.db_manager.add_http_request(
-                        connection_key, 
-                        method or "UNKNOWN", 
-                        host or "unknown", 
-                        path or "/", 
-                        "HTTP/1.1", # Assume HTTP/1.1 if not specified
-                        http_layer.get("http.user_agent", ""),
-                        http_layer.get("http.referer", ""),
-                        http_layer.get("http.content_type", ""),
-                        headers_json, 
-                        0  # Unknown request size
-                    )
-                    return True
-                
+                # Store minimal HTTP request
+                self.db_manager.add_http_request(
+                    connection_key, 
+                    "GET",         # Assumed method
+                    host,
+                    "/",           # Assumed path
+                    "HTTP/1.1",    # Assumed version
+                    user_agent or "",
+                    "",            # No referer
+                    content_type or "",
+                    headers_json,
+                    content_length
+                )
+                return True
+            
             return False
+            
         except Exception as e:
             self.gui.update_output(f"Error processing HTTP packet: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
-    def _process_http_request(self, http_layer, connection_key):
-        """Process HTTP request data with improved header extraction"""
+    def _process_http_request(self, connection_key, method, host, uri, user_agent, content_type, content_length):
+        """Process HTTP request with simplified field extraction"""
         try:
-            # Extract request details
-            method = http_layer.get("http.request.method", "")
-            uri = http_layer.get("http.request.uri", "")
-            version = http_layer.get("http.request.version", "")
+            # Create headers dictionary
+            headers = {"Host": host}
             
-            # Extract headers
-            headers = {}
-            host = None
-            user_agent = None
-            referer = None
-            content_type = None
-            request_size = 0
-            
-            # Loop through all keys to find headers
-            for key, value in http_layer.items():
-                if key == "http.request.line" or key == "http.response.line":
-                    continue
-                    
-                # Extract specific important headers
-                if key == "http.host":
-                    host = value
-                    headers["Host"] = value
-                elif key == "http.user_agent":
-                    user_agent = value
-                    headers["User-Agent"] = value
-                elif key == "http.referer":
-                    referer = value
-                    headers["Referer"] = value
-                elif key == "http.content_type":
-                    content_type = value
-                    headers["Content-Type"] = value
-                elif key == "http.content_length":
-                    try:
-                        request_size = int(value)
-                        headers["Content-Length"] = value
-                    except (ValueError, TypeError):
-                        pass
-                elif key.startswith("http.") and ":" in key:
-                    # Handle explicitly formatted headers (http.header_name: value)
-                    header_parts = key.split(":", 1)
-                    if len(header_parts) == 2:
-                        header_name = header_parts[0][5:].replace("_", "-").title()
-                        headers[header_name] = value
-                elif key.startswith("http.") and not key.startswith("http.response"):
-                    # Convert http.header_name to Header-Name format
-                    header_name = key[5:].replace("_", "-").title()
-                    headers[header_name] = value
+            if user_agent:
+                headers["User-Agent"] = user_agent
+                
+            if content_type:
+                headers["Content-Type"] = content_type
+                
+            if content_length > 0:
+                headers["Content-Length"] = str(content_length)
             
             # Convert headers to JSON
             headers_json = json.dumps(headers)
             
-            # If host is missing but present in the headers, extract it
-            if not host and "Host" in headers:
-                host = headers["Host"]
-            
             # Store in database
             request_id = self.db_manager.add_http_request(
-                connection_key, method, host, uri, version, 
-                user_agent, referer, content_type, headers_json, request_size
+                connection_key,
+                method,
+                host,
+                uri,
+                "HTTP/1.1",    # Assumed version
+                user_agent or "",
+                "",            # No referer in EK format
+                content_type or "",
+                headers_json,
+                content_length
             )
             
             # Log a small percentage of HTTP requests for monitoring
@@ -735,306 +745,59 @@ class TrafficCaptureEngine:
                 self.gui.update_output(f"HTTP: {method} {host}{uri}")
             
             return request_id is not None
+            
         except Exception as e:
             self.gui.update_output(f"Error processing HTTP request: {e}")
             return False
 
-    def _process_http_response(self, http_layer, connection_key):
-        """Process HTTP response data"""
+    def _process_tls_packet_ek(self, layers, src_ip, dst_ip, src_port, dst_port):
+        """Extract and store TLS/SSL packet information from EK format"""
         try:
-            # Find the corresponding request ID
-            # This is challenging with tshark JSON output since we don't have request-response tracking
-            # We'll need to make a best guess based on the connection
-            
-            # First, query for the most recent request for this connection
-            cursor = self.db_manager.get_cursor_for_rules()
-            cursor.execute("""
-                SELECT id FROM http_requests 
-                WHERE connection_key = ? 
-                ORDER BY timestamp DESC LIMIT 1
-            """, (connection_key,))
-            
-            result = cursor.fetchone()
-            cursor.close()
-            
-            if not result:
-                # No matching request found
-                return False
-                
-            request_id = result[0]
-            
-            # Extract response details
-            status_code = None
-            if "http.response.code" in http_layer:
-                try:
-                    status_code = int(http_layer["http.response.code"])
-                except (ValueError, TypeError):
-                    status_code = 0
-            
-            # Extract headers
-            headers = {}
-            server = None
-            content_type = None
-            content_length = 0
-            
-            # Loop through all keys to find headers
-            for key, value in http_layer.items():
-                if key.startswith("http.response.line"):
-                    continue
-                    
-                # Extract specific important headers
-                if key == "http.server":
-                    server = value
-                    headers["Server"] = value
-                elif key == "http.content_type":
-                    content_type = value
-                    headers["Content-Type"] = value
-                elif key == "http.content_length":
-                    try:
-                        content_length = int(value)
-                        headers["Content-Length"] = value
-                    except (ValueError, TypeError):
-                        pass
-                elif key.startswith("http.") and not key.startswith("http.request"):
-                    # Convert http.header_name to Header-Name format
-                    header_name = key[5:].replace("_", "-").title()
-                    headers[header_name] = value
-            
-            # Convert headers to JSON
-            headers_json = json.dumps(headers)
-            
-            # Store in database
-            return self.db_manager.add_http_response(
-                request_id, status_code, content_type, content_length, server, headers_json
-            )
-        except Exception as e:
-            self.gui.update_output(f"Error processing HTTP response: {e}")
-            return False
-
-    def _process_tls_packet(self, layers, src_ip, dst_ip, src_port, dst_port):
-        """Extract and store TLS/SSL packet information with deep packet inspection"""
-        try:
-            # Check for any TLS/SSL layer
-            tls_layer = None
-            if "tls" in layers and isinstance(layers["tls"], dict):
-                tls_layer = layers["tls"]
-            elif "ssl" in layers and isinstance(layers["ssl"], dict):
-                tls_layer = layers["ssl"]
-                
-            if not tls_layer:
-                return False
-            
             # Create connection key
             connection_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
-            
-            # Log detection of TLS traffic
-            self.gui.update_output(f"Detected TLS traffic: {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
-            
-            # Dump all TLS layer keys for debugging
-            tls_keys = list(tls_layer.keys())
-            self.gui.update_output(f"TLS layer contains {len(tls_keys)} fields: {', '.join(tls_keys[:5])}...")
             
             # Record application protocol
             self.db_manager.add_app_protocol(connection_key, "TLS/SSL", detection_method="direct")
             
-            # Extract TLS details with deep inspection
-            tls_version = None
-            cipher_suite = None
-            server_name = None
-            ja3_fingerprint = None
-            ja3s_fingerprint = None
+            # Extract TLS fields directly from layers
+            tls_version = self.get_layer_value(layers, "tls_handshake_version")
+            cipher_suite = self.get_layer_value(layers, "tls_handshake_ciphersuite")
+            server_name = self.get_layer_value(layers, "tls_handshake_extensions_server_name")
+            cert_issuer = self.get_layer_value(layers, "tls_handshake_cert_issuer")
+            cert_subject = self.get_layer_value(layers, "tls_handshake_cert_subject")
+            cert_valid_from = self.get_layer_value(layers, "tls_handshake_cert_not_before")
+            cert_valid_to = self.get_layer_value(layers, "tls_handshake_cert_not_after")
             
-            # Certificate information
-            cert_issuer = None
-            cert_subject = None
-            cert_valid_from = None
-            cert_valid_to = None
-            cert_serial = None
-            
-            # IMPROVED: Check ALL possible fields for TLS version - TShark's output varies
-            for key in tls_layer.keys():
-                # TLS Version - check various field patterns
-                if any(key.endswith(suffix) for suffix in ['.version', '.record.version', '.handshake.version']):
-                    version_raw = tls_layer[key]
-                    # Map numerical versions to human-readable form
-                    version_map = {
-                        "0x0300": "SSLv3",
-                        "0x0301": "TLSv1.0",
-                        "0x0302": "TLSv1.1",
-                        "0x0303": "TLSv1.2",
-                        "0x0304": "TLSv1.3"
-                    }
-                    tls_version = version_map.get(version_raw, version_raw)
-                    self.gui.update_output(f"Found TLS version: {tls_version} from field {key}")
-                
-                # Cipher Suite - check various field patterns
-                if any(pattern in key for pattern in ['cipher', 'ciphersuite']):
-                    cipher_suite = tls_layer[key]
-                    self.gui.update_output(f"Found cipher suite: {cipher_suite} from field {key}")
-                
-                # Server Name Indication (SNI)
-                if any(pattern in key for pattern in ['server_name', 'servername', 'sni']):
-                    server_name = tls_layer[key]
-                    self.gui.update_output(f"Found SNI: {server_name} from field {key}")
-                
-                # Certificate fields
-                if 'certificate' in key or 'cert' in key:
-                    # Look for specific certificate details in this key and all keys
-                    for cert_key, value in tls_layer.items():
-                        # Issuer name
-                        if any(pattern in cert_key for pattern in ['issuer', 'issuer_name']):
-                            cert_issuer = value
-                        # Subject name
-                        elif any(pattern in cert_key for pattern in ['subject', 'subject_name']):
-                            cert_subject = value
-                        # Validity period
-                        elif any(pattern in cert_key for pattern in ['not_before', 'validity.not_before']):
-                            cert_valid_from = value
-                        elif any(pattern in cert_key for pattern in ['not_after', 'validity.not_after']):
-                            cert_valid_to = value
-                        # Serial number
-                        elif any(pattern in cert_key for pattern in ['serial', 'serialnumber']):
-                            cert_serial = value
-            
-            # IMPROVED: Extract server name from HTTP Host header if SNI is missing
-            if not server_name and "http" in layers and isinstance(layers["http"], dict):
-                http_layer = layers["http"]
-                if "http.host" in http_layer:
-                    server_name = http_layer["http.host"]
-                    self.gui.update_output(f"Using HTTP host as server name: {server_name}")
-            
-            # IMPROVED: For Client Hello, extract more details
-            handshake_type = None
-            for key in tls_layer.keys():
-                if key.endswith('.handshake.type'):
-                    handshake_type = tls_layer[key]
-                    break
-                    
-            if handshake_type == "1":  # ClientHello
-                self.gui.update_output("Processing ClientHello")
-                # Extract more ClientHello details
-                client_hello_data = {}
-                
-                for key in tls_layer.keys():
-                    # Extract cipher suites list
-                    if 'ciphersuites' in key and isinstance(tls_layer[key], list):
-                        client_hello_data['cipher_suites'] = tls_layer[key]
-                    # Extract extensions
-                    elif 'extension' in key:
-                        extension_key = key.split('.')[-1]
-                        client_hello_data[f'extension_{extension_key}'] = tls_layer[key]
-                
-                # Create a JA3 fingerprint using available data
-                if tls_version or client_hello_data:
-                    import hashlib
-                    ja3_components = []
-                    
-                    # Add TLS version if available
-                    if tls_version:
-                        ja3_components.append(tls_version)
-                    
-                    # Add cipher suites if available
-                    if 'cipher_suites' in client_hello_data:
-                        ja3_components.append(','.join(client_hello_data['cipher_suites']))
-                    
-                    # Add extensions if available
-                    extensions = [v for k, v in client_hello_data.items() if k.startswith('extension_')]
-                    if extensions:
-                        ja3_components.append(','.join(extensions))
-                    
-                    # Generate fingerprint
-                    if ja3_components:
-                        fingerprint_input = '-'.join(ja3_components)
-                        ja3_fingerprint = hashlib.md5(fingerprint_input.encode()).hexdigest()
-                        self.gui.update_output(f"Generated JA3 fingerprint: {ja3_fingerprint}")
-            
-            # IMPROVED: For Server Hello, extract more details
-            elif handshake_type == "2":  # ServerHello
-                self.gui.update_output("Processing ServerHello")
-                # Similar to ClientHello but for server response
-                server_hello_data = {}
-                
-                for key in tls_layer.keys():
-                    if 'selected_cipher' in key or 'ciphersuite' in key:
-                        server_hello_data['cipher_suite'] = tls_layer[key]
-                    elif 'extension' in key:
-                        extension_key = key.split('.')[-1]
-                        server_hello_data[f'extension_{extension_key}'] = tls_layer[key]
-                
-                # Create a JA3S fingerprint
-                if tls_version or server_hello_data:
-                    import hashlib
-                    ja3s_components = []
-                    
-                    if tls_version:
-                        ja3s_components.append(tls_version)
-                    
-                    if 'cipher_suite' in server_hello_data:
-                        ja3s_components.append(server_hello_data['cipher_suite'])
-                    
-                    extensions = [v for k, v in server_hello_data.items() if k.startswith('extension_')]
-                    if extensions:
-                        ja3s_components.append(','.join(extensions))
-                    
-                    if ja3s_components:
-                        fingerprint_input = '-'.join(ja3s_components)
-                        ja3s_fingerprint = hashlib.md5(fingerprint_input.encode()).hexdigest()
-                        self.gui.update_output(f"Generated JA3S fingerprint: {ja3s_fingerprint}")
-            
-            # IMPROVED: Extract domain from certificate if SNI is missing
-            if not server_name and cert_subject:
-                # Look for CN=domain.com in the subject
-                import re
-                cn_match = re.search(r'CN=([^,]+)', cert_subject)
-                if cn_match:
-                    server_name = cn_match.group(1)
-                    self.gui.update_output(f"Extracted server name from certificate: {server_name}")
-                    
-            # IMPROVED: DNS resolution for IP addresses
-            if not server_name or server_name.replace('.', '').isdigit():
-                # If we only have an IP address, try to do a reverse DNS lookup
-                import socket
-                try:
-                    hostname, _, _ = socket.gethostbyaddr(dst_ip)
-                    if hostname and hostname != dst_ip:
-                        server_name = hostname
-                        self.gui.update_output(f"Resolved hostname via reverse DNS: {server_name}")
-                except (socket.herror, socket.gaierror):
-                    # If reverse lookup fails, keep the IP
-                    server_name = server_name or dst_ip
-                    self.gui.update_output(f"Using destination IP as server name: {server_name}")
-            
-            # IMPROVED: Fill in defaults for missing data
+            # Set default values if needed
             if not tls_version:
-                # If this is port 443, assume TLS 1.2 if we can't detect it
                 if dst_port == 443:
                     tls_version = "TLSv1.2 (assumed)"
-                    self.gui.update_output("Assuming TLSv1.2 for HTTPS traffic")
                 else:
                     tls_version = "Unknown"
-                    
-            if not cipher_suite:
-                # Check if we have cipher info in other TLS fields
-                cipher_found = False
-                for key, value in tls_layer.items():
-                    if 'cipher' in key.lower() and isinstance(value, str):
-                        cipher_suite = value
-                        cipher_found = True
-                        self.gui.update_output(f"Found cipher from field {key}: {value}")
-                        break
-                        
-                if not cipher_found:
-                    cipher_suite = "Unknown"
             
-            # Store in database with whatever information we have
+            if not cipher_suite:
+                cipher_suite = "Unknown"
+            
+            # If no server name available, use destination IP
+            if not server_name:
+                server_name = dst_ip
+            
+            # We don't attempt to calculate JA3/JA3S fingerprints here
+            ja3_fingerprint = ""
+            ja3s_fingerprint = ""
+            cert_serial = ""
+            
+            # Store in database
             success = self.db_manager.add_tls_connection(
                 connection_key, tls_version, cipher_suite, server_name, 
-                ja3_fingerprint, ja3s_fingerprint, cert_issuer, cert_subject,
-                cert_valid_from, cert_valid_to, cert_serial
+                ja3_fingerprint, ja3s_fingerprint, cert_issuer or "", cert_subject or "",
+                cert_valid_from or "", cert_valid_to or "", cert_serial
             )
             
+            # Log success or failure
             if success:
                 self.gui.update_output(f"Stored TLS connection: {server_name} ({tls_version})")
+                
                 # Trigger a refresh of the TLS tab if it's currently visible
                 if hasattr(self.gui, 'subtabs') and self.gui.subtabs:
                     for subtab in self.gui.subtabs:
@@ -1106,12 +869,6 @@ class TrafficCaptureEngine:
             # Check source port (less reliable but still useful)
             elif src_port in port_map:
                 protocol = port_map[src_port]
-            
-            # Additional protocol detection based on content signatures
-            if not protocol:
-                # For now, this is a placeholder for future enhancement
-                # We would add pattern matching on the packet content here
-                pass
             
             # If we detected a protocol, store it
             if protocol:
