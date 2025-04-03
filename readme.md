@@ -3,6 +3,7 @@
 A comprehensive network traffic analyzer and security monitoring tool for detecting and alerting on suspicious network activity.
 
 ![Traffic Monkey Interface](gui_1.png)
+![Traffic Monkey Interface](gui_2.png)
 
 ## Overview
 
