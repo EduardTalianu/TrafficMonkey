@@ -148,7 +148,7 @@ Traffic Monkey needs elevated privileges to capture network traffic:
 3. Click "Start Capture" to begin monitoring
 4. Configure detection rules in the "Rules" tab
 5. Explore the other tabs to become familiar with the interface
-6. download the mmdb databases from https://github.com/P3TERX/GeoLite.mmdb or elsewhere and place them in utils folder. These are needed for Geo Location subtab.
+6. download the mmdb databases from MaxMinde or elswhere such as https://github.com/P3TERX/GeoLite.mmdb and place them in utils folder. These are needed for Geo Location subtab.
 
 ## Architecture
 
