@@ -13,7 +13,7 @@ from datetime import datetime
 from PIL import Image, ImageTk
 
 class GeoLocationSubtab(SubtabBase):
-    """Subtab that displays alerts with geographical information"""
+    """Subtab that displays alerts with geo-location information"""
     
     def __init__(self):
         super().__init__(
@@ -24,13 +24,18 @@ class GeoLocationSubtab(SubtabBase):
         self.geo_details_tree = None
         self.selected_ip_var = None
         self.geo_data_cache = {}
+        self.asn_cache = {}  # Cache for ASN information
         self.city_reader = None
         self.country_reader = None
+        self.asn_reader = None  # New ASN database reader
         self.city_db_path = None
         self.country_db_path = None
+        self.asn_db_path = None
         self.ip_filter = None
         self.map_image = None
         self.map_photo = None
+        self.show_only_external_var = tk.BooleanVar(value=False)
+        self.show_only_alerts_var = tk.BooleanVar(value=False)
         
     def create_ui(self):
         """Create UI components for Geo Location subtab"""
@@ -64,18 +69,24 @@ class GeoLocationSubtab(SubtabBase):
         ttk.Button(filter_frame, text="Clear Filter", 
                   command=lambda: (self.ip_filter.delete(0, tk.END), self.refresh())).pack(side="left", padx=5)
                   
-        # Add a button to filter only for external IPs
-        self.show_only_external_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filter_frame, text="Show Only External IPs", 
-                      variable=self.show_only_external_var,
-                      command=self.refresh).pack(side="right", padx=5)
+        # Add checkboxes for filtering options
+        options_frame = ttk.Frame(self.tab_frame)
+        options_frame.pack(fill="x", padx=10, pady=5)
         
-        # Geo location treeview
+        ttk.Checkbutton(options_frame, text="Show Only External IPs", 
+                      variable=self.show_only_external_var,
+                      command=self.refresh).pack(side="left", padx=5)
+        
+        ttk.Checkbutton(options_frame, text="Show Only IPs with Alerts", 
+                      variable=self.show_only_alerts_var,
+                      command=self.refresh).pack(side="left", padx=5)
+        
+        # Geo location treeview - now with AS Owner column
         self.geo_tree, _ = gui.tab_factory.create_tree_with_scrollbar(
             self.tab_frame,
-            columns=("ip", "country", "city", "alerts"),
-            headings=["IP Address", "Country", "City", "Alert Count"],
-            widths=[150, 100, 150, 80],
+            columns=("ip", "country", "city", "as_owner", "alerts", "connections"),
+            headings=["IP Address", "Country", "City", "AS Owner", "Alerts", "Connections"],
+            widths=[150, 100, 120, 200, 60, 80],
             height=10
         )
         
@@ -151,8 +162,8 @@ class GeoLocationSubtab(SubtabBase):
             
             # Ask user if they want to download
             if messagebox.askyesno("Download Map", 
-                                "No local map file found. Would you like to download a world map image?\n\n"
-                                "The map will be used for IP visualization."):
+                                  "No local map file found. Would you like to download a world map image?\n\n"
+                                  "The map will be used for IP visualization."):
                 # Show downloading status
                 self.update_output("Downloading world map...")
                 
@@ -167,7 +178,6 @@ class GeoLocationSubtab(SubtabBase):
                 
         except Exception as e:
             self.update_output(f"Error with map download dialog: {e}")
-
     
     def _background_map_download(self, url, save_path):
         """Download the world map image in a background thread and save it locally"""
@@ -204,15 +214,17 @@ class GeoLocationSubtab(SubtabBase):
             return False
     
     def load_geoip_databases(self):
-        """Load both city and country GeoIP databases"""
+        """Load all available GeoIP databases (City, Country, and ASN)"""
         # Define paths in utils folder
         utils_path = os.path.join(gui.app_root, "utils")
         city_db_path = os.path.join(utils_path, "GeoLite2-City.mmdb")
         country_db_path = os.path.join(utils_path, "GeoLite2-Country.mmdb")
+        asn_db_path = os.path.join(utils_path, "GeoLite2-ASN.mmdb")  # New ASN database
         
         # Check if files exist
         city_exists = os.path.exists(city_db_path)
         country_exists = os.path.exists(country_db_path)
+        asn_exists = os.path.exists(asn_db_path)
         
         # Close existing readers if they exist
         if self.city_reader:
@@ -222,6 +234,10 @@ class GeoLocationSubtab(SubtabBase):
         if self.country_reader:
             self.country_reader.close()
             self.country_reader = None
+            
+        if self.asn_reader:
+            self.asn_reader.close()
+            self.asn_reader = None
         
         # Load databases that exist
         status_messages = []
@@ -249,26 +265,40 @@ class GeoLocationSubtab(SubtabBase):
                 status_messages.append("Country DB: Error")
         else:
             status_messages.append("Country DB: Not found")
+            
+        # Try to load ASN database
+        if asn_exists:
+            try:
+                self.asn_reader = geoip2.database.Reader(asn_db_path)
+                self.asn_db_path = asn_db_path
+                status_messages.append("ASN DB: Loaded")
+            except Exception as e:
+                self.update_output(f"Error loading ASN database: {e}")
+                status_messages.append("ASN DB: Error")
+        else:
+            status_messages.append("ASN DB: Not found")
         
         # Update status
         self.db_status_var.set(" | ".join(status_messages))
         
-        # Show warning if neither database was loaded
-        if not self.city_reader and not self.country_reader:
+        # Show warning if no databases were loaded
+        if not self.city_reader and not self.country_reader and not self.asn_reader:
             self.update_output("No GeoIP databases could be loaded")
             messagebox.showwarning("Databases Not Found", 
                                  f"GeoIP databases not found in {utils_path}\n\n"
-                                 "Please download GeoLite2-City.mmdb and GeoLite2-Country.mmdb from MaxMind "
-                                 "and place them in the utils/ folder.")
+                                 "Please download GeoLite2-City.mmdb, GeoLite2-Country.mmdb, and GeoLite2-ASN.mmdb "
+                                 "from MaxMind and place them in the utils/ folder.")
             return False
         
         # Success message
-        if self.city_reader or self.country_reader:
-            self.update_output("GeoIP databases loaded successfully")
-            self.refresh()  # Refresh the display
-            return True
-            
-        return False
+        loaded_dbs = []
+        if self.city_reader: loaded_dbs.append("City")
+        if self.country_reader: loaded_dbs.append("Country")
+        if self.asn_reader: loaded_dbs.append("ASN")
+        
+        self.update_output(f"Loaded GeoIP databases: {', '.join(loaded_dbs)}")
+        self.refresh()  # Refresh the display
+        return True
     
     def get_ip_location(self, ip):
         """Get location data for an IP address using geoip2 with fallback"""
@@ -288,21 +318,33 @@ class GeoLocationSubtab(SubtabBase):
                 "organization": "Local Network",
                 "timezone": "Local",
                 "database": "Local",
-                "is_local": True
+                "is_local": True,
+                "asn": None,
+                "as_org": "Local Network"
             }
             # Cache the result
             self.geo_data_cache[ip] = location
             return location
         
-        location = {"country": "Unknown", "city": "Unknown"}
+        location = {"country": "Unknown", "city": "Unknown", "asn": None, "as_org": "Unknown"}
         
-        # Try city database first for more detailed info
+        # Try ASN database to get organization info
+        if self.asn_reader:
+            try:
+                asn_response = self.asn_reader.asn(ip)
+                location["asn"] = asn_response.autonomous_system_number
+                location["as_org"] = asn_response.autonomous_system_organization
+            except Exception:
+                # If lookup fails, we'll leave ASN info as default values
+                pass
+        
+        # Try city database for location info
         if self.city_reader:
             try:
                 city_response = self.city_reader.city(ip)
                 
                 # Extract location information
-                location = {
+                location.update({
                     "country": city_response.country.name or "Unknown",
                     "city": city_response.city.name or "Unknown",
                     "region": city_response.subdivisions.most_specific.name if city_response.subdivisions else "Unknown",
@@ -314,7 +356,7 @@ class GeoLocationSubtab(SubtabBase):
                     "timezone": city_response.location.time_zone or "Unknown",
                     "database": "City",
                     "is_local": False
-                }
+                })
                 
                 # Cache the result
                 self.geo_data_cache[ip] = location
@@ -327,13 +369,13 @@ class GeoLocationSubtab(SubtabBase):
                 self.update_output(f"Error looking up IP {ip} in City database: {e}")
                 # Fall through to country database
         
-        # Try country database as fallback
+        # Try country database as fallback for location
         if self.country_reader:
             try:
                 country_response = self.country_reader.country(ip)
                 
                 # Build minimal location info
-                location = {
+                location.update({
                     "country": country_response.country.name or "Unknown",
                     "city": "Unknown",  # Not available in Country database
                     "region": "Unknown",  # Not available in Country database
@@ -345,7 +387,7 @@ class GeoLocationSubtab(SubtabBase):
                     "timezone": "Unknown",
                     "database": "Country",
                     "is_local": False
-                }
+                })
                 
                 # Cache the result
                 self.geo_data_cache[ip] = location
@@ -353,35 +395,54 @@ class GeoLocationSubtab(SubtabBase):
                 
             except geoip2.errors.AddressNotFoundError:
                 # IP not found in either database
-                location = {"country": "Not Found", "city": "Not Found", "database": "None", "is_local": False}
+                location.update({
+                    "country": "Not Found", 
+                    "city": "Not Found", 
+                    "database": "None", 
+                    "is_local": False
+                })
                 self.geo_data_cache[ip] = location
                 return location
             except Exception as e:
                 self.update_output(f"Error looking up IP {ip} in Country database: {e}")
-                location = {"country": "Error", "city": "Error", "database": "Error", "is_local": False}
+                location.update({
+                    "country": "Error", 
+                    "city": "Error", 
+                    "database": "Error", 
+                    "is_local": False
+                })
                 self.geo_data_cache[ip] = location
                 return location
         
-        # Neither database is available or lookup failed in both
-        location = {"country": "No Database", "city": "No Database", "database": "None", "is_local": False}
+        # No databases available or lookup failed in all of them
+        location.update({
+            "country": "No Database", 
+            "city": "No Database", 
+            "database": "None", 
+            "is_local": False
+        })
         self.geo_data_cache[ip] = location
         return location
     
     def refresh(self, ip_filter=None):
-        """Refresh geo location data with actual database queries"""
+        """Refresh geo location data with actual database queries for ALL IPs"""
         # Clear existing items
         gui.tree_manager.clear_tree(self.geo_tree)
         
-        if not self.city_reader and not self.country_reader:
+        if not self.city_reader and not self.country_reader and not self.asn_reader:
             self.update_output("No GeoIP databases loaded. Please load databases first.")
             return
             
-        # Create a new function to get alert IPs from the database
-        def get_alert_ips():
+        # Create a new function to get all IPs from the database
+        def get_all_ips():
             try:
                 cursor = gui.db_manager.analysis_conn.cursor()
                 
-                # Base query to get IPs and alert counts
+                # List to store all unique IP addresses with counts
+                ip_data = {}
+                
+                # 1. Get IPs from alerts table with alert counts
+                self.update_output("Querying alerts table...")
                 sql = """
                     SELECT ip_address, COUNT(*) as alert_count, MAX(timestamp) as last_seen
                     FROM alerts
@@ -393,43 +454,236 @@ class GeoLocationSubtab(SubtabBase):
                     sql += " WHERE ip_address LIKE ?"
                     params = (f"%{ip_filter}%",)
                 
-                # Group and order results
-                sql += " GROUP BY ip_address ORDER BY alert_count DESC LIMIT 100"
+                sql += " GROUP BY ip_address"
                 
-                rows = cursor.execute(sql, params).fetchall()
-                return rows
+                for ip, alert_count, last_seen in cursor.execute(sql, params).fetchall():
+                    if ip:
+                        # Initialize if this is a new IP
+                        if ip not in ip_data:
+                            ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None}
+                        
+                        # Update alert count
+                        ip_data[ip]['alerts'] = alert_count
+                        
+                        # Handle timestamp as string or float
+                        if isinstance(last_seen, str):
+                            # Try to parse as datetime string
+                            try:
+                                dt = datetime.strptime(last_seen, '%Y-%m-%d %H:%M:%S')
+                                last_seen = dt.timestamp()
+                            except ValueError:
+                                # If parsing fails, just use current time
+                                last_seen = time.time()
+                        
+                        # Update last seen if this timestamp is newer
+                        if last_seen and (not ip_data[ip]['last_seen'] or float(last_seen) > float(ip_data[ip]['last_seen'])):
+                            ip_data[ip]['last_seen'] = last_seen
+                
+                # Skip connection queries if we only want IPs with alerts
+                if not self.show_only_alerts_var.get():
+                    # 2. Get IPs from connections table
+                    self.update_output("Querying connections table...")
+                    conn_sql = """
+                        SELECT src_ip, COUNT(*) as conn_count, MAX(timestamp) as last_seen 
+                        FROM connections
+                    """
+                    
+                    # Add filter if provided
+                    if ip_filter:
+                        conn_sql += " WHERE src_ip LIKE ?"
+                        conn_params = (f"%{ip_filter}%",)
+                    else:
+                        conn_params = ()
+                        
+                    conn_sql += " GROUP BY src_ip"
+                    
+                    for ip, conn_count, last_seen in cursor.execute(conn_sql, conn_params).fetchall():
+                        if ip:
+                            # Skip if we only want IPs with alerts and this IP has none
+                            if self.show_only_alerts_var.get() and (ip not in ip_data or ip_data[ip]['alerts'] == 0):
+                                continue
+                                
+                            # Initialize if this is a new IP
+                            if ip not in ip_data:
+                                ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None}
+                            
+                            # Add connection count
+                            ip_data[ip]['connections'] += conn_count
+                            
+                            # Handle timestamp as string or float
+                            if isinstance(last_seen, str):
+                                # Try to parse as datetime string
+                                try:
+                                    dt = datetime.strptime(last_seen, '%Y-%m-%d %H:%M:%S')
+                                    last_seen = dt.timestamp()
+                                except ValueError:
+                                    # If parsing fails, just use current time
+                                    last_seen = time.time()
+                            
+                            # Update last seen if this timestamp is newer
+                            if last_seen and (not ip_data[ip]['last_seen'] or float(last_seen) > float(ip_data[ip]['last_seen'])):
+                                ip_data[ip]['last_seen'] = last_seen
+                    
+                    # Get destination IPs from connections
+                    dst_sql = """
+                        SELECT dst_ip, COUNT(*) as conn_count, MAX(timestamp) as last_seen 
+                        FROM connections
+                    """
+                    
+                    # Add filter if provided
+                    if ip_filter:
+                        dst_sql += " WHERE dst_ip LIKE ?"
+                        dst_params = (f"%{ip_filter}%",)
+                    else:
+                        dst_params = ()
+                    
+                    dst_sql += " GROUP BY dst_ip"
+                    
+                    for ip, conn_count, last_seen in cursor.execute(dst_sql, dst_params).fetchall():
+                        if ip:
+                            # Skip if we only want IPs with alerts and this IP has none
+                            if self.show_only_alerts_var.get() and (ip not in ip_data or ip_data[ip]['alerts'] == 0):
+                                continue
+                                
+                            # Initialize if this is a new IP
+                            if ip not in ip_data:
+                                ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None}
+                            
+                            # Add connection count
+                            ip_data[ip]['connections'] += conn_count
+                            
+                            # Handle timestamp as string or float
+                            if isinstance(last_seen, str):
+                                # Try to parse as datetime string
+                                try:
+                                    dt = datetime.strptime(last_seen, '%Y-%m-%d %H:%M:%S')
+                                    last_seen = dt.timestamp()
+                                except ValueError:
+                                    # If parsing fails, just use current time
+                                    last_seen = time.time()
+                            
+                            # Update last seen if this timestamp is newer
+                            if last_seen and (not ip_data[ip]['last_seen'] or float(last_seen) > float(ip_data[ip]['last_seen'])):
+                                ip_data[ip]['last_seen'] = last_seen
+                    
+                    # 3. Get IPs from dns_queries table
+                    self.update_output("Querying DNS queries...")
+                    dns_sql = """
+                        SELECT src_ip, COUNT(*) as query_count, MAX(timestamp) as last_seen 
+                        FROM dns_queries
+                    """
+                    
+                    # Add filter if provided
+                    if ip_filter:
+                        dns_sql += " WHERE src_ip LIKE ?"
+                        dns_params = (f"%{ip_filter}%",)
+                    else:
+                        dns_params = ()
+                    
+                    dns_sql += " GROUP BY src_ip"
+                    
+                    for ip, query_count, last_seen in cursor.execute(dns_sql, dns_params).fetchall():
+                        if ip:
+                            # Skip if we only want IPs with alerts and this IP has none
+                            if self.show_only_alerts_var.get() and (ip not in ip_data or ip_data[ip]['alerts'] == 0):
+                                continue
+                                
+                            # Initialize if this is a new IP
+                            if ip not in ip_data:
+                                ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None}
+                            
+                            # Add to connection count (count DNS queries as connections)
+                            ip_data[ip]['connections'] += query_count
+                            
+                            # Handle timestamp as string or float
+                            if isinstance(last_seen, str):
+                                # Try to parse as datetime string
+                                try:
+                                    dt = datetime.strptime(last_seen, '%Y-%m-%d %H:%M:%S')
+                                    last_seen = dt.timestamp()
+                                except ValueError:
+                                    # If parsing fails, just use current time
+                                    last_seen = time.time()
+                            
+                            # Update last seen if this timestamp is newer
+                            if last_seen and (not ip_data[ip]['last_seen'] or float(last_seen) > float(ip_data[ip]['last_seen'])):
+                                ip_data[ip]['last_seen'] = last_seen
+                
+                # Convert dictionary to list format needed for display
+                result = []
+                for ip, data in ip_data.items():
+                    # Skip empty IPs
+                    if not ip or ip == "None":
+                        continue
+                        
+                    alert_count = data['alerts']
+                    connection_count = data['connections']
+                    last_seen = data['last_seen']
+                    
+                    # Skip IPs with no alerts if that filter is enabled
+                    if self.show_only_alerts_var.get() and alert_count == 0:
+                        continue
+                    
+                    # Format the last_seen timestamp
+                    if last_seen:
+                        try:
+                            last_seen_formatted = datetime.fromtimestamp(float(last_seen)).strftime('%Y-%m-%d %H:%M:%S')
+                        except:
+                            last_seen_formatted = "Unknown"
+                    else:
+                        last_seen_formatted = "Unknown"
+                    
+                    # Add to result list with both alert count and connection count
+                    result.append((ip, alert_count, connection_count, last_seen_formatted))
+                
+                # Sort by alert count (descending), then by connections (descending)
+                result.sort(key=lambda x: (-(x[1] or 0), -(x[2] or 0)))
+                
+                # Limit to top 200 IPs for performance
+                return result[:200]
+                
             except Exception as e:
                 self.update_output(f"Error querying database: {e}")
+                import traceback
+                traceback.print_exc()
                 return []
         
         # Queue the database query
         gui.db_manager.queue_query(
-            get_alert_ips,
+            get_all_ips,
             callback=self._process_geo_data
         )
         
-        self.update_output("Geo location refresh queued")
-    
-    def _process_geo_data(self, rows):
+        filter_status = []
+        if self.show_only_external_var.get():
+            filter_status.append("external IPs only")
+        if self.show_only_alerts_var.get():
+            filter_status.append("IPs with alerts only")
+            
+        filter_msg = f" ({', '.join(filter_status)})" if filter_status else ""
+        
+        self.update_output(f"Geo location refresh queued for all network IPs{filter_msg}")
+
+    def _process_geo_data(self, geo_data):
         """Process the database results and update the display with geolocation data"""
-        if not rows:
-            self.update_output("No alert data found")
+        if not geo_data:
+            self.update_output("No IP data found matching the criteria")
             return
             
         # Start a background thread to process geolocation lookups
         # This prevents the UI from freezing during lookups
         threading.Thread(
             target=self._background_geo_processing,
-            args=(rows,),
+            args=(geo_data,),
             daemon=True
         ).start()
     
-    def _background_geo_processing(self, rows):
+    def _background_geo_processing(self, geo_data):
         """Process geolocation data in a background thread"""
-        geo_data = []
+        display_data = []
         
         # Process each IP
-        for i, (ip, alert_count, timestamp) in enumerate(rows):
+        for i, (ip, alert_count, connection_count, last_seen) in enumerate(geo_data):
             # Get location data
             location = self.get_ip_location(ip)
             
@@ -437,26 +691,43 @@ class GeoLocationSubtab(SubtabBase):
             if self.show_only_external_var.get() and location.get("is_local", False):
                 continue
             
-            # Add to result list
-            geo_data.append((
+            # Format AS information
+            as_info = ""
+            if location.get("asn"):
+                as_info = f"AS {location.get('asn')} ({location.get('as_org', 'Unknown')})"
+            else:
+                as_info = location.get("as_org", "Unknown")
+            
+            # Add to result list with AS information
+            display_data.append((
                 ip,
                 location.get("country", "Unknown"),
                 location.get("city", "Unknown"),
-                alert_count
+                as_info,
+                alert_count,
+                connection_count
             ))
             
             # Update progress periodically
             if i % 10 == 0:
-                self.update_output(f"Processed {i+1}/{len(rows)} IP addresses")
+                self.update_output(f"Processed {i+1}/{len(geo_data)} IP addresses")
         
         # Update UI in the main thread
-        gui.master.after(0, lambda: self._update_geo_display(geo_data))
+        gui.master.after(0, lambda: self._update_geo_display(display_data))
     
-    def _update_geo_display(self, geo_data):
+    def _update_geo_display(self, display_data):
         """Update the geo display with the processed data (called in main thread)"""
         # Populate tree using TreeViewManager
-        gui.tree_manager.populate_tree(self.geo_tree, geo_data)
-        self.update_output(f"Showing geolocation data for {len(geo_data)} IP addresses")
+        gui.tree_manager.populate_tree(self.geo_tree, display_data)
+        
+        # Show statistics
+        external_count = sum(1 for ip, country, city, as_info, alerts, conns in display_data 
+                            if country not in ["Local Network", "Unknown"])
+        
+        alert_count = sum(1 for ip, country, city, as_info, alerts, conns in display_data if alerts > 0)
+        
+        status = f"Showing {len(display_data)} IP addresses ({external_count} external, {alert_count} with alerts)"
+        self.update_output(status)
     
     def show_location_details(self, event):
         """Show details for selected IP location"""
@@ -494,7 +765,7 @@ class GeoLocationSubtab(SubtabBase):
             
             # Format timestamp if it's a number
             if isinstance(last_seen, (int, float)):
-                last_seen = datetime.fromtimestamp(last_seen).strftime('%Y-%m-%d %H:%M:%S')
+                last_seen = datetime.fromtimestamp(float(last_seen)).strftime('%Y-%m-%d %H:%M:%S')
                 
             return count, last_seen
         
@@ -505,11 +776,60 @@ class GeoLocationSubtab(SubtabBase):
         )
     
     def _update_location_details(self, ip, location, alert_info):
-        """Update the location details with alert information"""
+        """Update the location details with alert and connection information"""
         alert_count, last_seen = alert_info
+        
+        # Get connection count information
+        def get_ip_connection_data():
+            cursor = gui.db_manager.analysis_conn.cursor()
+            
+            # Source connections
+            src_count = cursor.execute(
+                "SELECT COUNT(*) FROM connections WHERE src_ip = ?", 
+                (ip,)
+            ).fetchone()[0]
+            
+            # Destination connections
+            dst_count = cursor.execute(
+                "SELECT COUNT(*) FROM connections WHERE dst_ip = ?", 
+                (ip,)
+            ).fetchone()[0]
+            
+            # DNS queries
+            dns_count = cursor.execute(
+                "SELECT COUNT(*) FROM dns_queries WHERE src_ip = ?",
+                (ip,)
+            ).fetchone()[0]
+            
+            # TLS connections (extract from connection_key)
+            tls_count = cursor.execute(
+                "SELECT COUNT(*) FROM tls_connections WHERE connection_key LIKE ? OR connection_key LIKE ?",
+                (f"{ip}:%->%", f"%->%:{ip}")
+            ).fetchone()[0]
+            
+            return src_count, dst_count, dns_count, tls_count
+        
+        # Queue the database query for connection data
+        gui.db_manager.queue_query(
+            get_ip_connection_data,
+            callback=lambda result: self._update_connection_details(ip, location, alert_info, result)
+        )
+
+    def _update_connection_details(self, ip, location, alert_info, connection_data):
+        """Update the details with connection information"""
+        alert_count, last_seen = alert_info
+        src_count, dst_count, dns_count, tls_count = connection_data
         
         # Database source info
         database_source = location.get("database", "Unknown")
+        
+        # Calculate total connections
+        total_connections = src_count + dst_count + dns_count
+        
+        # Format ASN information
+        asn = location.get("asn")
+        as_org = location.get("as_org", "Unknown")
+        asn_detail = f"AS{asn} - {as_org}" if asn else as_org
         
         # Prepare details data
         details = [
@@ -522,12 +842,20 @@ class GeoLocationSubtab(SubtabBase):
             ("Latitude", f"{location.get('latitude', 0):.4f}"),
             ("Longitude", f"{location.get('longitude', 0):.4f}"),
             ("Timezone", location.get("timezone", "Unknown")),
+            ("Network Type", "Local Network" if location.get("is_local", False) else "External Network"),
+            ("Autonomous System", asn_detail),
+            ("", ""),  # Separator
             ("Alert Count", str(alert_count)),
             ("Last Seen", last_seen),
-            ("Network Type", "Local Network" if location.get("is_local", False) else "External Network")
+            ("Source Connections", str(src_count)),
+            ("Destination Connections", str(dst_count)),
+            ("DNS Queries", str(dns_count)),
+            ("TLS Connections", str(tls_count)),
+            ("Total Connections", str(total_connections))
         ]
         
         # Populate details tree
+        gui.tree_manager.clear_tree(self.geo_details_tree)
         gui.tree_manager.populate_tree(self.geo_details_tree, details)
         
         # Queue query to get alert types for this IP
@@ -596,7 +924,7 @@ class GeoLocationSubtab(SubtabBase):
         if not selected_ips:
             messagebox.showinfo("No Data", "No IP addresses to display on map")
             return
-        
+            
         # Create a map window
         map_window = tk.Toplevel(gui.master)
         map_window.title("IP Location Map")
@@ -662,8 +990,12 @@ class GeoLocationSubtab(SubtabBase):
             # Draw dot for IP
             dot_id = canvas.create_oval(x-5, y-5, x+5, y+5, fill=dot_color, outline="black")
             
-            # Create tooltip with IP information
-            tooltip_text = f"{ip}: {location.get('country', '')}/{location.get('city', '')}"
+            # Create tooltip with IP information including AS info
+            as_info = ""
+            if location.get("asn"):
+                as_info = f" - AS{location.get('asn')} ({location.get('as_org', '')})"
+                
+            tooltip_text = f"{ip}: {location.get('country', '')}/{location.get('city', '')}{as_info}"
             
             # Bind mouse events for tooltip
             def show_tooltip(event, text=tooltip_text, dot=dot_id):
@@ -792,8 +1124,13 @@ class GeoLocationSubtab(SubtabBase):
             # Draw IP label
             canvas.create_text(x, y-15, text=ip, font=("Arial", 8))
             
-            # Draw country/city label if available
-            location_text = f"{location.get('country', '')}/{location.get('city', '')}"
+            # Get AS info for label
+            as_info = ""
+            if location.get("asn"):
+                as_info = f" (AS{location.get('asn')})"
+            
+            # Draw country/city/AS label if available
+            location_text = f"{location.get('country', '')}/{location.get('city', '')}{as_info}"
             if location_text != "/":
                 canvas.create_text(x, y+15, text=location_text, font=("Arial", 8))
                 
