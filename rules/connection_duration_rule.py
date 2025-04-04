@@ -12,13 +12,14 @@ class ConnectionDurationRule(Rule):
         self.check_interval = 600  # Seconds between checks (10 minutes)
         self.last_check_time = 0
         self.detected_connections = set()  # Track connections we've already detected
+        self.alerts_to_queue = []  # Initialize the alerts_to_queue list
     
     def analyze(self, db_cursor):
         # Local list for returning alerts to UI immediately
         alerts = []
         
-        # Variable to store alerts for queuing later, completely outside DB operations
-        alerts_to_queue = []
+        # Clear previous alerts to queue
+        self.alerts_to_queue = []
         
         current_time = time.time()
         
@@ -110,7 +111,7 @@ class ConnectionDurationRule(Rule):
                 alerts.append(alert_msg)
                 
                 # Save alert info for later queueing - use the destination as the alert target
-                alerts_to_queue.append((dst_ip, alert_msg))
+                self.alerts_to_queue.append((dst_ip, alert_msg))
                 
                 # Add to detected set
                 self.detected_connections.add(connection_key)
@@ -126,20 +127,13 @@ class ConnectionDurationRule(Rule):
             error_msg = f"Error in Connection Duration rule: {str(e)}"
             logging.error(error_msg)
             return [error_msg]
-        
-        # Important: These two blocks shouldn't be in a finally clause
-        # because we want to make sure the db operations are completely done
-        
-        finally:
-            # This ensures the database cursor is fully complete before we move on
-            pass
             
     def post_analyze_queue_alerts(self):
         """
         This method should be called by the RuleLoader after analyze() completes
         to queue any alerts without holding a database cursor.
         """
-        if hasattr(self, 'alerts_to_queue') and self.alerts_to_queue:
+        if self.alerts_to_queue:
             for ip, msg in self.alerts_to_queue:
                 try:
                     self.db_manager.queue_alert(ip, msg, self.name)

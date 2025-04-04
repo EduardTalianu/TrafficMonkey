@@ -57,27 +57,28 @@ class CredentialDumpingRule(Rule):
     def analyze_http_traffic(self, db_cursor):
         """Check HTTP traffic for credential dumping signatures"""
         alerts = []
+        pending_alerts = []
         
         try:
-            # Check if http_headers table exists
+            # First check if http_requests table exists
             db_cursor.execute("""
                 SELECT name FROM sqlite_master 
-                WHERE type='table' AND name='http_headers'
+                WHERE type='table' AND name='http_requests'
             """)
             
             if not db_cursor.fetchone():
-                return []  # Skip if table doesn't exist
+                return [], []  # Skip if table doesn't exist
             
-            # Look for suspicious user agents or URLs
+            # Look for suspicious user agents or URIs in HTTP requests
             db_cursor.execute("""
-                SELECT src_ip, dst_ip, path, host, user_agent
-                FROM http_headers
+                SELECT src_ip, dst_ip, uri, host, user_agent
+                FROM http_requests
                 WHERE timestamp > datetime('now', '-30 minutes')
             """)
             
-            for src_ip, dst_ip, path, host, user_agent in db_cursor.fetchall():
+            for src_ip, dst_ip, uri, host, user_agent in db_cursor.fetchall():
                 # Skip if not enough data
-                if not path:
+                if not uri:
                     continue
                 
                 # Check for tool references in User-Agent
@@ -87,32 +88,39 @@ class CredentialDumpingRule(Rule):
                             alert_key = f"{src_ip}-{tool}-ua"
                             if alert_key not in self.detected_dumps:
                                 self.detected_dumps[alert_key] = time.time()
-                                alerts.append(f"Credential dumping tool signature in User-Agent: {src_ip} using {tool} to access {dst_ip}")
+                                alert_msg = f"Credential dumping tool signature in User-Agent: {src_ip} using {tool} to access {dst_ip}"
+                                alerts.append(alert_msg)
+                                pending_alerts.append((src_ip, alert_msg, self.name))
                 
-                # Check for sensitive path access
-                lower_path = path.lower().replace('/', '\\')
+                # Check for sensitive path access in URI
+                lower_uri = uri.lower().replace('/', '\\')
                 for sensitive_path in self.sensitive_windows_paths:
-                    if sensitive_path.lower() in lower_path:
+                    if sensitive_path.lower() in lower_uri:
                         alert_key = f"{src_ip}-{sensitive_path}"
                         if alert_key not in self.detected_dumps:
                             self.detected_dumps[alert_key] = time.time()
-                            alerts.append(f"HTTP access to sensitive Windows credential file: {src_ip} accessing {sensitive_path} on {dst_ip}")
+                            alert_msg = f"HTTP access to sensitive Windows credential file: {src_ip} accessing {sensitive_path} on {dst_ip}"
+                            alerts.append(alert_msg)
+                            pending_alerts.append((src_ip, alert_msg, self.name))
                 
                 for sensitive_path in self.sensitive_unix_paths:
-                    if sensitive_path.lower() in lower_path.replace('\\', '/'):
+                    if sensitive_path.lower() in lower_uri.replace('\\', '/'):
                         alert_key = f"{src_ip}-{sensitive_path}"
                         if alert_key not in self.detected_dumps:
                             self.detected_dumps[alert_key] = time.time()
-                            alerts.append(f"HTTP access to sensitive Unix credential file: {src_ip} accessing {sensitive_path} on {dst_ip}")
+                            alert_msg = f"HTTP access to sensitive Unix credential file: {src_ip} accessing {sensitive_path} on {dst_ip}"
+                            alerts.append(alert_msg)
+                            pending_alerts.append((src_ip, alert_msg, self.name))
             
-            return alerts
+            return alerts, pending_alerts
         except Exception as e:
             logging.error(f"Error analyzing HTTP traffic for credential dumping: {e}")
-            return []
+            return [], []
     
     def analyze_smb_traffic(self, db_cursor):
         """Check for suspicious SMB traffic patterns"""
         alerts = []
+        pending_alerts = []
         
         try:
             # Look for connections to SMB-related ports with significant data transfer
@@ -139,15 +147,18 @@ class CredentialDumpingRule(Rule):
                     elif dst_port == 88:
                         service = "Kerberos"
                     
-                    alerts.append(f"Potential credential extraction: {src_ip} transferred {total_bytes/1024:.1f} KB from {dst_ip} via {service} (port {dst_port})")
+                    alert_msg = f"Potential credential extraction: {src_ip} transferred {total_bytes/1024:.1f} KB from {dst_ip} via {service} (port {dst_port})"
+                    alerts.append(alert_msg)
+                    pending_alerts.append((src_ip, alert_msg, self.name))
             
-            return alerts
+            return alerts, pending_alerts
         except Exception as e:
             logging.error(f"Error analyzing SMB traffic for credential dumping: {e}")
-            return []
+            return [], []
     
     def analyze(self, db_cursor):
-        alerts = []
+        all_alerts = []
+        all_pending_alerts = []
         current_time = time.time()
         
         # Only run periodically
@@ -158,18 +169,28 @@ class CredentialDumpingRule(Rule):
         
         try:
             # Run the specific analysis methods
-            http_alerts = self.analyze_http_traffic(db_cursor)
-            smb_alerts = self.analyze_smb_traffic(db_cursor)
+            http_alerts, http_pending = self.analyze_http_traffic(db_cursor)
+            smb_alerts, smb_pending = self.analyze_smb_traffic(db_cursor)
             
-            alerts.extend(http_alerts)
-            alerts.extend(smb_alerts)
+            all_alerts.extend(http_alerts)
+            all_alerts.extend(smb_alerts)
+            
+            all_pending_alerts.extend(http_pending)
+            all_pending_alerts.extend(smb_pending)
             
             # Clean up old detections (after 12 hours)
             old_detections = [k for k, t in self.detected_dumps.items() if current_time - t > 43200]
             for key in old_detections:
                 self.detected_dumps.pop(key, None)
             
-            return alerts
+            # Queue all pending alerts
+            for ip, msg, rule_name in all_pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
+            
+            return all_alerts
             
         except Exception as e:
             error_msg = f"Error in Credential Dumping Detection rule: {str(e)}"
