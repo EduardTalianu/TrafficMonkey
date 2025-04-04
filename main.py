@@ -67,12 +67,19 @@ def main():
     except Exception as e:
         logging.warning(f"Could not set application icon: {e}")
     
-    # Import the LiveCaptureGUI class
+    # Import necessary components directly
     try:
-        from traffic_analyzer import LiveCaptureGUI
+        # Import the database manager first
+        from src.database_manager import DatabaseManager
         
-        # Create the application
-        app = LiveCaptureGUI(root)
+        # Create LiveCaptureGUI with pre-initialized database manager
+        from src.traffic_analyzer import LiveCaptureGUI
+        
+        # Create the database manager first
+        db_manager = DatabaseManager(app_root)
+        
+        # Create the application with pre-initialized manager
+        app = LiveCaptureGUI(root, db_manager)
         
         # Start the main event loop
         root.mainloop()

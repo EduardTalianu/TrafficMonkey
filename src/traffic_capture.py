@@ -8,6 +8,7 @@ import threading
 import logging
 import random
 from collections import deque, defaultdict
+import capture_fields
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -149,50 +150,27 @@ class TrafficCaptureEngine:
             self.gui.update_output(f"Error saving packet sample: {e}")
     
     def capture_packets(self, interface):
-        """Capture packets with streaming EK format parser"""
+        """Capture packets with streaming EK format parser using dynamic field definitions"""
         try:
             self.gui.update_output(f"Capturing on interface: {interface}")
             
-            # Expanded tshark command with more fields for protocol detection
+            # Build tshark command dynamically from field definitions
             cmd = [
                 "tshark",
                 "-i", interface,
                 "-T", "ek",  # Elasticsearch Kibana format
-                # Basic fields
-                "-e", "frame.time_epoch",
-                "-e", "ip.src", 
-                "-e", "ip.dst",
-                "-e", "ipv6.src", 
-                "-e", "ipv6.dst",
-                "-e", "tcp.srcport", 
-                "-e", "tcp.dstport",
-                "-e", "udp.srcport", 
-                "-e", "udp.dstport",
-                "-e", "frame.len",
-                # DNS fields
-                "-e", "dns.qry.name", 
-                "-e", "dns.qry.type",
-                "-e", "dns.resp.name",
-                "-e", "dns.resp.type",
-                # ICMP fields
-                "-e", "icmp.type",
-                # HTTP fields
-                "-e", "http.host",
-                "-e", "http.request.method",
-                "-e", "http.request.uri",
-                "-e", "http.response.code",
-                "-e", "http.user_agent",
-                "-e", "http.server",
-                "-e", "http.content_type",
-                "-e", "http.content_length",
-                # TLS fields
-                "-e", "tls.handshake.type",
-                "-e", "tls.handshake.version",
-                "-e", "tls.handshake.ciphersuite",
+            ]
+            
+            # Add all fields from configuration
+            for field in capture_fields.get_tshark_fields():
+                cmd.extend(["-e", field])
+            
+            # Add filters
+            cmd.extend([
                 "-f", "tcp or udp or icmp",  # Capture filter
                 "-Y", "http or tls or ssl or http2 or dns or icmp",  # Display filter
                 "-l"  # Line-buffered output
-            ]
+            ])
             
             self.gui.update_output(f"Running command: {' '.join(cmd)}")
             
@@ -372,16 +350,41 @@ class TrafficCaptureEngine:
         return None
     
     def process_packet_ek(self, packet_data):
-        """Process a packet in Elasticsearch Kibana format with directly accessed fields"""
+        """Process a packet in Elasticsearch Kibana format using field definitions"""
         try:
             # Get the layers
             layers = packet_data.get("layers", {})
             if not layers:
                 return False
             
-            # Extract IP addresses (supporting both IPv4 and IPv6)
-            src_ip = self.get_layer_value(layers, "ip_src") or self.get_layer_value(layers, "ipv6_src")
-            dst_ip = self.get_layer_value(layers, "ip_dst") or self.get_layer_value(layers, "ipv6_dst")
+            # Extract IP addresses (supporting both IPv4 and IPv6) using field definitions
+            src_ip = None
+            dst_ip = None
+            
+            # Try IPv4 fields first
+            src_ip_field = capture_fields.get_field_by_tshark_name("ip.src")
+            dst_ip_field = capture_fields.get_field_by_tshark_name("ip.dst")
+            
+            if src_ip_field:
+                layer_name = src_ip_field["tshark_field"].replace(".", "_")
+                src_ip = self.get_layer_value(layers, layer_name)
+                
+            if dst_ip_field:
+                layer_name = dst_ip_field["tshark_field"].replace(".", "_")
+                dst_ip = self.get_layer_value(layers, layer_name)
+            
+            # If not found, try IPv6 fields
+            if not src_ip:
+                src_ipv6_field = capture_fields.get_field_by_tshark_name("ipv6.src")
+                if src_ipv6_field:
+                    layer_name = src_ipv6_field["tshark_field"].replace(".", "_")
+                    src_ip = self.get_layer_value(layers, layer_name)
+                    
+            if not dst_ip:
+                dst_ipv6_field = capture_fields.get_field_by_tshark_name("ipv6.dst")
+                if dst_ipv6_field:
+                    layer_name = dst_ipv6_field["tshark_field"].replace(".", "_")
+                    dst_ip = self.get_layer_value(layers, layer_name)
             
             # Basic data validation - we need IPs to proceed
             if not src_ip or not dst_ip:
@@ -390,50 +393,9 @@ class TrafficCaptureEngine:
                     self.gui.update_output(f"Missing IP addresses in packet - src:{src_ip}, dst:{dst_ip}")
                 return False
             
-            # Extract port information (TCP or UDP)
-            src_port = None
-            dst_port = None
-            
-            # Get TCP ports
-            tcp_src = self.get_layer_value(layers, "tcp_srcport")
-            if tcp_src:
-                try:
-                    src_port = int(tcp_src)
-                except (ValueError, TypeError):
-                    src_port = None
-            
-            tcp_dst = self.get_layer_value(layers, "tcp_dstport")
-            if tcp_dst:
-                try:
-                    dst_port = int(tcp_dst)
-                except (ValueError, TypeError):
-                    dst_port = None
-            
-            # If TCP ports not found, try UDP
-            if src_port is None:
-                udp_src = self.get_layer_value(layers, "udp_srcport")
-                if udp_src:
-                    try:
-                        src_port = int(udp_src)
-                    except (ValueError, TypeError):
-                        src_port = None
-            
-            if dst_port is None:
-                udp_dst = self.get_layer_value(layers, "udp_dstport")
-                if udp_dst:
-                    try:
-                        dst_port = int(udp_dst)
-                    except (ValueError, TypeError):
-                        dst_port = None
-            
-            # Get frame length
-            length = 0
-            frame_len = self.get_layer_value(layers, "frame_len")
-            if frame_len:
-                try:
-                    length = int(frame_len)
-                except (ValueError, TypeError):
-                    length = 0
+            # Extract port and length information
+            src_port, dst_port = self._extract_ports(layers)
+            length = self._extract_length(layers)
             
             # Skip processing if the IP is in the false positives list
             if src_ip in self.gui.false_positives or dst_ip in self.gui.false_positives:
@@ -454,25 +416,25 @@ class TrafficCaptureEngine:
             # Process specific protocol data if present
             protocol_detected = False
             
-            # Process DNS data if present
-            if "dns_qry_name" in layers:
-                self._process_dns_packet_ek(layers, src_ip, dst_ip)
-                protocol_detected = True
-            
-            # Process ICMP data if present
-            if "icmp_type" in layers:
-                self._process_icmp_packet_ek(layers, src_ip, dst_ip)
-                protocol_detected = True
-            
-            # Process HTTP data if present
-            if any(field in layers for field in ["http_host", "http_request_method", "http_request_uri", "http_response_code"]):
-                self._process_http_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
-                protocol_detected = True
-            
-            # Process TLS data if present
-            if any(field in layers for field in ["tls_handshake_type", "tls_handshake_version", "tls_handshake_extensions_server_name"]):
-                self._process_tls_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
-                protocol_detected = True
+            # Check for protocol fields using categories
+            for category in ["dns", "http", "tls", "icmp"]:
+                fields = capture_fields.get_fields_by_category(category)
+                layer_names = [f["tshark_field"].replace(".", "_") for f in fields]
+                
+                if any(name in layers for name in layer_names):
+                    # Call the appropriate protocol handler
+                    if category == "dns" and self._has_dns_data(layers):
+                        self._process_dns_packet_ek(layers, src_ip, dst_ip)
+                        protocol_detected = True
+                    elif category == "http" and self._has_http_data(layers):
+                        self._process_http_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
+                        protocol_detected = True
+                    elif category == "tls" and self._has_tls_data(layers):
+                        self._process_tls_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
+                        protocol_detected = True
+                    elif category == "icmp" and "icmp_type" in layers:
+                        self._process_icmp_packet_ek(layers, src_ip, dst_ip)
+                        protocol_detected = True
             
             # Port scan detection
             if dst_port:
@@ -502,6 +464,83 @@ class TrafficCaptureEngine:
             import traceback
             traceback.print_exc()
             return False
+    
+    def _has_dns_data(self, layers):
+        """Check if layers contain DNS query data"""
+        return "dns_qry_name" in layers
+    
+    def _has_http_data(self, layers):
+        """Check if layers contain HTTP data"""
+        return any(key in layers for key in ["http_host", "http_request_method", "http_request_uri", "http_response_code"])
+    
+    def _has_tls_data(self, layers):
+        """Check if layers contain TLS data"""
+        return any(key in layers for key in ["tls_handshake_type", "tls_handshake_version"])
+    
+    def _extract_ports(self, layers):
+        """Extract source and destination ports from packet layers"""
+        src_port = None
+        dst_port = None
+        
+        # Try TCP ports first
+        tcp_src_field = capture_fields.get_field_by_tshark_name("tcp.srcport")
+        if tcp_src_field:
+            layer_name = tcp_src_field["tshark_field"].replace(".", "_")
+            tcp_src = self.get_layer_value(layers, layer_name)
+            if tcp_src:
+                try:
+                    src_port = int(tcp_src)
+                except (ValueError, TypeError):
+                    pass
+        
+        tcp_dst_field = capture_fields.get_field_by_tshark_name("tcp.dstport")
+        if tcp_dst_field:
+            layer_name = tcp_dst_field["tshark_field"].replace(".", "_")
+            tcp_dst = self.get_layer_value(layers, layer_name)
+            if tcp_dst:
+                try:
+                    dst_port = int(tcp_dst)
+                except (ValueError, TypeError):
+                    pass
+        
+        # If not found, try UDP ports
+        if src_port is None:
+            udp_src_field = capture_fields.get_field_by_tshark_name("udp.srcport")
+            if udp_src_field:
+                layer_name = udp_src_field["tshark_field"].replace(".", "_")
+                udp_src = self.get_layer_value(layers, layer_name)
+                if udp_src:
+                    try:
+                        src_port = int(udp_src)
+                    except (ValueError, TypeError):
+                        pass
+        
+        if dst_port is None:
+            udp_dst_field = capture_fields.get_field_by_tshark_name("udp.dstport")
+            if udp_dst_field:
+                layer_name = udp_dst_field["tshark_field"].replace(".", "_")
+                udp_dst = self.get_layer_value(layers, layer_name)
+                if udp_dst:
+                    try:
+                        dst_port = int(udp_dst)
+                    except (ValueError, TypeError):
+                        pass
+                        
+        return src_port, dst_port
+    
+    def _extract_length(self, layers):
+        """Extract frame length from packet layers"""
+        length = 0
+        frame_len_field = capture_fields.get_field_by_tshark_name("frame.len")
+        if frame_len_field:
+            layer_name = frame_len_field["tshark_field"].replace(".", "_")
+            frame_len = self.get_layer_value(layers, layer_name)
+            if frame_len:
+                try:
+                    length = int(frame_len)
+                except (ValueError, TypeError):
+                    pass
+        return length
 
     def _update_port_scan_data(self, src_ip, dst_ip, dst_port):
         """Update port scan detection data"""
@@ -763,10 +802,6 @@ class TrafficCaptureEngine:
             tls_version = self.get_layer_value(layers, "tls_handshake_version")
             cipher_suite = self.get_layer_value(layers, "tls_handshake_ciphersuite")
             server_name = self.get_layer_value(layers, "tls_handshake_extensions_server_name")
-            cert_issuer = self.get_layer_value(layers, "tls_handshake_cert_issuer")
-            cert_subject = self.get_layer_value(layers, "tls_handshake_cert_subject")
-            cert_valid_from = self.get_layer_value(layers, "tls_handshake_cert_not_before")
-            cert_valid_to = self.get_layer_value(layers, "tls_handshake_cert_not_after")
             
             # Set default values if needed
             if not tls_version:
@@ -785,13 +820,17 @@ class TrafficCaptureEngine:
             # We don't attempt to calculate JA3/JA3S fingerprints here
             ja3_fingerprint = ""
             ja3s_fingerprint = ""
+            cert_issuer = ""
+            cert_subject = ""
+            cert_valid_from = ""
+            cert_valid_to = ""
             cert_serial = ""
             
             # Store in database
             success = self.db_manager.add_tls_connection(
                 connection_key, tls_version, cipher_suite, server_name, 
-                ja3_fingerprint, ja3s_fingerprint, cert_issuer or "", cert_subject or "",
-                cert_valid_from or "", cert_valid_to or "", cert_serial
+                ja3_fingerprint, ja3s_fingerprint, cert_issuer, cert_subject,
+                cert_valid_from, cert_valid_to, cert_serial
             )
             
             # Log success or failure

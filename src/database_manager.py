@@ -5,13 +5,12 @@ import threading
 import logging
 import queue
 import json
+import capture_fields  # Import the field definitions
 
 # Configure logging
 logger = logging.getLogger('database_manager')
 
 class DatabaseManager:
-    """Manages separate databases for capture and analysis with query queue"""
-    
     def __init__(self, app_root):
         self.app_root = app_root
         self.db_dir = os.path.join(app_root, "db")
@@ -30,7 +29,7 @@ class DatabaseManager:
         self._setup_analysis_db()
         
         # Set up synchronization
-        self.sync_lock = threading.Lock()  # Lock for synchronization operations
+        self.sync_lock = threading.Lock()
         self.last_sync_time = time.time()
         self.sync_interval = 10  # seconds between syncs
         
@@ -50,7 +49,11 @@ class DatabaseManager:
         self.sync_thread = threading.Thread(target=self._sync_thread, daemon=True)
         self.sync_thread.start()
         
+        # Check and update schema version
+        self._check_schema_version()
+        
         logger.info("Database manager initialized with separate capture and analysis databases")
+    
     
     def _setup_capture_db(self):
         """Set up capture database optimized for writing"""
@@ -79,10 +82,34 @@ class DatabaseManager:
         self.analysis_conn.commit()
         logger.info("Analysis database initialized for read operations")
     
+    def _check_schema_version(self):
+        """Check and update schema version if needed"""
+        # Check current version in capture database
+        self.capture_cursor.execute("PRAGMA user_version")
+        current_version = self.capture_cursor.fetchone()[0]
+        
+        target_version = capture_fields.SCHEMA_VERSION
+        
+        if current_version < target_version:
+            logger.info(f"Updating schema from version {current_version} to {target_version}")
+            # For a simple implementation, we just update the version number
+            self.capture_cursor.execute(f"PRAGMA user_version = {target_version}")
+            self.capture_conn.commit()
+        
+        # Also update analysis database version
+        self.analysis_cursor.execute("PRAGMA user_version")
+        analysis_version = self.analysis_cursor.fetchone()[0]
+        
+        if analysis_version < target_version:
+            self.analysis_cursor.execute(f"PRAGMA user_version = {target_version}")
+            self.analysis_conn.commit()
+    
     def _create_tables(self, cursor):
-        """Create required tables in the database (with HTTP headers support)"""
-        # Original tables remain the same
-        # Connections table
+        """Create tables based on field definitions from capture_fields.py only"""
+        # Get table schemas from field definitions
+        table_schemas = capture_fields.get_tables_schema()
+        
+        # Always create the core connections table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS connections (
                 connection_key TEXT PRIMARY KEY,
@@ -99,7 +126,7 @@ class DatabaseManager:
             )
         """)
         
-        # Create indices
+        # Create standard indices for the connections table
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_connections_ips 
             ON connections(src_ip, dst_ip)
@@ -110,7 +137,7 @@ class DatabaseManager:
             ON connections(src_port, dst_port)
         """)
         
-        # Alerts table
+        # Create alerts table (standard table not derived from field definitions)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,7 +158,43 @@ class DatabaseManager:
             ON alerts(rule_name)
         """)
         
-        # Port scan table
+        # Create tables dynamically based on field definitions
+        for table_name, columns in table_schemas.items():
+            # Skip connections and alerts tables that were already created
+            if table_name in ('connections', 'alerts', 'app_protocols'):
+                continue
+                
+            # Prepare column definitions
+            column_defs = []
+            
+            # Add primary key if it's not defined
+            if not any(col["name"] == "id" for col in columns):
+                column_defs.append("id INTEGER PRIMARY KEY AUTOINCREMENT")
+            
+            # Add each column
+            for column in columns:
+                nullable = "" if column["required"] else " DEFAULT NULL"
+                column_defs.append(f"{column['name']} {column['type']}{nullable}")
+            
+            # Add timestamp if not already included
+            if not any(col["name"] == "timestamp" for col in columns):
+                column_defs.append("timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            
+            # Create the table
+            create_table_sql = f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    {', '.join(column_defs)}
+                )
+            """
+            cursor.execute(create_table_sql)
+            
+            # Create index on timestamp for most tables
+            cursor.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{table_name}_timestamp 
+                ON {table_name}(timestamp)
+            """)
+        
+        # Create port scan tracking table (this is essential for the application)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS port_scan_timestamps (
                 src_ip TEXT,
@@ -142,131 +205,7 @@ class DatabaseManager:
             )
         """)
         
-        # DNS queries table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS dns_queries (
-                timestamp REAL,
-                src_ip TEXT,
-                query_domain TEXT,
-                query_type TEXT
-            )
-        """)
-        
-        # ICMP packets table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS icmp_packets (
-                src_ip TEXT,
-                dst_ip TEXT,
-                icmp_type INTEGER,
-                timestamp REAL
-            )
-        """)
-        
-        # HTTP requests table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS http_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                connection_key TEXT,
-                timestamp REAL,
-                method TEXT,
-                host TEXT,
-                uri TEXT,
-                version TEXT,
-                user_agent TEXT,
-                referer TEXT,
-                content_type TEXT,
-                request_headers TEXT,
-                request_size INTEGER DEFAULT 0,
-                FOREIGN KEY (connection_key) REFERENCES connections (connection_key)
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_http_requests_conn 
-            ON http_requests(connection_key)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_http_requests_host 
-            ON http_requests(host)
-        """)
-        
-        # HTTP headers table (NEW) - explicit table for headers for easier querying
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS http_headers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                connection_key TEXT,
-                request_id INTEGER,
-                header_name TEXT,
-                header_value TEXT,
-                is_request BOOLEAN,
-                timestamp REAL,
-                FOREIGN KEY (connection_key) REFERENCES connections (connection_key),
-                FOREIGN KEY (request_id) REFERENCES http_requests (id)
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_http_headers_conn 
-            ON http_headers(connection_key)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_http_headers_req 
-            ON http_headers(request_id)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_http_headers_name 
-            ON http_headers(header_name)
-        """)
-        
-        # HTTP responses table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS http_responses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                http_request_id INTEGER,
-                status_code INTEGER,
-                content_type TEXT,
-                content_length INTEGER,
-                server TEXT,
-                response_headers TEXT,
-                timestamp REAL,
-                FOREIGN KEY (http_request_id) REFERENCES http_requests (id)
-            )
-        """)
-        
-        # TLS connection information
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS tls_connections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                connection_key TEXT,
-                timestamp REAL,
-                tls_version TEXT,
-                cipher_suite TEXT,
-                server_name TEXT,
-                ja3_fingerprint TEXT,
-                ja3s_fingerprint TEXT,
-                certificate_issuer TEXT,
-                certificate_subject TEXT,
-                certificate_validity_start TEXT,
-                certificate_validity_end TEXT,
-                certificate_serial TEXT,
-                FOREIGN KEY (connection_key) REFERENCES connections (connection_key)
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_tls_connections_conn 
-            ON tls_connections(connection_key)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_tls_connections_ja3 
-            ON tls_connections(ja3_fingerprint)
-        """)
-        
-        # Application protocols table
+        # Create application protocols table (essential for protocol detection)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS app_protocols (
                 connection_key TEXT PRIMARY KEY,

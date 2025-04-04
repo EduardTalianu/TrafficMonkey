@@ -508,7 +508,8 @@ class TabFactory:
 
 # The main application class with refactored implementation
 class LiveCaptureGUI:
-    def __init__(self, master):
+    
+    def __init__(self, master, db_manager):
         self.master = master
         master.title("Live Network Traffic Analyzer")
 
@@ -554,10 +555,16 @@ class LiveCaptureGUI:
         self.false_positives_file = os.path.join(self.app_root, "db", "false_positives.txt")
         self.false_positives = self.load_false_positives()
 
-        # Database Setup - Use new DatabaseManager
-        self.setup_database()
+        # IMPORTANT: Explicitly create the database manager first
+        # Import the database manager class directly
+        from database_manager import DatabaseManager
+        self.db_manager = db_manager
+        
+        # Only after db_manager is created, initialize the capture engine
+        from traffic_capture import TrafficCaptureEngine
+        self.capture_engine = TrafficCaptureEngine(self)
 
-        # Create Managers and Factories
+        # Create other managers
         self.ip_manager = IPManager(self)
         self.tree_manager = TreeViewManager()
         self.tab_factory = TabFactory(self)
