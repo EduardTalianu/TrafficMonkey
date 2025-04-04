@@ -84,6 +84,9 @@ class DNSAnomalyRule(Rule):
     
     def analyze(self, db_cursor):
         alerts = []
+        # Add this list to store alerts that will be queued
+        pending_alerts = []
+        
         current_time = time.time()
         
         # Always check for basic DNS anomalies
@@ -111,7 +114,10 @@ class DNSAnomalyRule(Rule):
                 long_domains.append(row)
             
             for src_ip, domain, count in long_domains:
-                alerts.append(f"Potential DNS Tunneling: {src_ip} queried unusually long domain: {domain}")
+                alert_msg = f"Potential DNS Tunneling: {src_ip} queried unusually long domain: {domain}"
+                alerts.append(alert_msg)
+                # Add the alert to pending_alerts for queueing
+                pending_alerts.append((src_ip, alert_msg, self.name))
             
             # Check for high entropy domain names (potential DGA)
             db_cursor.execute("""
@@ -130,7 +136,10 @@ class DNSAnomalyRule(Rule):
                     
                 entropy = self.calculate_entropy(domain)
                 if entropy > self.entropy_threshold:
-                    alerts.append(f"Potential DGA Domain: {src_ip} queried high-entropy domain: {domain} (entropy: {entropy:.2f})")
+                    alert_msg = f"Potential DGA Domain: {src_ip} queried high-entropy domain: {domain} (entropy: {entropy:.2f})"
+                    alerts.append(alert_msg)
+                    # Add the alert to pending_alerts for queueing
+                    pending_alerts.append((src_ip, alert_msg, self.name))
             
             # Check for high query rates (potential DNS flood)
             db_cursor.execute("""
@@ -147,7 +156,10 @@ class DNSAnomalyRule(Rule):
                 high_rates.append(row)
             
             for src_ip, count in high_rates:
-                alerts.append(f"Potential DNS Flood: {src_ip} made {count} DNS queries in the last minute")
+                alert_msg = f"Potential DNS Flood: {src_ip} made {count} DNS queries in the last minute"
+                alerts.append(alert_msg)
+                # Add the alert to pending_alerts for queueing
+                pending_alerts.append((src_ip, alert_msg, self.name))
             
             # Perform more detailed DNS tunneling analysis less frequently
             if current_time - self.last_check_time >= self.check_interval:
@@ -224,13 +236,29 @@ class DNSAnomalyRule(Rule):
                             avg_entropy > self.entropy_threshold * 0.8 and 
                             length_variance < self.domain_variance_threshold):
                                 
-                            alerts.append(f"Sustained DNS tunneling activity: {src_ip} made {stats['total_queries']} queries with average length {avg_length:.1f}, entropy {avg_entropy:.2f}, and low length variance ({length_variance:.3f})")
+                            alert_msg = f"Sustained DNS tunneling activity: {src_ip} made {stats['total_queries']} queries with average length {avg_length:.1f}, entropy {avg_entropy:.2f}, and low length variance ({length_variance:.3f})"
+                            alerts.append(alert_msg)
+                            # Add the alert to pending_alerts for queueing
+                            pending_alerts.append((src_ip, alert_msg, self.name))
                             
                             # Add example domains
                             if len(stats['domains']) <= 3:
-                                alerts.append(f"  Example domains: {', '.join(stats['domains'])}")
+                                example_msg = f"  Example domains: {', '.join(stats['domains'])}"
+                                alerts.append(example_msg)
+                                # Add as a supplementary alert for the same IP
+                                pending_alerts.append((src_ip, example_msg, self.name))
                             else:
-                                alerts.append(f"  Example domains: {', '.join(stats['domains'][:3])}...")
+                                example_msg = f"  Example domains: {', '.join(stats['domains'][:3])}..."
+                                alerts.append(example_msg)
+                                # Add as a supplementary alert for the same IP
+                                pending_alerts.append((src_ip, example_msg, self.name))
+            
+            # Queue all pending alerts
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
             
             return alerts
             

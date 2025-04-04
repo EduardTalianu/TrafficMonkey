@@ -39,6 +39,8 @@ class DataSizeRule(Rule):
     
     def analyze(self, db_cursor):
         alerts = []
+        # Add this list to store alerts that will be queued
+        pending_alerts = []
         
         try:
             # First, check for large single-destination transfers
@@ -74,6 +76,8 @@ class DataSizeRule(Rule):
                     message += f", VirusTotal: {vt_result}"
                     
                 alerts.append(message)
+                # Add the alert to pending_alerts for queueing - use source IP as target
+                pending_alerts.append((src_ip, message, self.name))
             
             # Second, check for large aggregate transfers if enabled
             if self.alert_on_aggregate:
@@ -119,10 +123,22 @@ class DataSizeRule(Rule):
                         top_destinations.append(f"{dst_ip} ({dst_bytes:.2f} MB)")
                     
                     message = f"Large Aggregate Transfer: {src_ip} sent {mb_size:.2f} MB in {connection_count} connections over the last {self.window_minutes} minutes"
-                    if top_destinations:
-                        message += f"\n  Top destinations: {', '.join(top_destinations)}"
-                    
                     alerts.append(message)
+                    # Add the alert to pending_alerts for queueing - use source IP as target
+                    pending_alerts.append((src_ip, message, self.name))
+                    
+                    if top_destinations:
+                        dest_message = f"  Top destinations: {', '.join(top_destinations)}"
+                        alerts.append(dest_message)
+                        # Add as a supplementary alert for the same IP
+                        pending_alerts.append((src_ip, dest_message, self.name))
+            
+            # Queue all pending alerts
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
             
             return alerts
             

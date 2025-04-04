@@ -18,6 +18,7 @@ class SSLCertificateRule(Rule):
     
     def analyze(self, db_cursor):
         alerts = []
+        pending_alerts = []  # For queueing alerts
         current_time = time.time()
         
         # Only run this rule periodically
@@ -71,7 +72,10 @@ class SSLCertificateRule(Rule):
                     try:
                         # Check for self-signed certificates
                         if is_self_signed and self.alert_on_self_signed:
-                            alerts.append(f"Self-signed certificate detected: {src_ip} -> {dst_ip}:{dst_port} (Subject: {subject})")
+                            alert_msg = f"Self-signed certificate detected: {src_ip} -> {dst_ip}:{dst_port} (Subject: {subject})"
+                            alerts.append(alert_msg)
+                            # Add to pending alerts - use destination IP as the target
+                            pending_alerts.append((dst_ip, alert_msg, self.name))
                         
                         # Check for expired certificates
                         if self.alert_on_expired and not_after:
@@ -79,7 +83,10 @@ class SSLCertificateRule(Rule):
                                 # Parse expiration date (assuming ISO format)
                                 expiry_date = datetime.fromisoformat(not_after.replace('Z', '+00:00'))
                                 if expiry_date < datetime.now():
-                                    alerts.append(f"Expired certificate detected: {src_ip} -> {dst_ip}:{dst_port} (Expired: {not_after})")
+                                    alert_msg = f"Expired certificate detected: {src_ip} -> {dst_ip}:{dst_port} (Expired: {not_after})"
+                                    alerts.append(alert_msg)
+                                    # Add to pending alerts - use destination IP as the target
+                                    pending_alerts.append((dst_ip, alert_msg, self.name))
                             except ValueError:
                                 # If date parsing fails, skip the expiry check
                                 pass
@@ -89,13 +96,19 @@ class SSLCertificateRule(Rule):
                             weak_algorithms = ["md5", "sha1", "md2", "md4"]
                             for weak_algo in weak_algorithms:
                                 if weak_algo.lower() in signature_algorithm.lower():
-                                    alerts.append(f"Weak certificate signature algorithm detected: {src_ip} -> {dst_ip}:{dst_port} ({signature_algorithm})")
+                                    alert_msg = f"Weak certificate signature algorithm detected: {src_ip} -> {dst_ip}:{dst_port} ({signature_algorithm})"
+                                    alerts.append(alert_msg)
+                                    # Add to pending alerts - use destination IP as the target
+                                    pending_alerts.append((dst_ip, alert_msg, self.name))
                                     break
                         
                         # Check for wildcard certificates
                         if self.alert_on_wildcard and subject_alt_names:
                             if '*.' in subject_alt_names or '*.' in subject:
-                                alerts.append(f"Wildcard certificate detected: {src_ip} -> {dst_ip}:{dst_port} (Subject: {subject})")
+                                alert_msg = f"Wildcard certificate detected: {src_ip} -> {dst_ip}:{dst_port} (Subject: {subject})"
+                                alerts.append(alert_msg)
+                                # Add to pending alerts - use destination IP as the target
+                                pending_alerts.append((dst_ip, alert_msg, self.name))
                         
                         # Cache this certificate
                         self.certificate_cache[connection_key] = {
@@ -120,10 +133,22 @@ class SSLCertificateRule(Rule):
                 for key in old_entries:
                     self.certificate_cache.pop(key, None)
             
+            # Queue all pending alerts
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
+            
             return alerts
         except Exception as e:
             error_msg = f"Error in SSL Certificate rule: {str(e)}"
             logging.error(error_msg)
+            # Try to queue the error alert
+            try:
+                self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+            except Exception as e:
+                logging.error(f"Error queueing alert: {e}")
             return [error_msg]
     
     def get_params(self):

@@ -60,7 +60,13 @@ class TimeBasedAccessRule(Rule):
             """
             
             db_cursor.execute(timestamp_query)
-            timestamp_type = db_cursor.fetchone()[0].lower()
+            result = db_cursor.fetchone()
+            if result is None:
+                # Handle the case where the query returned no results
+                logging.warning("No connections found in database, using default timestamp type")
+                timestamp_type = "text"  # Default to text as a safe option
+            else:
+                timestamp_type = result[0].lower()
             
             # Find recent connections outside of work hours
             # This is complex because SQLite doesn't have native time functions that match Python's

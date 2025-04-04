@@ -1495,18 +1495,37 @@ class LiveCaptureGUI:
             self.master.after(0, lambda: self.status_var.set(f"Captured: {self.capture_engine.packet_count} packets"))
 
     def update_output(self, message):
+        """Thread-safe method to update output in the UI"""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         formatted_message = f"[{timestamp}] {message}"
         
-        # Update UI
-        self.master.after(0, lambda: self._update_output_ui(formatted_message))
-        
-        # Save to log file automatically
         try:
-            with open(self.log_file, 'a', encoding='utf-8') as f:
-                f.write(formatted_message + "\n")
+            # First, always log to file regardless of UI state
+            try:
+                with open(self.log_file, 'a', encoding='utf-8') as f:
+                    f.write(formatted_message + "\n")
+            except Exception as e:
+                print(f"Error writing to log file: {e}")
+                
+            # Check if we're in the main thread
+            if threading.current_thread() is threading.main_thread():
+                # Direct update if we're in the main thread and UI is ready
+                try:
+                    self.master.after_idle(lambda: self._update_output_ui(formatted_message))
+                except (RuntimeError, tk.TclError):
+                    # Fall back to direct update if after_idle fails
+                    print(formatted_message)  # At least print to console
+            else:
+                # For background threads, use a more cautious approach
+                try:
+                    # Use a queue or other thread-safe mechanism here
+                    print(formatted_message)  # Print to console for now
+                except Exception:
+                    pass  # Last resort fallback
         except Exception as e:
-            print(f"Error writing to log file: {e}")
+            # Last resort - just print without formatting
+            print(f"Error in update_output: {e}")
+            print(message)
     
     def _update_output_ui(self, message):
         self.output_text.config(state=tk.NORMAL)

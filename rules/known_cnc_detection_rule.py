@@ -163,6 +163,7 @@ class CommandControlDetectionRule(Rule):
     
     def analyze(self, db_cursor):
         alerts = []
+        pending_alerts = []  # Track alerts for queueing
         current_time = time.time()
         
         # Only run periodically
@@ -193,7 +194,9 @@ class CommandControlDetectionRule(Rule):
                         
                         if c2_key not in self.detected_c2:
                             self.detected_c2[c2_key] = current_time
-                            alerts.append(f"Potential C2: {src_ip} queried known C2 domain: {domain}")
+                            alert_msg = f"Potential C2: {src_ip} queried known C2 domain: {domain}"
+                            alerts.append(alert_msg)
+                            pending_alerts.append((src_ip, alert_msg, self.name))
             
             # Check for connections to known C2 IPs
             for c2_ip in self.c2_ips:
@@ -210,7 +213,9 @@ class CommandControlDetectionRule(Rule):
                     
                     if c2_key not in self.detected_c2:
                         self.detected_c2[c2_key] = current_time
-                        alerts.append(f"Potential C2: {src_ip} connected to known C2 server: {dst_ip} ({count} connections)")
+                        alert_msg = f"Potential C2: {src_ip} connected to known C2 server: {dst_ip} ({count} connections)"
+                        alerts.append(alert_msg)
+                        pending_alerts.append((src_ip, alert_msg, self.name))
             
             # 2. Check for beaconing patterns matching known C2 frameworks
             db_cursor.execute("""
@@ -266,8 +271,17 @@ class CommandControlDetectionRule(Rule):
                         
                         if is_match:
                             self.detected_c2[c2_key] = current_time
-                            alerts.append(f"Potential {c2_type} C2 channel: {src_ip} to {dst_ip}:{dst_port} - {reason}")
+                            alert_msg = f"Potential {c2_type} C2 channel: {src_ip} to {dst_ip}:{dst_port} - {reason}"
+                            alerts.append(alert_msg)
+                            pending_alerts.append((src_ip, alert_msg, self.name))
                             break
+            
+            # Queue all pending alerts
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
             
             # Clean up old detections (after 12 hours)
             old_c2 = [k for k, t in self.detected_c2.items() if current_time - t > 43200]

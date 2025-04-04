@@ -22,6 +22,9 @@ class EnhancedPortScanRule(Rule):
     
     def analyze(self, db_cursor):
         alerts = []
+        # Add this list to store alerts that will be queued
+        pending_alerts = []
+        
         current_time = time.time()
         
         # Only run this rule periodically
@@ -80,7 +83,10 @@ class EnhancedPortScanRule(Rule):
                         continue  # Skip if alerted recently
                         
                     self.last_alert_time[ip_pair] = current_time
-                    alerts.append(f"Vertical port scan detected: {src_ip} scanned {len(ports)} ports on {dst_ip} with {max_sequential} sequential ports")
+                    alert_msg = f"Vertical port scan detected: {src_ip} scanned {len(ports)} ports on {dst_ip} with {max_sequential} sequential ports"
+                    alerts.append(alert_msg)
+                    # Add the alert to pending_alerts for queueing - use source IP
+                    pending_alerts.append((src_ip, alert_msg, self.name))
             
             # Detection 2: Horizontal scan (same port across multiple hosts)
             db_cursor.execute("""
@@ -110,13 +116,22 @@ class EnhancedPortScanRule(Rule):
                     continue  # Skip if alerted recently
                     
                 self.last_alert_time[src_ip] = current_time
-                alerts.append(f"Horizontal scan detected: {src_ip} scanned port {dst_port} on {host_count} hosts")
+                alert_msg = f"Horizontal scan detected: {src_ip} scanned port {dst_port} on {host_count} hosts"
+                alerts.append(alert_msg)
+                # Add the alert to pending_alerts for queueing - use source IP
+                pending_alerts.append((src_ip, alert_msg, self.name))
                 
                 # List sample hosts
                 if len(hosts) <= 5:
-                    alerts.append(f"  Hosts: {', '.join(hosts)}")
+                    host_msg = f"  Hosts: {', '.join(hosts)}"
+                    alerts.append(host_msg)
+                    # Add as a supplementary alert for the same IP
+                    pending_alerts.append((src_ip, host_msg, self.name))
                 else:
-                    alerts.append(f"  Sample hosts: {', '.join(hosts[:5])}...")
+                    host_msg = f"  Sample hosts: {', '.join(hosts[:5])}..."
+                    alerts.append(host_msg)
+                    # Add as a supplementary alert for the same IP
+                    pending_alerts.append((src_ip, host_msg, self.name))
             
             # Detection 3: Rapid scanning (many ports in short time)
             db_cursor.execute("""
@@ -152,7 +167,17 @@ class EnhancedPortScanRule(Rule):
                             continue  # Skip if alerted recently
                             
                         self.last_alert_time[ip_pair] = current_time
-                        alerts.append(f"Rapid port scan: {src_ip} scanned {port_count} ports on {dst_ip} in {time_span:.2f} seconds")
+                        alert_msg = f"Rapid port scan: {src_ip} scanned {port_count} ports on {dst_ip} in {time_span:.2f} seconds"
+                        alerts.append(alert_msg)
+                        # Add the alert to pending_alerts for queueing - use source IP
+                        pending_alerts.append((src_ip, alert_msg, self.name))
+            
+            # Queue all pending alerts
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
             
             return alerts
             

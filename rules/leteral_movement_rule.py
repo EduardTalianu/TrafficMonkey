@@ -50,6 +50,7 @@ class LateralMovementRule(Rule):
     
     def analyze(self, db_cursor):
         alerts = []
+        pending_alerts = []  # Track alerts for queueing
         current_time = time.time()
         
         # Only run periodically
@@ -124,16 +125,27 @@ class LateralMovementRule(Rule):
                             protocols_used.append(f"{protocol} to {targets_str}")
                     
                     # Create main alert
-                    alerts.append(f"Lateral movement detected: {src_ip} connected to {len(internal_targets)} internal hosts using {admin_protocol_count} administrative protocols")
+                    alert_msg = f"Lateral movement detected: {src_ip} connected to {len(internal_targets)} internal hosts using {admin_protocol_count} administrative protocols"
+                    alerts.append(alert_msg)
+                    pending_alerts.append((src_ip, alert_msg, self.name))
                     
                     # Add details about protocols and targets
                     for protocol_info in protocols_used:
-                        alerts.append(f"  - Used {protocol_info}")
+                        detail_msg = f"  - Used {protocol_info}"
+                        alerts.append(detail_msg)
+                        pending_alerts.append((src_ip, detail_msg, self.name))
             
             # Clean up old detections (after 12 hours)
             old_movements = [k for k, t in self.detected_movements.items() if current_time - t > 43200]
             for key in old_movements:
                 self.detected_movements.pop(key, None)
+            
+            # Queue all pending alerts
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
             
             return alerts
             

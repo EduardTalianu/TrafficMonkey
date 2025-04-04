@@ -167,27 +167,29 @@ class MaliciousFileTransferRule(Rule):
     def detect_http_file_transfer(self, db_cursor):
         """Detect unusual HTTP file transfers"""
         alerts = []
+        pending_alerts = []  # Track alerts for queueing
         
         try:
-            # Check if http_headers table exists
+            # Check if http_requests table exists
             db_cursor.execute("""
                 SELECT name FROM sqlite_master 
-                WHERE type='table' AND name='http_headers'
+                WHERE type='table' AND name='http_requests'
             """)
             
             if not db_cursor.fetchone():
                 return []  # Skip if table doesn't exist
             
-            # Look for suspicious HTTP headers or methods
+            # Look for suspicious HTTP requests using correct table and field names
             db_cursor.execute("""
-                SELECT h.connection_key, c.src_ip, c.dst_ip, h.method, h.path, h.host, h.content_length, h.content_type
-                FROM http_headers h
-                JOIN connections c ON h.connection_key = c.connection_key
+                SELECT r.connection_key, c.src_ip, c.dst_ip, r.method, r.uri, r.host, 
+                    r.request_size, r.content_type
+                FROM http_requests r
+                JOIN connections c ON r.connection_key = c.connection_key
                 WHERE c.timestamp > datetime('now', '-30 minutes')
-                AND (content_length > ? OR method IN ('PUT', 'PATCH'))
+                AND (r.request_size > ? OR r.method IN ('PUT', 'PATCH'))
             """, (self.http_min_content_length,))
             
-            for conn_key, src_ip, dst_ip, method, path, host, content_length, content_type in db_cursor.fetchall():
+            for conn_key, src_ip, dst_ip, method, uri, host, content_length, content_type in db_cursor.fetchall():
                 suspicion_level = 0
                 reasons = []
                 
@@ -208,14 +210,14 @@ class MaliciousFileTransferRule(Rule):
                         reasons.append(f"suspicious content-type ({content_type})")
                 
                 # Check for suspicious paths
-                if path:
-                    if any(s in path.lower() for s in ['upload', 'file', 'put', 'data']):
+                if uri:
+                    if any(s in uri.lower() for s in ['upload', 'file', 'put', 'data']):
                         suspicion_level += 1
                         reasons.append("suspicious path")
                     
                     # Check if path contains encoded data
-                    if len(path) > 100:
-                        entropy = self.calculate_entropy(path)
+                    if len(uri) > 100:
+                        entropy = self.calculate_entropy(uri)
                         if entropy > 4.0:
                             suspicion_level += 2
                             reasons.append(f"high entropy path (entropy: {entropy:.2f})")
@@ -236,7 +238,16 @@ class MaliciousFileTransferRule(Rule):
                     
                     if alert_key not in self.detected_transfers:
                         self.detected_transfers[alert_key] = time.time()
-                        alerts.append(f"Suspicious HTTP file transfer: {src_ip} to {dst_ip} - {', '.join(reasons)}")
+                        alert_msg = f"Suspicious HTTP file transfer: {src_ip} to {dst_ip} - {', '.join(reasons)}"
+                        alerts.append(alert_msg)
+                        pending_alerts.append((src_ip, alert_msg, self.name))
+            
+            # Queue all pending alerts
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
             
             return alerts
         except Exception as e:
@@ -280,6 +291,7 @@ class MaliciousFileTransferRule(Rule):
     
     def analyze(self, db_cursor):
         alerts = []
+        pending_alerts = []  # Track alerts for queueing
         current_time = time.time()
         
         # Only run periodically
@@ -297,6 +309,21 @@ class MaliciousFileTransferRule(Rule):
             alerts.extend(dns_alerts)
             alerts.extend(http_alerts)
             alerts.extend(icmp_alerts)
+            
+            # Also ensure DNS and ICMP methods queue alerts
+            for alert in dns_alerts + icmp_alerts:
+                # Extract IP from alert message
+                ip_matches = re.findall(r'(\d+\.\d+\.\d+\.\d+)', alert)
+                if ip_matches:
+                    src_ip = ip_matches[0]  # Use first IP as source
+                    pending_alerts.append((src_ip, alert, self.name))
+            
+            # Queue all pending alerts
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
             
             # Clean up old detections (after 6 hours)
             old_detections = [k for k, t in self.detected_transfers.items() if current_time - t > 21600]

@@ -17,22 +17,25 @@ class ProtocolTunnelingRule(Rule):
     def analyze_http_tunneling(self, db_cursor):
         """Analyze HTTP traffic for tunneling indicators"""
         alerts = []
+        pending_alerts = []  # For queueing
         
         try:
-            # Check if http_headers table exists
+            # Check if http_requests table exists (not http_headers)
             db_cursor.execute("""
                 SELECT name FROM sqlite_master 
-                WHERE type='table' AND name='http_headers'
+                WHERE type='table' AND name='http_requests'
             """)
             
             if not db_cursor.fetchone():
-                return []  # HTTP headers table doesn't exist, skip this check
+                return []  # HTTP requests table doesn't exist, skip this check
             
             # Look for suspicious HTTP traffic that might indicate tunneling
+            # Changed to use the correct table and fields
             db_cursor.execute("""
-                SELECT h.connection_key, c.src_ip, c.dst_ip, c.dst_port, h.host, h.path, h.user_agent, c.total_bytes
-                FROM http_headers h
-                JOIN connections c ON h.connection_key = c.connection_key
+                SELECT r.connection_key, c.src_ip, c.dst_ip, c.dst_port, 
+                    r.host, r.uri, r.user_agent, c.total_bytes
+                FROM http_requests r
+                JOIN connections c ON r.connection_key = c.connection_key
                 WHERE c.total_bytes > ?
                 AND c.timestamp > datetime('now', '-1 hour')
             """, (self.min_http_content_length,))
@@ -74,17 +77,20 @@ class ProtocolTunnelingRule(Rule):
                 if suspicious:
                     alert_msg = f"Possible HTTP tunneling: {src_ip} to {dst_ip}:{dst_port} ({total_bytes/1024:.1f} KB) - {', '.join(reasons)}"
                     alerts.append(alert_msg)
+                    # Add to pending alerts
+                    pending_alerts.append((src_ip, alert_msg, self.name))
             
-            return alerts
+            return alerts, pending_alerts
             
         except Exception as e:
             error_msg = f"Error in HTTP tunneling analysis: {str(e)}"
             logging.error(error_msg)
-            return [error_msg]
-    
+            return [error_msg], []
+        
     def analyze_icmp_tunneling(self, db_cursor):
         """Analyze ICMP traffic for tunneling indicators"""
         alerts = []
+        pending_alerts = []  # For queueing
         
         try:
             # Check if icmp_packets table exists
@@ -94,7 +100,7 @@ class ProtocolTunnelingRule(Rule):
             """)
             
             if not db_cursor.fetchone():
-                return []  # ICMP table doesn't exist, skip this check
+                return [], []  # ICMP table doesn't exist, skip this check
             
             # Look for unusual ICMP traffic
             db_cursor.execute("""
@@ -135,17 +141,20 @@ class ProtocolTunnelingRule(Rule):
                         if cv < 0.5 and avg_interval < 60:  # Less than 60 seconds between packets
                             alert_msg = f"Possible ICMP tunneling: {src_ip} sent {packet_count} ICMP packets to {dst_ip} with regular timing (variance: {cv:.2f})"
                             alerts.append(alert_msg)
+                            # Add to pending alerts
+                            pending_alerts.append((src_ip, alert_msg, self.name))
             
-            return alerts
+            return alerts, pending_alerts
             
         except Exception as e:
             error_msg = f"Error in ICMP tunneling analysis: {str(e)}"
             logging.error(error_msg)
-            return [error_msg]
+            return [error_msg], []
     
     def analyze_ssh_tunneling(self, db_cursor):
         """Analyze SSH traffic for tunneling indicators"""
         alerts = []
+        pending_alerts = []  # For queueing
         
         try:
             # Look for SSH connections with unusual traffic patterns
@@ -171,16 +180,19 @@ class ProtocolTunnelingRule(Rule):
                     if bytes_per_packet > 1000:  # More than 1KB per packet average
                         alert_msg = f"Possible SSH tunneling: {src_ip} to {dst_ip} with {total_bytes/1024:.1f} KB transferred ({bytes_per_packet:.1f} bytes/packet)"
                         alerts.append(alert_msg)
+                        # Add to pending alerts
+                        pending_alerts.append((src_ip, alert_msg, self.name))
             
-            return alerts
+            return alerts, pending_alerts
             
         except Exception as e:
             error_msg = f"Error in SSH tunneling analysis: {str(e)}"
             logging.error(error_msg)
-            return [error_msg]
+            return [error_msg], []
     
     def analyze(self, db_cursor):
         alerts = []
+        pending_alerts = []  # For queueing to database
         current_time = time.time()
         
         # Only run this rule periodically
@@ -191,13 +203,26 @@ class ProtocolTunnelingRule(Rule):
         
         try:
             # Run the different protocol tunneling detection methods (excluding DNS)
-            http_alerts = self.analyze_http_tunneling(db_cursor)
-            icmp_alerts = self.analyze_icmp_tunneling(db_cursor)
-            ssh_alerts = self.analyze_ssh_tunneling(db_cursor)
+            http_alerts, http_pending = self.analyze_http_tunneling(db_cursor)
+            icmp_alerts, icmp_pending = self.analyze_icmp_tunneling(db_cursor)
+            ssh_alerts, ssh_pending = self.analyze_ssh_tunneling(db_cursor)
             
+            # Combine all alerts
             alerts.extend(http_alerts)
             alerts.extend(icmp_alerts)
             alerts.extend(ssh_alerts)
+            
+            # Combine all pending alerts
+            pending_alerts.extend(http_pending)
+            pending_alerts.extend(icmp_pending)
+            pending_alerts.extend(ssh_pending)
+            
+            # Queue all pending alerts
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
             
             return alerts
         except Exception as e:

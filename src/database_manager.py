@@ -218,28 +218,20 @@ class DatabaseManager:
         """)
 
     def add_http_headers(self, request_id, connection_key, headers_json, is_request=True):
-        """
-        Parses headers JSON and adds individual headers to the http_headers table
-        """
+        """Parses headers JSON and adds individual headers to the http_headers table"""
         try:
+            cursor = self.capture_conn.cursor()
             current_time = time.time()
-            if not headers_json:
-                return True
-                
-            # Parse JSON headers
-            try:
+            if headers_json:
                 headers = json.loads(headers_json)
-            except json.JSONDecodeError:
-                return False
-                
-            # Add each header to the headers table
-            for name, value in headers.items():
-                self.capture_cursor.execute("""
-                    INSERT INTO http_headers
-                    (connection_key, request_id, header_name, header_value, is_request, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (connection_key, request_id, name, value, is_request, current_time))
-                
+                for name, value in headers.items():
+                    cursor.execute("""
+                        INSERT INTO http_headers
+                        (connection_key, request_id, header_name, header_value, is_request, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (connection_key, request_id, name, value, is_request, current_time))
+            self.capture_conn.commit()
+            cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error adding HTTP headers: {e}")
@@ -467,8 +459,8 @@ class DatabaseManager:
     def add_packet(self, connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp=0):
         """Add packet to the capture database (write-only operation)"""
         try:
-            # Update existing connection if it exists
-            self.capture_cursor.execute("""
+            cursor = self.capture_conn.cursor()
+            cursor.execute("""
                 UPDATE connections 
                 SET total_bytes = total_bytes + ?,
                     packet_count = packet_count + 1,
@@ -476,14 +468,15 @@ class DatabaseManager:
                 WHERE connection_key = ?
             """, (length, connection_key))
             
-            # If no rows updated, insert new connection
-            if self.capture_cursor.rowcount == 0:
-                self.capture_cursor.execute("""
+            if cursor.rowcount == 0:
+                cursor.execute("""
                     INSERT INTO connections 
                     (connection_key, src_ip, dst_ip, src_port, dst_port, total_bytes, packet_count, is_rdp_client)
                     VALUES (?, ?, ?, ?, ?, ?, 1, ?)
                 """, (connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp))
             
+            self.capture_conn.commit()
+            cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error adding packet: {e}")
@@ -492,13 +485,15 @@ class DatabaseManager:
     def add_port_scan_data(self, src_ip, dst_ip, dst_port):
         """Update port scan detection data"""
         try:
-            # Update or insert port scan timestamp
+            cursor = self.capture_conn.cursor()
             current_time = time.time()
-            self.capture_cursor.execute("""
+            cursor.execute("""
                 INSERT OR REPLACE INTO port_scan_timestamps
                 (src_ip, dst_ip, dst_port, timestamp)
                 VALUES (?, ?, ?, ?)
             """, (src_ip, dst_ip, dst_port, current_time))
+            self.capture_conn.commit()  # Commit immediately
+            cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error updating port scan data: {e}")
@@ -535,10 +530,13 @@ class DatabaseManager:
     def add_alert(self, ip_address, alert_message, rule_name):
         """Add an alert to the capture database (write-only operation)"""
         try:
-            self.capture_cursor.execute("""
+            cursor = self.capture_conn.cursor()
+            cursor.execute("""
                 INSERT INTO alerts (ip_address, alert_message, rule_name)
                 VALUES (?, ?, ?)
             """, (ip_address, alert_message, rule_name))
+            self.capture_conn.commit()
+            cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error adding alert: {e}")
@@ -547,20 +545,20 @@ class DatabaseManager:
     def add_http_request(self, connection_key, method, host, uri, version, user_agent, referer, content_type, headers_json, request_size):
         """Store HTTP request information"""
         try:
+            cursor = self.capture_conn.cursor()
             current_time = time.time()
-            self.capture_cursor.execute("""
+            cursor.execute("""
                 INSERT INTO http_requests
                 (connection_key, timestamp, method, host, uri, version, user_agent, referer, content_type, request_headers, request_size)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (connection_key, current_time, method, host, uri, version, user_agent, referer, content_type, headers_json, request_size))
             
-            # Get the ID of the inserted request
-            request_id = self.capture_cursor.lastrowid
-            
-            # Add headers to the headers table
+            request_id = cursor.lastrowid
             if headers_json:
                 self.add_http_headers(request_id, connection_key, headers_json, is_request=True)
-                
+            
+            self.capture_conn.commit()
+            cursor.close()
             return request_id
         except Exception as e:
             logger.error(f"Error storing HTTP request: {e}")
@@ -584,8 +582,9 @@ class DatabaseManager:
                         ja3s_fingerprint, cert_issuer, cert_subject, cert_valid_from, cert_valid_to, cert_serial):
         """Store TLS connection information"""
         try:
+            cursor = self.capture_conn.cursor()
             current_time = time.time()
-            self.capture_cursor.execute("""
+            cursor.execute("""
                 INSERT OR REPLACE INTO tls_connections
                 (connection_key, timestamp, tls_version, cipher_suite, server_name, ja3_fingerprint, 
                 ja3s_fingerprint, certificate_issuer, certificate_subject, certificate_validity_start, 
@@ -593,6 +592,8 @@ class DatabaseManager:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (connection_key, current_time, tls_version, cipher_suite, server_name, ja3_fingerprint, 
                 ja3s_fingerprint, cert_issuer, cert_subject, cert_valid_from, cert_valid_to, cert_serial))
+            self.capture_conn.commit()  # Commit immediately
+            cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error storing TLS connection: {e}")
@@ -601,20 +602,22 @@ class DatabaseManager:
     def add_app_protocol(self, connection_key, app_protocol, protocol_details=None, detection_method=None):
         """Store application protocol information"""
         try:
+            cursor = self.capture_conn.cursor()
             current_time = time.time()
-            self.capture_cursor.execute("""
+            cursor.execute("""
                 INSERT OR REPLACE INTO app_protocols
                 (connection_key, app_protocol, protocol_details, detection_method, timestamp)
                 VALUES (?, ?, ?, ?, ?)
             """, (connection_key, app_protocol, protocol_details, detection_method, current_time))
             
-            # Also update the connection record with the protocol
-            self.capture_cursor.execute("""
+            cursor.execute("""
                 UPDATE connections
                 SET protocol = ?
                 WHERE connection_key = ?
             """, (app_protocol, connection_key))
             
+            self.capture_conn.commit()
+            cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error storing application protocol: {e}")
@@ -1134,12 +1137,13 @@ class DatabaseManager:
     def update_connection_field(self, connection_key, field, value):
         """Update a specific field in the connections table (used by rules)"""
         try:
-            # Update in capture DB
-            self.capture_cursor.execute(
+            cursor = self.capture_conn.cursor()
+            cursor.execute(
                 f"UPDATE connections SET {field} = ? WHERE connection_key = ?",
                 (value, connection_key)
             )
             self.capture_conn.commit()
+            cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error updating connection field: {e}")

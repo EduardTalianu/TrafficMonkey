@@ -69,11 +69,12 @@ class CredentialDumpingRule(Rule):
             if not db_cursor.fetchone():
                 return [], []  # Skip if table doesn't exist
             
-            # Look for suspicious user agents or URIs in HTTP requests
+            # Join http_requests with connections to get IPs
             db_cursor.execute("""
-                SELECT src_ip, dst_ip, uri, host, user_agent
-                FROM http_requests
-                WHERE timestamp > datetime('now', '-30 minutes')
+                SELECT c.src_ip, c.dst_ip, h.uri, h.host, h.user_agent
+                FROM http_requests h
+                JOIN connections c ON h.connection_key = c.connection_key
+                WHERE h.timestamp > datetime('now', '-30 minutes')
             """)
             
             for src_ip, dst_ip, uri, host, user_agent in db_cursor.fetchall():

@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import hashlib
+import threading
 
 class VirusTotalRule(Rule):
     """Rule that checks IPs and URLs against VirusTotal API"""
@@ -17,6 +18,10 @@ class VirusTotalRule(Rule):
         self.check_interval = 10     # Check at most one resource every 10 seconds to respect API limits
         self.max_checks_per_run = 5  # Maximum number of resources to check per rule run
         self.check_urls = True       # Whether to extract and check URLs from connection data
+        
+        # To prevent database recursion errors
+        self.pending_updates = []
+        self.pending_alerts = []
         
         # Set up cache file path in db directory
         try:
@@ -412,169 +417,213 @@ class VirusTotalRule(Rule):
             logging.error(f"Error checking URL {url} with VirusTotal: {e}")
             return None
     
+    def add_connection_update(self, connection_key, field, value):
+        """Add a connection update to the pending list"""
+        self.pending_updates.append((connection_key, field, value))
+    
+    def add_pending_alert(self, ip, message, rule_name):
+        """Add an alert to the pending list"""
+        self.pending_alerts.append((ip, message, rule_name))
+    
+    def process_pending_updates(self):
+        """Process all pending connection updates"""
+        for connection_key, field, value in self.pending_updates:
+            try:
+                self.db_manager.queue_query(
+                    self.db_manager.update_connection_field,
+                    None,  # No callback needed
+                    connection_key, field, value
+                )
+            except Exception as e:
+                logging.error(f"Error queueing connection update: {e}")
+        
+        # Clear the list after processing
+        self.pending_updates = []
+    
+    def process_pending_alerts(self):
+        """Process all pending alerts"""
+        for ip, msg, rule_name in self.pending_alerts:
+            try:
+                self.db_manager.queue_alert(ip, msg, rule_name)
+            except Exception as e:
+                logging.error(f"Error queueing alert: {e}")
+        
+        # Clear the list after processing
+        self.pending_alerts = []
+    
     def analyze(self, db_cursor):
+        # Clear pending updates/alerts from previous runs
+        self.pending_updates = []
+        self.pending_alerts = []
+        
         # Store alerts to be returned
         alerts = []
-        
-        # Store new alerts that will be queued AFTER this function completes
-        # to avoid recursive cursor use
-        pending_alerts = []
         
         # Refresh false positives list before running analysis
         self.false_positives = self.load_false_positives()
         
-        # First, look for any connections already marked as malicious
-        db_cursor.execute("SELECT src_ip, dst_ip, connection_key, vt_result FROM connections WHERE vt_result = 'Malicious'")
-        vt_alerts = db_cursor.fetchall()
-        
-        for src_ip, dst_ip, connection_key, vt_result in vt_alerts:
-            # Check if destination IP is in false positives list
-            dst_ip_clean = dst_ip.split(':')[0] if ':' in dst_ip else dst_ip
+        try:
+            # First, look for any connections already marked as malicious
+            db_cursor.execute("SELECT src_ip, dst_ip, connection_key, vt_result FROM connections WHERE vt_result = 'Malicious'")
+            vt_alerts = db_cursor.fetchall()
             
-            if dst_ip_clean in self.false_positives:
-                # Store connection update for later
-                self.update_connection(connection_key, "vt_result", 'False Positive')
-                continue  # Skip creating an alert
+            for src_ip, dst_ip, connection_key, vt_result in vt_alerts:
+                # Check if destination IP is in false positives list
+                dst_ip_clean = dst_ip.split(':')[0] if ':' in dst_ip else dst_ip
                 
-            # Create alert message
-            alert_msg = f"Malicious connection from {src_ip} to {dst_ip} (VirusTotal: {vt_result})"
-            
-            # Store alert for later queueing - use the malicious IP as the alert IP
-            pending_alerts.append((dst_ip_clean, alert_msg, self.name))
-            
-            # Add to immediate alerts list
-            alerts.append(f"ALERT: {alert_msg}")
-        
-        # Get API key from environment
-        api_key = os.getenv("VIRUSTOTAL_API_KEY", "")
-        if not api_key:
-            # Store warning for later queueing - use the first alert IP if available, otherwise a default
-            default_ip = vt_alerts[0][1] if vt_alerts else "0.0.0.0"
-            pending_alerts.append((default_ip, "No VirusTotal API key set in environment variable VIRUSTOTAL_API_KEY", self.name))
-            alerts.append("WARNING: No VirusTotal API key set in environment variable VIRUSTOTAL_API_KEY")
-            
-            # Queue all pending alerts
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    # Use separate thread/queue for dispatching alerts
-                    self.db_manager.queue_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
+                if dst_ip_clean in self.false_positives:
+                    # Add to pending updates instead of updating directly
+                    self.add_connection_update(connection_key, "vt_result", 'False Positive')
+                    continue  # Skip creating an alert
+                    
+                # Create alert message
+                alert_msg = f"Malicious connection from {src_ip} to {dst_ip} (VirusTotal: {vt_result})"
                 
-            return alerts
-        
-        # Look for new connections that haven't been checked
-        db_cursor.execute("""
-            SELECT connection_key, src_ip, dst_ip 
-            FROM connections 
-            WHERE (vt_result IS NULL OR vt_result = 'unknown')
-            AND total_bytes > 1000
-            LIMIT 100
-        """)
-        
-        unchecked = db_cursor.fetchall()
-        # Store the results to process after closing the cursor
-        unchecked_connections = []
-        for row in unchecked:
-            unchecked_connections.append(row)
-        
-        # Check a limited number of resources per run to respect API limits
-        checks_performed = 0
-        # Keep track of checked IPs for informational messages
-        checked_ips = set()
-        
-        # Process connections outside of cursor context
-        for connection_key, src_ip, dst_ip in unchecked_connections:
-            # Extract the IP part if it contains port information
-            dst_ip_clean = dst_ip.split(':')[0] if ':' in dst_ip else dst_ip
-            
-            # Skip if not a valid public IP
-            if not self.is_valid_public_ip(dst_ip_clean):
-                continue
-            
-            # Skip if IP is in false positives list
-            if dst_ip_clean in self.false_positives:
-                # Store for update after loop
-                self.update_connection(connection_key, "vt_result", 'False Positive')
-                logging.info(f"Marked connection {connection_key} as false positive")
-                continue
-            
-            # Check if we've reached our limit for this run
-            if checks_performed >= self.max_checks_per_run:
-                break
+                # Add to pending alerts instead of queuing directly
+                self.add_pending_alert(dst_ip_clean, alert_msg, self.name)
                 
-            # Check the IP
-            result = self.check_ip(dst_ip_clean, api_key)
-            checks_performed += 1
-            checked_ips.add(dst_ip_clean)
+                # Add to immediate alerts list
+                alerts.append(f"ALERT: {alert_msg}")
             
-            if result:
-                # Store update for after loop
-                self.update_connection(connection_key, "vt_result", result['status'])
+            # Get API key from environment
+            api_key = os.getenv("VIRUSTOTAL_API_KEY", "")
+            if not api_key:
+                # Add to pending alerts instead of queuing directly
+                default_ip = vt_alerts[0][1] if vt_alerts else "0.0.0.0"
+                self.add_pending_alert(default_ip, "No VirusTotal API key set in environment variable VIRUSTOTAL_API_KEY", self.name)
+                alerts.append("WARNING: No VirusTotal API key set in environment variable VIRUSTOTAL_API_KEY")
                 
-                if result['is_malicious']:
-                    # Create alert message
-                    alert_msg = f"Malicious IP detected in connection from {src_ip} to {dst_ip} (VirusTotal detections: {result['total_detections']})"
-                    
-                    # Store for queueing after loop - use the malicious IP as the alert IP
-                    pending_alerts.append((dst_ip_clean, alert_msg, self.name))
-                    
-                    # Add to immediate alerts list
-                    alerts.append(f"ALERT: {alert_msg}")
+                # Process all pending updates and alerts
+                self.process_pending_updates()
+                self.process_pending_alerts()
+                
+                return alerts
             
-            # If URL checking is enabled, check URLs from the connection data
-            if self.check_urls and checks_performed < self.max_checks_per_run:
-                # This is where you would extract URLs from packet data if available
-                # For demo purposes, we'll just check if the destination looks like a hostname
-                if not re.match(r'^\d+\.\d+\.\d+\.\d+', dst_ip):
-                    potential_url = dst_ip.split(':')[0] if ':' in dst_ip else dst_ip
+            # Look for new connections that haven't been checked
+            db_cursor.execute("""
+                SELECT connection_key, src_ip, dst_ip 
+                FROM connections 
+                WHERE (vt_result IS NULL OR vt_result = 'unknown')
+                AND total_bytes > 1000
+                LIMIT 100
+            """)
+            
+            # Store the results to process after closing the cursor
+            unchecked_connections = []
+            for row in db_cursor.fetchall():
+                unchecked_connections.append(row)
+            
+            # Check a limited number of resources per run to respect API limits
+            checks_performed = 0
+            # Keep track of checked IPs for informational messages
+            checked_ips = set()
+            
+            # Process connections outside of cursor context
+            for connection_key, src_ip, dst_ip in unchecked_connections:
+                # Extract the IP part if it contains port information
+                dst_ip_clean = dst_ip.split(':')[0] if ':' in dst_ip else dst_ip
+                
+                # Skip if not a valid public IP
+                if not self.is_valid_public_ip(dst_ip_clean):
+                    continue
+                
+                # Skip if IP is in false positives list
+                if dst_ip_clean in self.false_positives:
+                    # Add to pending updates instead of updating directly
+                    self.add_connection_update(connection_key, "vt_result", 'False Positive')
+                    logging.info(f"Marked connection {connection_key} as false positive")
+                    continue
+                
+                # Check if we've reached our limit for this run
+                if checks_performed >= self.max_checks_per_run:
+                    break
                     
-                    # Check if domain is in false positives list
-                    if potential_url in self.false_positives:
-                        continue
+                # Check the IP
+                result = self.check_ip(dst_ip_clean, api_key)
+                checks_performed += 1
+                checked_ips.add(dst_ip_clean)
+                
+                if result:
+                    # Add to pending updates instead of updating directly
+                    self.add_connection_update(connection_key, "vt_result", result['status'])
                     
-                    # Check if we still have API quota
-                    if checks_performed >= self.max_checks_per_run:
-                        break
-                        
-                    url_result = self.check_url(potential_url, api_key)
-                    checks_performed += 1
-                    
-                    if url_result and url_result['is_malicious']:
+                    if result['is_malicious']:
                         # Create alert message
-                        alert_msg = f"Malicious URL detected in connection from {src_ip} to {potential_url} (VirusTotal detections: {url_result['total_detections']})"
+                        alert_msg = f"Malicious IP detected in connection from {src_ip} to {dst_ip} (VirusTotal detections: {result['total_detections']})"
                         
-                        # Store for queueing after loop - use the destination as the alert IP since it's the malicious one
-                        pending_alerts.append((potential_url, alert_msg, self.name))
+                        # Add to pending alerts instead of queuing directly
+                        self.add_pending_alert(dst_ip_clean, alert_msg, self.name)
                         
                         # Add to immediate alerts list
                         alerts.append(f"ALERT: {alert_msg}")
+                
+                # If URL checking is enabled, check URLs from the connection data
+                if self.check_urls and checks_performed < self.max_checks_per_run:
+                    # This is where you would extract URLs from packet data if available
+                    # For demo purposes, we'll just check if the destination looks like a hostname
+                    if not re.match(r'^\d+\.\d+\.\d+\.\d+', dst_ip):
+                        potential_url = dst_ip.split(':')[0] if ':' in dst_ip else dst_ip
+                        
+                        # Check if domain is in false positives list
+                        if potential_url in self.false_positives:
+                            continue
+                        
+                        # Check if we still have API quota
+                        if checks_performed >= self.max_checks_per_run:
+                            break
+                            
+                        url_result = self.check_url(potential_url, api_key)
+                        checks_performed += 1
+                        
+                        if url_result and url_result['is_malicious']:
+                            # Create alert message
+                            alert_msg = f"Malicious URL detected in connection from {src_ip} to {potential_url} (VirusTotal detections: {url_result['total_detections']})"
+                            
+                            # Add to pending alerts instead of queuing directly
+                            self.add_pending_alert(potential_url, alert_msg, self.name)
+                            
+                            # Add to immediate alerts list
+                            alerts.append(f"ALERT: {alert_msg}")
+            
+            if checks_performed > 0:
+                # Use the most recently checked IP for info messages
+                info_ip = next(iter(checked_ips)) if checked_ips else "127.0.0.1"
+                
+                info_msg = f"Checked {checks_performed} resources with VirusTotal API"
+                alerts.append(f"INFO: {info_msg}")
+                
+                cache_msg = f"VirusTotal cache has {len(self.ip_cache)} IPs and {len(self.url_cache)} URLs"
+                alerts.append(f"INFO: {cache_msg}")
+                
+                fp_msg = f"Using {len(self.false_positives)} IP addresses in false positives list"
+                alerts.append(f"INFO: {fp_msg}")
+                
+                # Add to pending alerts instead of queuing directly
+                self.add_pending_alert(info_ip, info_msg, self.name)
+                self.add_pending_alert(info_ip, cache_msg, self.name)
+                self.add_pending_alert(info_ip, fp_msg, self.name)
         
-        if checks_performed > 0:
-            # Use the most recently checked IP for info messages
-            info_ip = next(iter(checked_ips)) if checked_ips else "127.0.0.1"
+        except Exception as e:
+            logging.error(f"Error in VirusTotal rule: {e}")
+            import traceback
+            traceback.print_exc()
             
-            info_msg = f"Checked {checks_performed} resources with VirusTotal API"
-            alerts.append(f"INFO: {info_msg}")
-            
-            cache_msg = f"VirusTotal cache has {len(self.ip_cache)} IPs and {len(self.url_cache)} URLs"
-            alerts.append(f"INFO: {cache_msg}")
-            
-            fp_msg = f"Using {len(self.false_positives)} IP addresses in false positives list"
-            alerts.append(f"INFO: {fp_msg}")
-            
-            # Store informational messages for queueing using the most recently checked IP
-            pending_alerts.append((info_ip, info_msg, self.name))
-            pending_alerts.append((info_ip, cache_msg, self.name))
-            pending_alerts.append((info_ip, fp_msg, self.name))
+            # Add error to alerts
+            alerts.append(f"ERROR: VirusTotal rule error: {e}")
         
-        # Queue all pending alerts AFTER db_cursor operations are complete
-        for ip, msg, rule_name in pending_alerts:
-            try:
-                # Use the queue method to add alerts
-                self.db_manager.queue_alert(ip, msg, rule_name)
-            except Exception as e:
-                logging.error(f"Error queueing alert: {e}")
+        finally:
+            # Process all pending updates and alerts at the very end
+            # Separate these with a short delay to ensure database operations don't overlap
+            def process_with_delay():
+                # Process updates first
+                self.process_pending_updates()
+                # Wait a moment before processing alerts
+                time.sleep(0.1)
+                # Then process alerts
+                self.process_pending_alerts()
+            
+            # Start in a separate thread to avoid blocking
+            threading.Thread(target=process_with_delay, daemon=True).start()
             
         return alerts
     
@@ -606,3 +655,12 @@ class VirusTotalRule(Rule):
     def get_params(self):
         """Get configurable parameters"""
         return self.configurable_params
+    
+    def update_connection(self, connection_key, field, value):
+        """
+        Override the parent class method to use the queue system instead
+        of direct database access to prevent recursive cursor use
+        """
+        # Instead of directly queueing, add to pending updates
+        self.add_connection_update(connection_key, field, value)
+        return True
