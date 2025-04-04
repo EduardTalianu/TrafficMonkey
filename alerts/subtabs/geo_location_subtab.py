@@ -432,8 +432,8 @@ class GeoLocationSubtab(SubtabBase):
         if not self.city_reader and not self.country_reader and not self.asn_reader:
             self.update_output("No GeoIP databases loaded. Please load databases first.")
             return
-            
-        # Create a new function to get all IPs from the database
+        
+        # Define the function to get IPs from the database using queue system
         def get_all_ips():
             try:
                 cursor = gui.db_manager.analysis_conn.cursor()
@@ -647,6 +647,9 @@ class GeoLocationSubtab(SubtabBase):
                 import traceback
                 traceback.print_exc()
                 return []
+                
+            finally:
+                cursor.close()
         
         # Queue the database query
         gui.db_manager.queue_query(

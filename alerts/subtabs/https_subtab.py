@@ -213,7 +213,7 @@ class HttpTlsMonitor(SubtabBase):
                   command=self.export_suspicious_tls).pack(side="right", padx=5)
     
     def check_database_status(self):
-        """Check database table status for debugging"""
+        """Check database table status for debugging using queue system"""
         self.update_output("Checking database tables...")
         
         # Create a debug information window
@@ -230,7 +230,7 @@ class HttpTlsMonitor(SubtabBase):
         scrollbar.pack(side="right", fill="y")
         debug_text.config(yscrollcommand=scrollbar.set)
         
-        # Collect database information
+        # Define query functions using queue system
         def get_table_counts():
             conn = self.gui.db_manager.analysis_conn
             cursor = conn.cursor()
@@ -251,7 +251,6 @@ class HttpTlsMonitor(SubtabBase):
             cursor.close()
             return tables
         
-        # Check for TLS connections
         def check_tls_connections():
             conn = self.gui.db_manager.analysis_conn
             cursor = conn.cursor()
@@ -284,8 +283,7 @@ class HttpTlsMonitor(SubtabBase):
                 "tls_records": tls_records,
                 "recent_https": recent_https
             }
-            
-        # Get HTTP requests info
+        
         def check_http_requests():
             conn = self.gui.db_manager.analysis_conn
             cursor = conn.cursor()
@@ -314,12 +312,25 @@ class HttpTlsMonitor(SubtabBase):
                 "http_responses": http_responses,
                 "recent_requests": recent_requests
             }
-            
-        # Get table counts
-        tables = get_table_counts()
-        tls_info = check_tls_connections()
-        http_info = check_http_requests()
         
+        # Queue the database queries
+        self.gui.db_manager.queue_query(
+            get_table_counts,
+            callback=lambda tables: self.gui.db_manager.queue_query(
+                check_tls_connections,
+                callback=lambda tls_info: self.gui.db_manager.queue_query(
+                    check_http_requests,
+                    callback=lambda http_info: self._display_debug_info(debug_text, tables, tls_info, http_info),
+                ),
+            ),
+        )
+        
+        # Close button
+        ttk.Button(debug_window, text="Close", 
+                command=debug_window.destroy).pack(pady=10)
+        
+    def _display_debug_info(self, debug_text, tables, tls_info, http_info):
+        """Display collected debug information in the text widget"""
         # Display the information
         debug_text.insert(tk.END, "=== DATABASE TABLE COUNTS ===\n\n")
         for table, count in tables.items():
@@ -369,10 +380,6 @@ class HttpTlsMonitor(SubtabBase):
         
         # Make text read-only
         debug_text.config(state=tk.DISABLED)
-        
-        # Close button
-        ttk.Button(debug_window, text="Close", 
-                 command=debug_window.destroy).pack(pady=10)
     
     def refresh(self):
         """Refresh all data in the subtab"""
@@ -523,69 +530,101 @@ class HttpTlsMonitor(SubtabBase):
         self.update_output(f"Loaded {len(tls_connections)} TLS connections")
 
     def debug_tls_processing(self):
-        """Force a check of TLS processing and database status"""
+        """Force a check of TLS processing and database status using queue system"""
         if not self.gui or not hasattr(self.gui, 'db_manager'):
             self.update_output("GUI or database manager not available")
             return
-            
-        db_manager = self.gui.db_manager
-        
+                
         # Clear the details text area
         self.tls_details_text.delete(1.0, tk.END)
         self.tls_details_text.insert(tk.END, "TLS Debug Information:\n\n")
         
-        # Check database tables
-        if hasattr(db_manager, 'check_tls_tables'):
-            status = db_manager.check_tls_tables()
-            if status:
-                self.tls_details_text.insert(tk.END, f"Database Status:\n")
-                self.tls_details_text.insert(tk.END, f"- Total connections: {status['connections']}\n")
-                self.tls_details_text.insert(tk.END, f"- Total TLS connections: {status['tls_connections']}\n")
-                self.tls_details_text.insert(tk.END, f"- Successful joins: {status['successful_joins']}\n\n")
-                
-                if status['tls_keys']:
-                    self.tls_details_text.insert(tk.END, f"Sample TLS keys:\n")
-                    for key in status['tls_keys']:
-                        self.tls_details_text.insert(tk.END, f"- {key}\n")
-                    self.tls_details_text.insert(tk.END, "\n")
-                    
-                if status['conn_keys']:
-                    self.tls_details_text.insert(tk.END, f"Sample connection keys:\n")
-                    for key in status['conn_keys']:
-                        self.tls_details_text.insert(tk.END, f"- {key}\n")
-            else:
-                self.tls_details_text.insert(tk.END, "Could not retrieve database status\n")
-                
-        # Check HTTPS connections
-        try:
-            cursor = db_manager.analysis_conn.cursor()
-            cursor.execute("""
-                SELECT COUNT(*) FROM connections WHERE dst_port = 443
-            """)
-            https_count = cursor.fetchone()[0]
+        # Define query function to check TLS tables
+        def check_tls_tables():
+            cursor = self.gui.db_manager.analysis_conn.cursor()
             
-            self.tls_details_text.insert(tk.END, f"\nHTTPS Connections (port 443): {https_count}\n")
+            # Check connections table
+            conn_count = cursor.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
+            
+            # Check TLS connections table
+            tls_count = cursor.execute("SELECT COUNT(*) FROM tls_connections").fetchone()[0]
+            
+            # Check HTTPS connections specifically
+            https_count = cursor.execute(
+                "SELECT COUNT(*) FROM connections WHERE dst_port = 443"
+            ).fetchone()[0]
+            
+            # Check for successful joins
+            join_count = cursor.execute("""
+                SELECT COUNT(*) FROM tls_connections t
+                JOIN connections c ON t.connection_key = c.connection_key
+            """).fetchone()[0]
+            
+            # Sample TLS connection keys
+            cursor.execute("SELECT connection_key FROM tls_connections LIMIT 5")
+            tls_keys = [row[0] for row in cursor.fetchall()]
+            
+            # Sample connection keys
+            cursor.execute("SELECT connection_key FROM connections LIMIT 5")
+            conn_keys = [row[0] for row in cursor.fetchall()]
             
             # Check recent HTTPS connections
-            if https_count > 0:
-                cursor.execute("""
-                    SELECT src_ip, dst_ip, timestamp FROM connections 
-                    WHERE dst_port = 443
-                    ORDER BY timestamp DESC
-                    LIMIT 5
-                """)
-                
-                recent = cursor.fetchall()
-                if recent:
-                    self.tls_details_text.insert(tk.END, "\nRecent HTTPS connections:\n")
-                    for row in recent:
-                        src, dst, ts = row
-                        self.tls_details_text.insert(tk.END, f"- {src} → {dst} at {ts}\n")
+            cursor.execute("""
+                SELECT src_ip, dst_ip, timestamp FROM connections 
+                WHERE dst_port = 443
+                ORDER BY timestamp DESC
+                LIMIT 5
+            """)
+            recent_https = cursor.fetchall()
             
             cursor.close()
-        except Exception as e:
-            self.tls_details_text.insert(tk.END, f"\nError checking HTTPS connections: {e}\n")
             
+            return {
+                "connections": conn_count,
+                "https_connections": https_count,
+                "tls_connections": tls_count,
+                "successful_joins": join_count,
+                "tls_keys": tls_keys,
+                "conn_keys": conn_keys,
+                "recent_https": recent_https
+            }
+        
+        # Queue the query
+        self.gui.db_manager.queue_query(
+            check_tls_tables,
+            callback=self._update_tls_debug_display
+        )
+    
+    def _update_tls_debug_display(self, status):
+        """Update TLS debug display with the query results"""
+        if status:
+            self.tls_details_text.insert(tk.END, f"Database Status:\n")
+            self.tls_details_text.insert(tk.END, f"- Total connections: {status['connections']}\n")
+            self.tls_details_text.insert(tk.END, f"- Total TLS connections: {status['tls_connections']}\n")
+            self.tls_details_text.insert(tk.END, f"- Successful joins: {status['successful_joins']}\n\n")
+            
+            if status['tls_keys']:
+                self.tls_details_text.insert(tk.END, f"Sample TLS keys:\n")
+                for key in status['tls_keys']:
+                    self.tls_details_text.insert(tk.END, f"- {key}\n")
+                self.tls_details_text.insert(tk.END, "\n")
+                
+            if status['conn_keys']:
+                self.tls_details_text.insert(tk.END, f"Sample connection keys:\n")
+                for key in status['conn_keys']:
+                    self.tls_details_text.insert(tk.END, f"- {key}\n")
+            
+            self.tls_details_text.insert(tk.END, f"\nHTTPS Connections (port 443): {status['https_connections']}\n")
+            
+            # Check recent HTTPS connections
+            if status['recent_https']:
+                self.tls_details_text.insert(tk.END, "\nRecent HTTPS connections:\n")
+                for row in status['recent_https']:
+                    src, dst, ts = row
+                    self.tls_details_text.insert(tk.END, f"- {src} → {dst} at {ts}\n")
+        else:
+            self.tls_details_text.insert(tk.END, "Could not retrieve database status\n")
+        
         # Add suggestions
         self.tls_details_text.insert(tk.END, "\nTroubleshooting steps:\n")
         
@@ -598,7 +637,7 @@ class HttpTlsMonitor(SubtabBase):
         self.tls_details_text.insert(tk.END, "3. Check that TLS field extraction is working in traffic_capture.py\n")
         self.tls_details_text.insert(tk.END, "4. Force a database sync using the 'Force Refresh' button\n")
         self.tls_details_text.insert(tk.END, "5. Check sample packets in logs/packets directory for TLS fields\n")
-    
+
     def refresh_suspicious_tls(self):
         """Refresh suspicious TLS connection data"""
         if not self.gui or not hasattr(self.gui, 'db_manager'):

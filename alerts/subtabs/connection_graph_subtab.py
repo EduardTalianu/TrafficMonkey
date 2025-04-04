@@ -119,34 +119,88 @@ class ConnectionGraphSubtab(SubtabBase):
         self.update_output("Connections refresh queued")
     
     def _update_connections_display(self, connections):
-        """Update the connections display with the results"""
+        """Update the connections display with the results using queue-based DB access"""
         try:
             # Store connections for later graph generation
             self.connections = connections
             
-            # Format connections for display
-            display_data = []
-            for src_ip, dst_ip, total_bytes, packet_count, timestamp in connections:
-                # For this example, we'll add a mock alert count
-                # In a real implementation, we would query the alerts database
-                alert_count = gui.db_manager.analysis_cursor.execute(
+            # Format connections for display with additional alert info
+            self._fetch_alert_counts_for_connections(connections)
+            
+        except Exception as e:
+            self.update_output(f"Error updating connections display: {e}")
+
+    def _fetch_alert_counts_for_connections(self, connections):
+        """Fetch alert counts for each connection using the queue system"""
+        # Prepare for batch processing
+        connection_data = []
+        
+        # First format what we already have
+        for i, (src_ip, dst_ip, total_bytes, packet_count, timestamp) in enumerate(connections):
+            # Format bytes for display
+            bytes_formatted = f"{total_bytes:,}" if total_bytes is not None else "0"
+            
+            # Store all data we need for later processing
+            connection_data.append({
+                'id': i,  # Use index as identifier for callback
+                'src_ip': src_ip,
+                'dst_ip': dst_ip,
+                'bytes_formatted': bytes_formatted,
+                'packet_count': packet_count
+            })
+        
+        # Define query function to get alert counts
+        def get_alert_counts(connection_data):
+            results = []
+            cursor = gui.db_manager.analysis_conn.cursor()
+            
+            # Process each connection
+            for conn in connection_data:
+                src_ip = conn['src_ip']
+                dst_ip = conn['dst_ip']
+                
+                # Get alert count
+                count = cursor.execute(
                     "SELECT COUNT(*) FROM alerts WHERE ip_address = ? OR ip_address = ?",
                     (src_ip, dst_ip)
                 ).fetchone()[0]
                 
-                # Format bytes for display
-                bytes_formatted = f"{total_bytes:,}" if total_bytes is not None else "0"
-                
-                # Add to display data
-                display_data.append((src_ip, dst_ip, bytes_formatted, packet_count, alert_count))
+                # Add to results with all data needed for display
+                results.append((
+                    conn['id'],
+                    conn['src_ip'],
+                    conn['dst_ip'],
+                    conn['bytes_formatted'],
+                    conn['packet_count'],
+                    count
+                ))
+            
+            cursor.close()
+            return results
+        
+        # Queue the query with callback
+        gui.db_manager.queue_query(
+            get_alert_counts,
+            callback=self._display_connections_with_alerts,
+            connection_data=connection_data
+        )
+    
+
+    def _display_connections_with_alerts(self, results):
+        """Process query results and update the tree display"""
+        try:
+            # Sort results back to original order
+            results.sort(key=lambda x: x[0])
+            
+            # Format data for tree display (removing the temporary ID)
+            display_data = [(r[1], r[2], r[3], r[4], r[5]) for r in results]
             
             # Populate tree using TreeViewManager
             gui.tree_manager.populate_tree(self.connections_tree, display_data)
-            self.update_output(f"Showing {len(connections)} connections")
-            
+            self.update_output(f"Showing {len(display_data)} connections")
         except Exception as e:
-            self.update_output(f"Error updating connections display: {e}")
-    
+            self.update_output(f"Error displaying connections: {e}")
+            
     def update_selected_ip(self, event):
         """Update selected IP when a connection is selected"""
         selected = self.connections_tree.selection()
