@@ -264,6 +264,15 @@ TABLE_DEFINITIONS = {
         {"name": "response_headers", "type": "TEXT", "required": False},
         {"name": "timestamp", "type": "REAL", "required": True}
     ],
+    "http_headers": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "connection_key", "type": "TEXT", "required": True},
+        {"name": "request_id", "type": "INTEGER", "required": True},
+        {"name": "header_name", "type": "TEXT", "required": True},
+        {"name": "header_value", "type": "TEXT", "required": False},
+        {"name": "is_request", "type": "BOOLEAN", "required": True},
+        {"name": "timestamp", "type": "REAL", "required": True}
+    ],
     "tls_connections": [
         {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
         {"name": "connection_key", "type": "TEXT", "required": True},
