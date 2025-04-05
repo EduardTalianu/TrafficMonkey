@@ -221,6 +221,47 @@ CAPTURE_FIELDS = [
         "data_type": "TEXT",
         "required": False,
         "description": "TLS Server Name Indication (SNI)"
+    },
+    {
+        "tshark_field": "ip.ttl",
+        "category": "ip",
+        "db_mapping": {"table": "connections", "column": "ttl"},
+        "data_type": "INTEGER",
+        "required": False,
+        "description": "IP Time-to-Live value"
+    },
+    {
+        "tshark_field": "ipv6.hlim",
+        "category": "ip",
+        "db_mapping": {"table": "connections", "column": "ttl"},
+        "data_type": "INTEGER",
+        "required": False,
+        "description": "IPv6 Hop Limit value (equivalent to TTL)"
+    },
+    # ARP fields
+    {
+        "tshark_field": "arp.src.proto_ipv4",
+        "category": "arp",
+        "db_mapping": {"table": "arp_data", "column": "src_ip"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "ARP source IP address"
+    },
+    {
+        "tshark_field": "arp.dst.proto_ipv4",
+        "category": "arp",
+        "db_mapping": {"table": "arp_data", "column": "dst_ip"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "ARP target IP address"
+    },
+    {
+        "tshark_field": "arp.opcode",
+        "category": "arp",
+        "db_mapping": {"table": "arp_data", "column": "operation"},
+        "data_type": "INTEGER",
+        "required": False,
+        "description": "ARP operation (1=request, 2=reply)"
     }
 ]
 
@@ -300,7 +341,16 @@ TABLE_DEFINITIONS = {
         {"name": "protocol_details", "type": "TEXT", "required": False},
         {"name": "detection_method", "type": "TEXT", "required": False},
         {"name": "timestamp", "type": "REAL", "required": True}
+    ],
+    "arp_data": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "timestamp", "type": "REAL", "required": True},
+        {"name": "src_ip", "type": "TEXT", "required": True},
+        {"name": "src_mac", "type": "TEXT", "required": False},
+        {"name": "dst_ip", "type": "TEXT", "required": False},
+        {"name": "operation", "type": "INTEGER", "required": False}
     ]
+
 }
 
 # Track schema version for migrations

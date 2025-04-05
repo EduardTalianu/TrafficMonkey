@@ -144,7 +144,8 @@ class DatabaseManager:
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 vt_result TEXT DEFAULT 'unknown',
                 is_rdp_client BOOLEAN DEFAULT 0,
-                protocol TEXT DEFAULT NULL
+                protocol TEXT DEFAULT NULL,
+                ttl INTEGER DEFAULT NULL
             )
         """)
         
@@ -315,8 +316,22 @@ class DatabaseManager:
         logger.debug(f"Queued update for connection {connection_key}, field {field}")
         return True
     
+    def get_table_columns(self, conn, table_name):
+        """Helper function to get column names and types for a table."""
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns_info = cursor.fetchall()
+            # Returns list of tuples: (cid, name, type, notnull, default_value, pk)
+            return columns_info
+        except Exception as e:
+            logger.error(f"Error getting columns for table {table_name}: {e}")
+            return []
+        finally:
+            cursor.close()
+
     def sync_databases(self):
-        """Synchronize data from capture DB to analysis DB with improved reliability"""
+        """Synchronize data from capture DB to analysis DB with improved table detection and handling"""
         try:
             with self.sync_lock:
                 current_time = time.time()
@@ -330,95 +345,76 @@ class DatabaseManager:
                 # Begin transaction on analysis DB
                 self.analysis_conn.execute("BEGIN TRANSACTION")
                 
-                # Sync connections table
-                last_timestamp = sync_analysis_cursor.execute(
-                    "SELECT MAX(timestamp) FROM connections"
-                ).fetchone()[0] or '1970-01-01'
-                
-                # Get new connections from capture DB
+                # Get all tables from capture database
                 sync_capture_cursor.execute(
-                    "SELECT * FROM connections WHERE timestamp > datetime(?)", 
-                    (last_timestamp,)
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
                 )
+                all_tables = [row[0] for row in sync_capture_cursor.fetchall()]
+                logger.info(f"Found {len(all_tables)} tables to synchronize: {', '.join(all_tables)}")
                 
-                for row in sync_capture_cursor.fetchall():
+                # Sync each table
+                for table_name in all_tables:
                     try:
-                        # Get column count to ensure we use the right number of placeholders
-                        column_count = len(row)
-                        placeholders = ", ".join(["?"] * column_count)
-                        query = f"INSERT OR REPLACE INTO connections VALUES ({placeholders})"
-                        sync_analysis_cursor.execute(query, row)
-                        sync_count += 1
+                        # Get column info for the current table
+                        columns_info = self.get_table_columns(self.capture_conn, table_name)
+                        if not columns_info:
+                            logger.warning(f"Could not get column info for table {table_name}. Skipping.")
+                            continue
+                        
+                        column_names = [col[1] for col in columns_info]
+                        column_types = {col[1]: col[2] for col in columns_info}
+                        
+                        # Determine sync strategy based on table structure
+                        if 'timestamp' in column_names:
+                            # For timestamp-based tables, use incremental sync
+                            if column_types.get('timestamp', '').upper() in ['REAL', 'INTEGER', 'NUMERIC']:
+                                # Numeric timestamp (epoch)
+                                last_timestamp = sync_analysis_cursor.execute(
+                                    f"SELECT MAX(timestamp) FROM {table_name}"
+                                ).fetchone()[0] or 0
+                                
+                                # Get new records from capture DB
+                                sync_capture_cursor.execute(
+                                    f"SELECT * FROM {table_name} WHERE timestamp > ?", 
+                                    (last_timestamp,)
+                                )
+                            else:
+                                # Text/date timestamp
+                                last_timestamp = sync_analysis_cursor.execute(
+                                    f"SELECT MAX(timestamp) FROM {table_name}"
+                                ).fetchone()[0] or '1970-01-01'
+                                
+                                # Get new records from capture DB
+                                sync_capture_cursor.execute(
+                                    f"SELECT * FROM {table_name} WHERE timestamp > datetime(?)", 
+                                    (last_timestamp,)
+                                )
+                        else:
+                            # For tables without timestamp, sync all records
+                            sync_capture_cursor.execute(f"SELECT * FROM {table_name}")
+                        
+                        # Get column names from the cursor description
+                        if sync_capture_cursor.description:
+                            fetch_column_names = [desc[0] for desc in sync_capture_cursor.description]
+                            
+                            # Process rows from capture DB
+                            rows = sync_capture_cursor.fetchall()
+                            
+                            for row in rows:
+                                try:
+                                    # Construct column-specific insert to handle schema differences
+                                    placeholders = ", ".join(["?"] * len(fetch_column_names))
+                                    column_names_str = ", ".join(fetch_column_names)
+                                    
+                                    query = f"INSERT OR REPLACE INTO {table_name} ({column_names_str}) VALUES ({placeholders})"
+                                    sync_analysis_cursor.execute(query, row)
+                                    sync_count += 1
+                                except Exception as e:
+                                    logger.error(f"Error syncing row in {table_name}: {e}")
+                            
+                            logger.info(f"Synchronized {len(rows)} records from table {table_name}")
                     except Exception as e:
-                        logger.error(f"Error syncing connections row: {e}")
-                
-                # Sync TLS connections table - special handling for better compatibility
-                last_tls_timestamp = sync_analysis_cursor.execute(
-                    "SELECT MAX(timestamp) FROM tls_connections"
-                ).fetchone()[0] or 0
-                
-                sync_capture_cursor.execute(
-                    "SELECT * FROM tls_connections WHERE timestamp > ?",
-                    (last_tls_timestamp,)
-                )
-                
-                # First get column names to ensure we handle any schema differences
-                tls_columns = [column[0] for column in sync_capture_cursor.description]
-                
-                for row in sync_capture_cursor.fetchall():
-                    try:
-                        # Construct column-specific insert to handle potential schema differences
-                        column_names = ", ".join(tls_columns)
-                        placeholders = ", ".join(["?"] * len(tls_columns))
-                        query = f"INSERT OR REPLACE INTO tls_connections ({column_names}) VALUES ({placeholders})"
-                        sync_analysis_cursor.execute(query, row)
-                        sync_count += 1
-                    except Exception as e:
-                        logger.error(f"Error syncing TLS connection: {e}")
-                
-                # Similar approach for HTTP requests and responses
-                # HTTP requests
-                last_http_timestamp = sync_analysis_cursor.execute(
-                    "SELECT MAX(timestamp) FROM http_requests"
-                ).fetchone()[0] or 0
-                
-                sync_capture_cursor.execute(
-                    "SELECT * FROM http_requests WHERE timestamp > ?",
-                    (last_http_timestamp,)
-                )
-                
-                http_req_columns = [column[0] for column in sync_capture_cursor.description]
-                
-                for row in sync_capture_cursor.fetchall():
-                    try:
-                        column_names = ", ".join(http_req_columns)
-                        placeholders = ", ".join(["?"] * len(http_req_columns))
-                        query = f"INSERT OR REPLACE INTO http_requests ({column_names}) VALUES ({placeholders})"
-                        sync_analysis_cursor.execute(query, row)
-                        sync_count += 1
-                    except Exception as e:
-                        logger.error(f"Error syncing HTTP request: {e}")
-                
-                # Sync all other tables normally
-                # Sync alerts table
-                last_alert_timestamp = sync_analysis_cursor.execute(
-                    "SELECT MAX(timestamp) FROM alerts"
-                ).fetchone()[0] or '1970-01-01'
-                
-                sync_capture_cursor.execute(
-                    "SELECT * FROM alerts WHERE timestamp > datetime(?)",
-                    (last_alert_timestamp,)
-                )
-                
-                for row in sync_capture_cursor.fetchall():
-                    try:
-                        column_count = len(row)
-                        placeholders = ", ".join(["?"] * column_count)
-                        query = f"INSERT OR REPLACE INTO alerts VALUES ({placeholders})"
-                        sync_analysis_cursor.execute(query, row)
-                        sync_count += 1
-                    except Exception as e:
-                        logger.error(f"Error syncing alert: {e}")
+                        logger.error(f"Error syncing table {table_name}: {e}")
                 
                 # After all syncing is done, perform DNS resolution for TLS connections
                 # that have IP addresses instead of hostnames
@@ -641,6 +637,38 @@ class DatabaseManager:
             return True
         except Exception as e:
             logger.error(f"Error storing TLS connection: {e}")
+            return False
+        
+    def add_arp_data(self, src_ip, dst_ip, operation, timestamp):
+        """Store ARP packet information"""
+        try:
+            cursor = self.capture_conn.cursor()
+            cursor.execute("""
+                INSERT INTO arp_data
+                (timestamp, src_ip, dst_ip, operation)
+                VALUES (?, ?, ?, ?)
+            """, (timestamp, src_ip, dst_ip, operation))
+            self.capture_conn.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.error(f"Error storing ARP data: {e}")
+            return False
+        
+    def update_connection_ttl(self, connection_key, ttl):
+        """Update TTL value for a connection"""
+        try:
+            cursor = self.capture_conn.cursor()
+            cursor.execute("""
+                UPDATE connections
+                SET ttl = ?
+                WHERE connection_key = ?
+            """, (ttl, connection_key))
+            self.capture_conn.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating TTL: {e}")
             return False
 
     def add_app_protocol(self, connection_key, app_protocol, protocol_details=None, detection_method=None):

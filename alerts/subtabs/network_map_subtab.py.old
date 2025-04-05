@@ -1,0 +1,1277 @@
+# SubtabBase class is injected by the Loader
+import tkinter as tk
+from tkinter import ttk, colorchooser
+import time
+import math
+import re
+import random
+import ipaddress
+
+class NetworkMapSubtab(SubtabBase):
+    """Subtab that displays a graphical map of the network based on captured traffic"""
+    
+    def __init__(self):
+        super().__init__(
+            name="Network Map",
+            description="Visualizes the network topology based on captured traffic"
+        )
+        self.canvas = None
+        self.controls_frame = None
+        self.details_frame = None
+        
+        # Configuration options
+        self.show_wan_connections = tk.BooleanVar(value=True)
+        self.show_internal_traffic = tk.BooleanVar(value=True)
+        self.group_external_by_domain = tk.BooleanVar(value=True)
+        self.node_spacing = tk.IntVar(value=100)
+        self.layout_type = tk.StringVar(value="hierarchical")
+        
+        # Data storage
+        self.nodes = {}  # {node_id: {type, ip, name, x, y, ...}}
+        self.edges = []  # [{source, target, protocol, volume, ...}]
+        self.selected_node = None
+        self.last_refresh_time = 0
+        self.refresh_interval = 15  # seconds
+        
+        # Visual elements
+        self.node_radius = 20
+        self.canvas_items = {}  # Store canvas item IDs for interaction
+        self.colors = {
+            "router": "#FF9800",     # Orange
+            "lan": "#4CAF50",        # Green
+            "wan": "#2196F3",        # Blue
+            "firewall": "#F44336",   # Red
+            "proxy": "#9C27B0",      # Purple
+            "server": "#FFEB3B",     # Yellow
+            "unknown": "#9E9E9E",    # Gray
+            "selected": "#00BCD4",   # Cyan
+            "background": "#FFFFFF", # White
+        }
+        
+        # Ensure last_refresh_time is different from current to force first refresh
+        self.last_refresh_time = time.time() - self.refresh_interval - 1
+    
+    def create_ui(self):
+        """Create the network map UI components"""
+        main_frame = ttk.Frame(self.tab_frame)
+        main_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Split into left controls panel and right visualization area
+        self.controls_frame = ttk.Frame(main_frame, width=200)
+        self.controls_frame.pack(side="left", fill="y", padx=5, pady=5)
+        
+        visualization_frame = ttk.Frame(main_frame)
+        visualization_frame.pack(side="right", fill="both", expand=True, padx=5, pady=5)
+        
+        # Create the controls
+        self.create_control_panel()
+        
+        # Create the visualization area
+        self.create_visualization_area(visualization_frame)
+        
+        # Create the details panel at the bottom
+        self.details_frame = ttk.LabelFrame(self.tab_frame, text="Device Details")
+        self.details_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.details_text = tk.Text(self.details_frame, height=6, wrap=tk.WORD)
+        self.details_text.pack(fill="both", expand=True, padx=5, pady=5)
+    
+    def create_control_panel(self):
+        """Create the controls for the network map"""
+        # Title
+        ttk.Label(self.controls_frame, text="Map Controls", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=5, pady=5)
+        
+        # Refresh button
+        ttk.Button(self.controls_frame, text="Refresh Map", command=self.refresh).pack(fill="x", padx=5, pady=5)
+        
+        # View options frame
+        options_frame = ttk.LabelFrame(self.controls_frame, text="View Options")
+        options_frame.pack(fill="x", padx=5, pady=5)
+        
+        ttk.Checkbutton(options_frame, text="Show WAN Connections", 
+                      variable=self.show_wan_connections,
+                      command=self.refresh).pack(anchor="w", padx=5, pady=2)
+        
+        ttk.Checkbutton(options_frame, text="Show Internal Traffic", 
+                      variable=self.show_internal_traffic,
+                      command=self.refresh).pack(anchor="w", padx=5, pady=2)
+        
+        ttk.Checkbutton(options_frame, text="Group External by Domain", 
+                      variable=self.group_external_by_domain,
+                      command=self.refresh).pack(anchor="w", padx=5, pady=2)
+        
+        # Layout options
+        layout_frame = ttk.LabelFrame(self.controls_frame, text="Layout")
+        layout_frame.pack(fill="x", padx=5, pady=5)
+        
+        ttk.Label(layout_frame, text="Layout Type:").pack(anchor="w", padx=5, pady=2)
+        
+        layout_combo = ttk.Combobox(layout_frame, textvariable=self.layout_type,
+                                  values=["hierarchical", "circular", "force-directed"])
+        layout_combo.pack(fill="x", padx=5, pady=2)
+        layout_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        
+        ttk.Label(layout_frame, text="Node Spacing:").pack(anchor="w", padx=5, pady=2)
+        ttk.Scale(layout_frame, from_=50, to=200, variable=self.node_spacing, 
+                orient="horizontal", command=lambda s: self.refresh()).pack(fill="x", padx=5, pady=2)
+        
+        # Color options
+        color_frame = ttk.LabelFrame(self.controls_frame, text="Colors")
+        color_frame.pack(fill="x", padx=5, pady=5)
+        
+        for node_type in ["router", "lan", "wan", "firewall", "proxy", "server"]:
+            color_btn = ttk.Button(
+                color_frame, 
+                text=f"{node_type.capitalize()}", 
+                command=lambda t=node_type: self.change_color(t)
+            )
+            color_btn.pack(fill="x", padx=5, pady=2)
+        
+        # Legend
+        legend_frame = ttk.LabelFrame(self.controls_frame, text="Legend")
+        legend_frame.pack(fill="x", padx=5, pady=5)
+        
+        legend_canvas = tk.Canvas(legend_frame, height=150, bg=self.colors["background"])
+        legend_canvas.pack(fill="x", padx=5, pady=5)
+        
+        # Draw legend items
+        y_pos = 20
+        for node_type, color in self.colors.items():
+            if node_type not in ["selected", "background", "unknown"]:
+                # Draw circle
+                legend_canvas.create_oval(10, y_pos-8, 26, y_pos+8, fill=color, outline="black")
+                # Draw label
+                legend_canvas.create_text(35, y_pos, text=node_type.capitalize(), anchor="w")
+                y_pos += 25
+        
+        # Add export option
+        ttk.Button(self.controls_frame, text="Export Map", 
+                 command=self.export_map).pack(fill="x", padx=5, pady=5)
+    
+    def create_visualization_area(self, parent_frame):
+        """Create the network map visualization canvas"""
+        # Canvas frame with scrollbars
+        canvas_frame = ttk.Frame(parent_frame)
+        canvas_frame.pack(fill="both", expand=True)
+        
+        # Add scrollbars
+        h_scrollbar = ttk.Scrollbar(canvas_frame, orient="horizontal")
+        h_scrollbar.pack(side="bottom", fill="x")
+        
+        v_scrollbar = ttk.Scrollbar(canvas_frame)
+        v_scrollbar.pack(side="right", fill="y")
+        
+        # Create canvas
+        self.canvas = tk.Canvas(canvas_frame, bg=self.colors["background"], 
+                             xscrollcommand=h_scrollbar.set,
+                             yscrollcommand=v_scrollbar.set)
+        self.canvas.pack(fill="both", expand=True)
+        
+        h_scrollbar.config(command=self.canvas.xview)
+        v_scrollbar.config(command=self.canvas.yview)
+        
+        # Bind events
+        self.canvas.bind("<ButtonPress-1>", self.on_canvas_click)
+        self.canvas.bind("<ButtonPress-3>", self.on_canvas_right_click)
+        self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        self.canvas.bind("<MouseWheel>", self.on_canvas_zoom)
+        
+        # Add zoom controls
+        zoom_frame = ttk.Frame(parent_frame)
+        zoom_frame.pack(fill="x", pady=5)
+        
+        ttk.Button(zoom_frame, text="Zoom In", command=lambda: self.zoom_canvas(1.2)).pack(side="left", padx=5)
+        ttk.Button(zoom_frame, text="Zoom Out", command=lambda: self.zoom_canvas(0.8)).pack(side="left", padx=5)
+        ttk.Button(zoom_frame, text="Reset View", command=self.reset_canvas_view).pack(side="left", padx=5)
+    
+    def on_canvas_click(self, event):
+        """Handle canvas click event"""
+        # Get item at click position
+        item = self.canvas.find_closest(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if item and item[0] in self.canvas_items:
+            node_id = self.canvas_items[item[0]]
+            self.select_node(node_id)
+        else:
+            self.select_node(None)
+    
+    def on_canvas_right_click(self, event):
+        """Handle right click to show context menu"""
+        # Find the node at the click position
+        item = self.canvas.find_closest(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if item and item[0] in self.canvas_items:
+            node_id = self.canvas_items[item[0]]
+            self.select_node(node_id)
+            
+            # Create a popup menu
+            menu = tk.Menu(self.canvas, tearoff=0)
+            
+            # Add menu options based on node type
+            node = self.nodes[node_id]
+            if "ip" in node:
+                menu.add_command(label=f"Copy IP: {node['ip']}", 
+                               command=lambda: gui.ip_manager.copy_ip_to_clipboard(node['ip']))
+                menu.add_command(label="Mark as False Positive", 
+                               command=lambda: self.mark_as_false_positive(node['ip']))
+            
+            if node["type"] == "lan":
+                menu.add_command(label="Show Traffic", command=lambda: self.show_node_traffic(node_id))
+            elif node["type"] == "wan":
+                menu.add_command(label="Show Domain Info", command=lambda: self.show_domain_info(node_id))
+            
+            # Show the menu
+            menu.post(event.x_root, event.y_root)
+    
+    def on_canvas_drag(self, event):
+        """Handle dragging a node"""
+        if self.selected_node:
+            node = self.nodes[self.selected_node]
+            # Update node position
+            node["x"] = self.canvas.canvasx(event.x)
+            node["y"] = self.canvas.canvasy(event.y)
+            # Redraw
+            self.redraw_network()
+    
+    def on_canvas_zoom(self, event):
+        """Handle mouse wheel zoom"""
+        # Zoom in or out based on mouse wheel direction
+        if event.delta > 0:
+            self.zoom_canvas(1.1, event.x, event.y)
+        else:
+            self.zoom_canvas(0.9, event.x, event.y)
+    
+    def zoom_canvas(self, factor, x=None, y=None):
+        """Zoom the canvas by the given factor"""
+        # If x and y are provided, zoom at that point
+        if x is not None and y is not None:
+            # Convert screen coordinates to canvas coordinates
+            x = self.canvas.canvasx(x)
+            y = self.canvas.canvasy(y)
+            
+            # Get current canvas scroll position
+            x_scroll = self.canvas.xview()
+            y_scroll = self.canvas.yview()
+            
+            # Apply zoom
+            self.canvas.scale("all", x, y, factor, factor)
+            
+            # Adjust scrollregion
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            
+            # Keep the point under the mouse in the same position
+            self.canvas.xview_moveto(x_scroll[0])
+            self.canvas.yview_moveto(y_scroll[0])
+        else:
+            # Zoom from center
+            width = self.canvas.winfo_width()
+            height = self.canvas.winfo_height()
+            
+            self.canvas.scale("all", width/2, height/2, factor, factor)
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+    
+    def reset_canvas_view(self):
+        """Reset the canvas view to show all elements"""
+        # Delete and redraw all elements
+        self.redraw_network()
+        
+        # Update scrollregion to show all
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        
+        # Center the view
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
+    
+    def change_color(self, node_type):
+        """Change the color for a node type"""
+        current_color = self.colors.get(node_type, "#CCCCCC")
+        new_color = colorchooser.askcolor(color=current_color, title=f"Choose color for {node_type}")
+        
+        if new_color[1]:  # If a color was selected
+            self.colors[node_type] = new_color[1]
+            # Redraw the network with new colors
+            self.redraw_network()
+    
+    def refresh(self):
+        """Refresh the network map data and visualization"""
+        # Check if enough time has passed since last refresh
+        current_time = time.time()
+        if (current_time - self.last_refresh_time) < self.refresh_interval and self.nodes:
+            self.update_output(f"Network map will auto-refresh in {int(self.refresh_interval - (current_time - self.last_refresh_time))} seconds")
+            return
+            
+        self.last_refresh_time = current_time
+        self.update_output("Refreshing network map...")
+        
+        # Queue the data query
+        gui.db_manager.queue_query(
+            self.get_network_data,
+            callback=self.process_network_data
+        )
+    
+    def get_network_data(self):
+        """Get network data from the database"""
+        try:
+            # Create a cursor for querying the analysis database
+            cursor = gui.db_manager.analysis_conn.cursor()
+            
+            # Get connection data
+            connection_query = """
+                SELECT src_ip, dst_ip, src_port, dst_port, total_bytes, 
+                       packet_count, protocol, vt_result
+                FROM connections
+                ORDER BY total_bytes DESC
+                LIMIT 1000
+            """
+            connections = cursor.execute(connection_query).fetchall()
+            
+            # Get DNS data to resolve hostnames
+            dns_query = """
+                SELECT src_ip, query_domain
+                FROM dns_queries
+                WHERE timestamp > ?
+                GROUP BY src_ip, query_domain
+            """
+            # Get DNS queries from the last 24 hours
+            dns_data = cursor.execute(dns_query, (time.time() - 86400,)).fetchall()
+            
+            # Get HTTP/TLS data to identify services
+            http_query = """
+                SELECT connection_key, host
+                FROM http_requests
+                WHERE timestamp > ?
+                GROUP BY connection_key, host
+            """
+            http_data = cursor.execute(http_query, (time.time() - 86400,)).fetchall()
+            
+            # Get application protocols
+            protocol_query = """
+                SELECT connection_key, app_protocol
+                FROM app_protocols
+                GROUP BY connection_key, app_protocol
+            """
+            protocol_data = cursor.execute(protocol_query).fetchall()
+            
+            # Close the cursor
+            cursor.close()
+            
+            return {
+                "connections": connections,
+                "dns_data": dns_data,
+                "http_data": http_data,
+                "protocol_data": protocol_data
+            }
+        except Exception as e:
+            self.update_output(f"Error getting network data: {e}")
+            return None
+    
+    def process_network_data(self, data):
+        """Process the network data and create the network map"""
+        if not data:
+            self.update_output("No network data available")
+            return
+            
+        try:
+            # Clear existing data
+            self.nodes = {}
+            self.edges = []
+            
+            # Get local network ranges
+            local_ranges = self.get_local_network_ranges()
+            
+            # Process connections to build nodes and edges
+            self.build_network_topology(data["connections"], data["dns_data"], 
+                                      data["http_data"], data["protocol_data"], local_ranges)
+            
+            # Apply layout to position nodes
+            self.apply_layout()
+            
+            # Draw the network
+            self.redraw_network()
+            
+            self.update_output(f"Network map refreshed with {len(self.nodes)} devices and {len(self.edges)} connections")
+        except Exception as e:
+            self.update_output(f"Error processing network data: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def get_local_network_ranges(self):
+        """Determine local network address ranges"""
+        local_ranges = []
+        
+        # Add common private IP ranges
+        local_ranges.append(ipaddress.ip_network("10.0.0.0/8"))
+        local_ranges.append(ipaddress.ip_network("172.16.0.0/12"))
+        local_ranges.append(ipaddress.ip_network("192.168.0.0/16"))
+        
+        # Add localhost
+        local_ranges.append(ipaddress.ip_network("127.0.0.0/8"))
+        
+        # Try to get local interfaces from the captured data
+        try:
+            # Get the interface information from the GUI
+            if hasattr(gui, 'capture_engine') and gui.capture_engine:
+                for interface_info in gui.capture_engine.get_interfaces():
+                    if len(interface_info) >= 3:  # Make sure we have enough elements
+                        ip_addr = interface_info[2]
+                        if ip_addr and ip_addr != "Unknown":
+                            try:
+                                # Add a /24 subnet for each interface
+                                ip_obj = ipaddress.ip_address(ip_addr)
+                                if ip_obj.version == 4:  # Only handle IPv4 for now
+                                    # Get the first 3 octets of the IP
+                                    prefix = '.'.join(ip_addr.split('.')[:3])
+                                    local_ranges.append(ipaddress.ip_network(f"{prefix}.0/24", strict=False))
+                            except (ValueError, TypeError):
+                                pass
+        except Exception as e:
+            self.update_output(f"Error determining local networks: {e}")
+        
+        return local_ranges
+    
+    def is_local_ip(self, ip, local_ranges):
+        """Check if an IP is in local ranges"""
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            return any(ip_obj in network for network in local_ranges)
+        except ValueError:
+            return False
+    
+    def build_network_topology(self, connections, dns_data, http_data, protocol_data, local_ranges):
+        """Build network topology from connection data"""
+        # Create a map of connection keys to protocols
+        protocol_map = {}
+        for conn_key, protocol in protocol_data:
+            protocol_map[conn_key] = protocol
+
+        # Create a map of connection keys to hostnames
+        hostname_map = {}
+        for conn_key, hostname in http_data:
+            hostname_map[conn_key] = hostname
+        
+        # Process DNS data to build a map of IPs to domains
+        dns_map = {}
+        for src_ip, domain in dns_data:
+            if src_ip not in dns_map:
+                dns_map[src_ip] = []
+            if domain not in dns_map[src_ip]:
+                dns_map[src_ip].append(domain)
+        
+        # First identify the router/gateway
+        router_candidates = {}
+        for conn in connections:
+            src_ip, dst_ip = conn[0], conn[1]
+            
+            # Skip if either IP is invalid
+            if not src_ip or not dst_ip:
+                continue
+                
+            # Check if this is a LAN to WAN connection
+            if self.is_local_ip(src_ip, local_ranges) and not self.is_local_ip(dst_ip, local_ranges):
+                # This might be through a router
+                # Check if there are multiple different source IPs going to the same destination
+                router_key = f"{src_ip}"
+                if router_key not in router_candidates:
+                    router_candidates[router_key] = {"count": 0, "ip": src_ip}
+                router_candidates[router_key]["count"] += 1
+        
+        # Sort router candidates by count
+        router_list = sorted(router_candidates.values(), key=lambda x: x["count"], reverse=True)
+        
+        # The top candidate is likely our gateway/router
+        router_ip = None
+        if router_list:
+            router_ip = router_list[0]["ip"]
+            self.nodes["router"] = {
+                "id": "router",
+                "type": "router",
+                "ip": router_ip,
+                "name": "Gateway Router",
+                "connections": 0,
+                "x": 0,
+                "y": 0
+            }
+        
+        # Now process connections to build the network
+        for conn in connections:
+            src_ip, dst_ip, src_port, dst_port, total_bytes, packet_count, protocol, vt_result = conn
+            
+            # Skip if either IP is invalid
+            if not src_ip or not dst_ip:
+                continue
+            
+            # Create a connection key like in the database
+            conn_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}" if src_port and dst_port else f"{src_ip}->{dst_ip}"
+            
+            # Get the protocol from our map if available
+            app_protocol = protocol_map.get(conn_key, protocol or "unknown")
+            
+            # Get hostname if available
+            hostname = hostname_map.get(conn_key)
+            
+            # Determine if IPs are local or WAN
+            src_is_local = self.is_local_ip(src_ip, local_ranges)
+            dst_is_local = self.is_local_ip(dst_ip, local_ranges)
+            
+            # Skip router-to-router or WAN-to-WAN if not showing external traffic
+            if not self.show_wan_connections.get() and not (src_is_local or dst_is_local):
+                continue
+            
+            # Skip LAN-to-LAN if not showing internal traffic
+            if not self.show_internal_traffic.get() and src_is_local and dst_is_local:
+                continue
+            
+            # Create or update source node
+            src_node_id = self.get_node_id(src_ip, src_is_local, hostname, dns_map)
+            if src_node_id not in self.nodes:
+                node_type = "lan" if src_is_local else "wan"
+                # Check if this is a special device
+                if src_ip == router_ip:
+                    node_type = "router"
+                elif dst_port == 8080 or dst_port == 3128:  # Common proxy ports
+                    node_type = "proxy"
+                elif vt_result and vt_result != "unknown" and "malicious" in vt_result.lower():
+                    node_type = "malicious"
+                
+                self.nodes[src_node_id] = {
+                    "id": src_node_id,
+                    "type": node_type,
+                    "ip": src_ip,
+                    "name": self.get_node_name(src_ip, src_is_local, hostname, dns_map),
+                    "connections": 0,
+                    "x": 0,
+                    "y": 0
+                }
+            
+            self.nodes[src_node_id]["connections"] += 1
+            
+            # Create or update destination node
+            dst_node_id = self.get_node_id(dst_ip, dst_is_local, hostname, dns_map)
+            if dst_node_id not in self.nodes:
+                node_type = "lan" if dst_is_local else "wan"
+                # Check for special services
+                if dst_port == 80 or dst_port == 443:
+                    node_type = "server"
+                elif dst_port == 53:  # DNS
+                    node_type = "server"
+                
+                self.nodes[dst_node_id] = {
+                    "id": dst_node_id,
+                    "type": node_type,
+                    "ip": dst_ip,
+                    "name": self.get_node_name(dst_ip, dst_is_local, hostname, dns_map),
+                    "connections": 0,
+                    "x": 0,
+                    "y": 0
+                }
+            
+            self.nodes[dst_node_id]["connections"] += 1
+            
+            # Add edge
+            edge = {
+                "source": src_node_id,
+                "target": dst_node_id,
+                "protocol": app_protocol,
+                "volume": total_bytes,
+                "packets": packet_count
+            }
+            self.edges.append(edge)
+    
+    def get_node_id(self, ip, is_local, hostname=None, dns_map=None):
+        """Get a unique identifier for a node"""
+        if is_local:
+            # For local IPs, just use the IP as the ID
+            return ip
+        else:
+            # For external IPs, group by domain if enabled
+            if self.group_external_by_domain.get() and hostname:
+                # Extract domain from hostname
+                domain_parts = hostname.split('.')
+                if len(domain_parts) > 1:
+                    return '.'.join(domain_parts[-2:])
+                
+            # Try to find a domain from DNS
+            if dns_map and ip in dns_map and dns_map[ip]:
+                domain = dns_map[ip][0]
+                domain_parts = domain.split('.')
+                if len(domain_parts) > 1:
+                    return '.'.join(domain_parts[-2:])
+            
+            # Default to IP
+            return ip
+    
+    def get_node_name(self, ip, is_local, hostname=None, dns_map=None):
+        """Get a display name for a node"""
+        if is_local:
+            # Try to get a hostname
+            if dns_map and ip in dns_map and dns_map[ip]:
+                # Use first part of the first domain
+                return dns_map[ip][0].split('.')[0]
+            return f"Local: {ip}"
+        else:
+            # For external, use the hostname or domain if available
+            if hostname:
+                return hostname
+            
+            # Try DNS
+            if dns_map and ip in dns_map and dns_map[ip]:
+                return dns_map[ip][0]
+                
+            return f"External: {ip}"
+    
+    def apply_layout(self):
+        """Apply the selected layout algorithm to position nodes"""
+        layout_type = self.layout_type.get()
+        
+        if layout_type == "hierarchical":
+            self.apply_hierarchical_layout()
+        elif layout_type == "circular":
+            self.apply_circular_layout()
+        elif layout_type == "force-directed":
+            self.apply_force_directed_layout()
+    
+    def apply_hierarchical_layout(self):
+        """Apply a hierarchical layout - Router at top, then LAN, then WAN"""
+        # Start with the router at the center top
+        canvas_width = self.canvas.winfo_width() or 800
+        canvas_height = self.canvas.winfo_height() or 600
+        
+        spacing = self.node_spacing.get()
+        
+        # Group nodes by type
+        node_groups = {
+            "router": [],
+            "proxy": [],
+            "firewall": [],
+            "lan": [],
+            "server": [],
+            "wan": []
+        }
+        
+        for node_id, node in self.nodes.items():
+            if node["type"] in node_groups:
+                node_groups[node["type"]].append(node_id)
+            else:
+                node_groups["lan"].append(node_id)
+        
+        # Position router at the top center
+        if "router" in self.nodes:
+            self.nodes["router"]["x"] = canvas_width / 2
+            self.nodes["router"]["y"] = 50
+        
+        # Position proxies and firewalls in the second row
+        row2_nodes = node_groups["proxy"] + node_groups["firewall"]
+        row2_count = len(row2_nodes)
+        
+        if row2_count > 0:
+            row2_width = canvas_width * 0.8
+            spacing_x = row2_width / (row2_count + 1)
+            start_x = (canvas_width - row2_width) / 2 + spacing_x
+            
+            for i, node_id in enumerate(row2_nodes):
+                self.nodes[node_id]["x"] = start_x + i * spacing_x
+                self.nodes[node_id]["y"] = 150
+        
+        # Position LAN nodes in a grid in the middle section
+        lan_count = len(node_groups["lan"])
+        if lan_count > 0:
+            lan_width = canvas_width * 0.8
+            cols = min(max(int(math.sqrt(lan_count)), 1), 8)  # At most 8 columns
+            rows = math.ceil(lan_count / cols)
+            
+            cell_width = lan_width / cols
+            start_x = (canvas_width - lan_width) / 2 + cell_width / 2
+            
+            for i, node_id in enumerate(node_groups["lan"]):
+                row = i // cols
+                col = i % cols
+                self.nodes[node_id]["x"] = start_x + col * cell_width
+                self.nodes[node_id]["y"] = 250 + row * spacing
+        
+        # Position servers below LAN
+        server_count = len(node_groups["server"])
+        if server_count > 0:
+            server_width = canvas_width * 0.8
+            spacing_x = server_width / (server_count + 1)
+            start_x = (canvas_width - server_width) / 2 + spacing_x
+            start_y = 250 + (math.ceil(len(node_groups["lan"]) / (min(max(int(math.sqrt(lan_count)), 1), 8))) * spacing) + 50
+            
+            for i, node_id in enumerate(node_groups["server"]):
+                self.nodes[node_id]["x"] = start_x + i * spacing_x
+                self.nodes[node_id]["y"] = start_y
+        
+        # Position WAN nodes at the bottom
+        wan_count = len(node_groups["wan"])
+        if wan_count > 0:
+            wan_width = canvas_width * 0.9
+            cols = min(max(int(math.sqrt(wan_count * 2)), 1), 12)  # More columns for WAN
+            rows = math.ceil(wan_count / cols)
+            
+            cell_width = wan_width / cols
+            start_x = (canvas_width - wan_width) / 2 + cell_width / 2
+            start_y = 250 + (math.ceil(len(node_groups["lan"]) / (min(max(int(math.sqrt(lan_count)), 1), 8))) * spacing) + 150
+            
+            for i, node_id in enumerate(node_groups["wan"]):
+                row = i // cols
+                col = i % cols
+                self.nodes[node_id]["x"] = start_x + col * cell_width
+                self.nodes[node_id]["y"] = start_y + row * spacing
+    
+    def apply_circular_layout(self):
+        """Apply a circular layout with the router at the center"""
+        # Get canvas dimensions
+        canvas_width = self.canvas.winfo_width() or 800
+        canvas_height = self.canvas.winfo_height() or 600
+        
+        center_x = canvas_width / 2
+        center_y = canvas_height / 2
+        
+        # Position router at center
+        if "router" in self.nodes:
+            self.nodes["router"]["x"] = center_x
+            self.nodes["router"]["y"] = center_y
+        
+        # Count nodes by type
+        node_types = {
+            "proxy": [],
+            "firewall": [],
+            "lan": [],
+            "server": [],
+            "wan": []
+        }
+        
+        for node_id, node in self.nodes.items():
+            if node_id == "router":
+                continue
+            
+            node_type = node["type"]
+            if node_type in node_types:
+                node_types[node_type].append(node_id)
+            else:
+                node_types["lan"].append(node_id)
+        
+        # Position nodes in concentric circles by type
+        radius = self.node_spacing.get()
+        
+        # Inner circle: proxies and firewalls
+        inner_nodes = node_types["proxy"] + node_types["firewall"]
+        self.place_nodes_in_circle(inner_nodes, center_x, center_y, radius)
+        
+        # Middle circle: LAN nodes
+        self.place_nodes_in_circle(node_types["lan"], center_x, center_y, radius * 2)
+        
+        # Servers between middle and outer
+        self.place_nodes_in_circle(node_types["server"], center_x, center_y, radius * 3)
+        
+        # Outer circle: WAN nodes
+        self.place_nodes_in_circle(node_types["wan"], center_x, center_y, radius * 4)
+    
+    def place_nodes_in_circle(self, node_ids, center_x, center_y, radius):
+        """Place a set of nodes in a circle around a center point"""
+        count = len(node_ids)
+        if count == 0:
+            return
+            
+        angle_step = 2 * math.pi / count
+        
+        for i, node_id in enumerate(node_ids):
+            angle = i * angle_step
+            self.nodes[node_id]["x"] = center_x + radius * math.cos(angle)
+            self.nodes[node_id]["y"] = center_y + radius * math.sin(angle)
+    
+    def apply_force_directed_layout(self):
+        """Apply a simple force-directed layout algorithm"""
+        # Get canvas dimensions
+        canvas_width = self.canvas.winfo_width() or 800
+        canvas_height = self.canvas.winfo_height() or 600
+        
+        # Initialize random positions if not set
+        for node_id, node in self.nodes.items():
+            if node["x"] == 0 and node["y"] == 0:
+                node["x"] = random.uniform(100, canvas_width - 100)
+                node["y"] = random.uniform(100, canvas_height - 100)
+        
+        # Run simulation
+        iterations = 50
+        k = self.node_spacing.get()  # Optimal distance
+        
+        for _ in range(iterations):
+            # Calculate repulsive forces
+            for node1_id, node1 in self.nodes.items():
+                force_x, force_y = 0, 0
+                
+                # Repulsive force from all other nodes
+                for node2_id, node2 in self.nodes.items():
+                    if node1_id != node2_id:
+                        dx = node1["x"] - node2["x"]
+                        dy = node1["y"] - node2["y"]
+                        distance = max(math.sqrt(dx*dx + dy*dy), 1)
+                        
+                        # Repulsive force
+                        force = k*k / distance
+                        force_x += force * dx / distance
+                        force_y += force * dy / distance
+                
+                # Store force
+                node1["force_x"] = force_x
+                node1["force_y"] = force_y
+            
+            # Calculate attractive forces
+            for edge in self.edges:
+                source_id = edge["source"]
+                target_id = edge["target"]
+                
+                if source_id in self.nodes and target_id in self.nodes:
+                    source = self.nodes[source_id]
+                    target = self.nodes[target_id]
+                    
+                    dx = source["x"] - target["x"]
+                    dy = source["y"] - target["y"]
+                    distance = max(math.sqrt(dx*dx + dy*dy), 1)
+                    
+                    # Attractive force
+                    force = distance*distance / k
+                    force_x = force * dx / distance
+                    force_y = force * dy / distance
+                    
+                    # Apply to both nodes
+                    source["force_x"] -= force_x
+                    source["force_y"] -= force_y
+                    target["force_x"] += force_x
+                    target["force_y"] += force_y
+            
+            # Apply forces
+            for node in self.nodes.values():
+                dx = min(max(node.get("force_x", 0), -10), 10)
+                dy = min(max(node.get("force_y", 0), -10), 10)
+                
+                node["x"] += dx
+                node["y"] += dy
+                
+                # Keep within bounds
+                node["x"] = max(50, min(canvas_width - 50, node["x"]))
+                node["y"] = max(50, min(canvas_height - 50, node["y"]))
+    
+    def redraw_network(self):
+        """Redraw the entire network visualization"""
+        # Clear canvas
+        self.canvas.delete("all")
+        self.canvas_items = {}
+        
+        # Draw edges first (so they're behind nodes)
+        for edge in self.edges:
+            self.draw_edge(edge)
+        
+        # Draw nodes
+        for node_id, node in self.nodes.items():
+            self.draw_node(node)
+        
+        # Update canvas scrollregion
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+    
+    def draw_node(self, node):
+        """Draw a node on the canvas"""
+        x, y = node["x"], node["y"]
+        node_type = node["type"]
+        radius = self.node_radius
+        
+        # Adjust radius based on connections
+        if "connections" in node and node["connections"] > 0:
+            radius = max(radius, min(radius * math.log(node["connections"] + 1) / 2, radius * 2))
+        
+        # Choose color based on node type
+        color = self.colors.get(node_type, self.colors["unknown"])
+        
+        # Change color if selected
+        if node["id"] == self.selected_node:
+            color = self.colors["selected"]
+        
+        # Draw the node circle
+        node_item = self.canvas.create_oval(
+            x - radius, y - radius, 
+            x + radius, y + radius, 
+            fill=color, outline="black", width=2
+        )
+        
+        # Store reference to the node
+        self.canvas_items[node_item] = node["id"]
+        
+        # Draw label
+        label = node.get("name", node["id"])
+        label_item = self.canvas.create_text(
+            x, y + radius + 10, 
+            text=label, 
+            font=("TkDefaultFont", 8), 
+            fill="black"
+        )
+        
+        # Add extra indicators for special nodes
+        if node_type == "router":
+            self.canvas.create_text(x, y, text="R", font=("TkDefaultFont", 12, "bold"), fill="white")
+        elif node_type == "proxy":
+            self.canvas.create_text(x, y, text="P", font=("TkDefaultFont", 12, "bold"), fill="white")
+        elif node_type == "firewall":
+            self.canvas.create_text(x, y, text="F", font=("TkDefaultFont", 12, "bold"), fill="white")
+        elif node_type == "server":
+            self.canvas.create_text(x, y, text="S", font=("TkDefaultFont", 12, "bold"), fill="white")
+    
+    def draw_edge(self, edge):
+        """Draw an edge between nodes"""
+        # Get source and target nodes
+        source_id = edge["source"]
+        target_id = edge["target"]
+        
+        if source_id not in self.nodes or target_id not in self.nodes:
+            return
+            
+        source = self.nodes[source_id]
+        target = self.nodes[target_id]
+        
+        # Get coordinates
+        x1, y1 = source["x"], source["y"]
+        x2, y2 = target["x"], target["y"]
+        
+        # Calculate edge thickness based on volume
+        volume = edge.get("volume", 0)
+        min_width = 1
+        max_width = 5
+        if volume > 0:
+            # Logarithmic scale for edge width
+            width = min_width + min(max_width - min_width, math.log(volume + 1) / 5)
+        else:
+            width = min_width
+        
+        # Choose color based on protocol
+        protocol = edge.get("protocol", "unknown")
+        if protocol == "HTTP" or protocol == "HTTPS":
+            color = "#4CAF50"  # Green
+        elif protocol == "DNS":
+            color = "#2196F3"  # Blue
+        elif protocol == "SMTP" or protocol == "IMAP" or protocol == "POP3":
+            color = "#FF9800"  # Orange
+        elif protocol == "SSH" or protocol == "SFTP":
+            color = "#9C27B0"  # Purple
+        elif protocol == "FTP":
+            color = "#F44336"  # Red
+        else:
+            color = "#9E9E9E"  # Gray
+        
+        # Adjust line ending to stop at node boundaries
+        radius1 = self.node_radius
+        radius2 = self.node_radius
+        
+        # Adjust radius based on connections
+        if "connections" in source and source["connections"] > 0:
+            radius1 = max(radius1, min(radius1 * math.log(source["connections"] + 1) / 2, radius1 * 2))
+        if "connections" in target and target["connections"] > 0:
+            radius2 = max(radius2, min(radius2 * math.log(target["connections"] + 1) / 2, radius2 * 2))
+        
+        # Calculate unit vector along the line
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.sqrt(dx*dx + dy*dy)
+        if length < 1:
+            return  # Skip zero-length lines
+        
+        dx, dy = dx/length, dy/length
+        
+        # Calculate start and end points
+        start_x = x1 + dx * radius1
+        start_y = y1 + dy * radius1
+        end_x = x2 - dx * radius2
+        end_y = y2 - dy * radius2
+        
+        # Draw the edge
+        self.canvas.create_line(
+            start_x, start_y, end_x, end_y, 
+            fill=color, width=width, 
+            arrow="last", arrowshape=(10, 12, 5)
+        )
+    
+    def select_node(self, node_id):
+        """Select a node and show its details"""
+        self.selected_node = node_id
+        
+        # Clear details
+        self.details_text.delete(1.0, tk.END)
+        
+        if node_id and node_id in self.nodes:
+            node = self.nodes[node_id]
+            
+            # Display node details
+            details = f"Device Type: {node['type'].capitalize()}\n"
+            details += f"Name: {node.get('name', 'Unknown')}\n"
+            
+            if "ip" in node:
+                details += f"IP Address: {node['ip']}\n"
+            
+            if "connections" in node:
+                details += f"Connections: {node['connections']}\n"
+            
+            # Get connected nodes
+            connected_nodes = []
+            for edge in self.edges:
+                if edge["source"] == node_id and edge["target"] in self.nodes:
+                    target = self.nodes[edge["target"]]
+                    protocol = edge.get("protocol", "unknown")
+                    volume = edge.get("volume", 0)
+                    connected_nodes.append(f"{target.get('name', target['id'])} ({protocol}, {self.format_bytes(volume)})")
+                elif edge["target"] == node_id and edge["source"] in self.nodes:
+                    source = self.nodes[edge["source"]]
+                    protocol = edge.get("protocol", "unknown")
+                    volume = edge.get("volume", 0)
+                    connected_nodes.append(f"{source.get('name', source['id'])} ({protocol}, {self.format_bytes(volume)})")
+            
+            if connected_nodes:
+                details += f"\nConnected to:\n"
+                details += "\n".join(f"- {node}" for node in connected_nodes[:10])
+                if len(connected_nodes) > 10:
+                    details += f"\n... and {len(connected_nodes) - 10} more"
+            
+            # Display the details
+            self.details_text.insert(tk.END, details)
+        
+        # Redraw to update selection
+        self.redraw_network()
+    
+    def format_bytes(self, bytes_value):
+        """Format bytes as human readable"""
+        if bytes_value < 1024:
+            return f"{bytes_value} B"
+        elif bytes_value < 1024 * 1024:
+            return f"{bytes_value / 1024:.1f} KB"
+        elif bytes_value < 1024 * 1024 * 1024:
+            return f"{bytes_value / (1024 * 1024):.1f} MB"
+        else:
+            return f"{bytes_value / (1024 * 1024 * 1024):.1f} GB"
+    
+    def show_node_traffic(self, node_id):
+        """Show detailed traffic information for a node"""
+        if node_id not in self.nodes:
+            return
+            
+        node = self.nodes[node_id]
+        if "ip" not in node:
+            return
+            
+        # Queue the query
+        ip = node["ip"]
+        
+        # Show a dialog with traffic details
+        dialog = tk.Toplevel(self.tab_frame)
+        dialog.title(f"Traffic for {node.get('name', ip)}")
+        dialog.geometry("600x400")
+        dialog.transient(self.tab_frame)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text=f"Traffic for {node.get('name', ip)} ({ip})", 
+                font=("TkDefaultFont", 12, "bold")).pack(pady=10)
+        
+        # Create a frame for traffic data
+        traffic_frame = ttk.Frame(dialog)
+        traffic_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Create a treeview for traffic
+        traffic_tree = ttk.Treeview(traffic_frame, columns=("dest", "protocol", "volume", "packets"))
+        traffic_tree.heading("#0", text="")
+        traffic_tree.heading("dest", text="Destination")
+        traffic_tree.heading("protocol", text="Protocol")
+        traffic_tree.heading("volume", text="Volume")
+        traffic_tree.heading("packets", text="Packets")
+        
+        traffic_tree.column("#0", width=0, stretch=tk.NO)
+        traffic_tree.column("dest", width=250)
+        traffic_tree.column("protocol", width=100)
+        traffic_tree.column("volume", width=100)
+        traffic_tree.column("packets", width=100)
+        
+        scrollbar = ttk.Scrollbar(traffic_frame, orient="vertical", command=traffic_tree.yview)
+        traffic_tree.configure(yscrollcommand=scrollbar.set)
+        
+        scrollbar.pack(side="right", fill="y")
+        traffic_tree.pack(side="left", fill="both", expand=True)
+        
+        # Populate the treeview
+        for edge in self.edges:
+            if edge["source"] == node_id and edge["target"] in self.nodes:
+                target = self.nodes[edge["target"]]
+                protocol = edge.get("protocol", "unknown")
+                volume = edge.get("volume", 0)
+                packets = edge.get("packets", 0)
+                
+                traffic_tree.insert("", "end", values=(
+                    target.get("name", target["id"]),
+                    protocol,
+                    self.format_bytes(volume),
+                    packets
+                ))
+        
+        # Add close button
+        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=10)
+    
+    def show_domain_info(self, node_id):
+        """Show domain information for an external node"""
+        if node_id not in self.nodes:
+            return
+            
+        node = self.nodes[node_id]
+        
+        # Show a dialog with domain info
+        dialog = tk.Toplevel(self.tab_frame)
+        dialog.title(f"Domain Info: {node.get('name', node_id)}")
+        dialog.geometry("500x300")
+        dialog.transient(self.tab_frame)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text=f"Domain: {node.get('name', node_id)}", 
+                font=("TkDefaultFont", 12, "bold")).pack(pady=10)
+        
+        # Create a text widget for domain info
+        info_text = tk.Text(dialog, height=10, wrap=tk.WORD)
+        info_text.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Add info
+        if "ip" in node:
+            info_text.insert(tk.END, f"IP: {node['ip']}\n\n")
+        
+        info_text.insert(tk.END, f"Connected from:\n")
+        
+        # List connections
+        connected_from = []
+        for edge in self.edges:
+            if edge["target"] == node_id and edge["source"] in self.nodes:
+                source = self.nodes[edge["source"]]
+                protocol = edge.get("protocol", "unknown")
+                volume = edge.get("volume", 0)
+                connected_from.append((source, protocol, volume))
+        
+        for source, protocol, volume in connected_from:
+            info_text.insert(tk.END, f"- {source.get('name', source['id'])}: {protocol}, {self.format_bytes(volume)}\n")
+        
+        # Add close button
+        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=10)
+    
+    def mark_as_false_positive(self, ip):
+        """Mark an IP as a false positive"""
+        gui.ip_manager.mark_as_false_positive(ip)
+        self.update_output(f"Marked {ip} as false positive")
+    
+    def export_map(self):
+        """Export the network map as an image or data file"""
+        # Create a dialog to select export options
+        dialog = tk.Toplevel(self.tab_frame)
+        dialog.title("Export Network Map")
+        dialog.geometry("300x200")
+        dialog.transient(self.tab_frame)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text="Export Options", 
+                font=("TkDefaultFont", 12, "bold")).pack(pady=10)
+        
+        export_type = tk.StringVar(value="image")
+        
+        ttk.Radiobutton(dialog, text="Export as Image (PNG)", 
+                      variable=export_type, value="image").pack(anchor="w", padx=20, pady=5)
+        
+        ttk.Radiobutton(dialog, text="Export as Data (JSON)", 
+                      variable=export_type, value="json").pack(anchor="w", padx=20, pady=5)
+        
+        def do_export():
+            export_format = export_type.get()
+            try:
+                if export_format == "image":
+                    self.export_as_image()
+                else:
+                    self.export_as_json()
+                dialog.destroy()
+            except Exception as e:
+                self.update_output(f"Export error: {e}")
+        
+        ttk.Button(dialog, text="Export", command=do_export).pack(pady=20)
+        ttk.Button(dialog, text="Cancel", command=dialog.destroy).pack()
+    
+    def export_as_image(self):
+        """Export the network map as a PNG image"""
+        try:
+            from PIL import ImageGrab
+            import os
+            from datetime import datetime
+            
+            # Generate filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"network_map_{timestamp}.png"
+            desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+            filepath = os.path.join(desktop_path, filename)
+            
+            # Get canvas bounds
+            bbox = self.canvas.bbox("all")
+            if not bbox:
+                self.update_output("Nothing to export")
+                return
+                
+            # Adjust bbox to include a margin
+            x1, y1, x2, y2 = bbox
+            margin = 20
+            x1 -= margin
+            y1 -= margin
+            x2 += margin
+            y2 += margin
+            
+            # Create a temporary scrollregion to ensure all content is visible
+            orig_region = self.canvas.cget("scrollregion")
+            self.canvas.configure(scrollregion=(x1, y1, x2, y2))
+            
+            # Take a screenshot of the canvas
+            bbox = (
+                self.canvas.winfo_rootx() + x1,
+                self.canvas.winfo_rooty() + y1,
+                self.canvas.winfo_rootx() + x2,
+                self.canvas.winfo_rooty() + y2
+            )
+            
+            # Grab the image
+            image = ImageGrab.grab(bbox)
+            image.save(filepath)
+            
+            # Restore original scrollregion
+            self.canvas.configure(scrollregion=orig_region)
+            
+            self.update_output(f"Network map exported to {filepath}")
+        except ImportError:
+            self.update_output("PIL/pillow is required for image export")
+        except Exception as e:
+            self.update_output(f"Error exporting image: {e}")
+    
+    def export_as_json(self):
+        """Export the network map data as JSON"""
+        try:
+            import json
+            import os
+            from datetime import datetime
+            
+            # Generate filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"network_map_{timestamp}.json"
+            desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+            filepath = os.path.join(desktop_path, filename)
+            
+            # Prepare data
+            export_data = {
+                "nodes": self.nodes,
+                "edges": self.edges,
+                "timestamp": timestamp,
+                "layout": self.layout_type.get()
+            }
+            
+            # Save to file
+            with open(filepath, 'w') as f:
+                json.dump(export_data, f, indent=2)
+                
+            self.update_output(f"Network map data exported to {filepath}")
+        except Exception as e:
+            self.update_output(f"Error exporting JSON: {e}")
+    
+    def on_tab_selected(self):
+        """Called when this tab is selected"""
+        # Check if we need to refresh
+        current_time = time.time()
+        if (current_time - self.last_refresh_time) > self.refresh_interval or not self.nodes:
+            self.refresh()

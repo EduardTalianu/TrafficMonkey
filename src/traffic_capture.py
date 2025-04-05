@@ -167,8 +167,8 @@ class TrafficCaptureEngine:
             
             # Add filters
             cmd.extend([
-                "-f", "tcp or udp or icmp",  # Capture filter
-                "-Y", "http or tls or ssl or http2 or dns or icmp",  # Display filter
+                "-f", "tcp or udp or icmp or arp",  # Capture filter
+                "-Y", "http or tls or ssl or http2 or dns or icmp or arp",  # Display filter
                 "-l"  # Line-buffered output
             ])
             
@@ -386,8 +386,15 @@ class TrafficCaptureEngine:
                     layer_name = dst_ipv6_field["tshark_field"].replace(".", "_")
                     dst_ip = self.get_layer_value(layers, layer_name)
             
-            # Basic data validation - we need IPs to proceed
-            if not src_ip or not dst_ip:
+            # Check for ARP data - check if any ARP field is present
+            if "arp_src_proto_ipv4" in layers or "arp_dst_proto_ipv4" in layers or "arp_opcode" in layers:
+                # Process ARP packet using dedicated method
+                self._process_arp_packet_ek(layers)
+                # Still continue processing as a normal packet if IP fields are present
+
+            # Basic data validation for IP-based packets
+            # For ARP packets, we may not have both IPs, so don't return early
+            if (not "arp_src_proto_ipv4" in layers and not "arp_dst_proto_ipv4" in layers) and (not src_ip or not dst_ip):
                 # Don't log this too frequently
                 if random.random() < 0.05:
                     self.gui.update_output(f"Missing IP addresses in packet - src:{src_ip}, dst:{dst_ip}")
@@ -398,66 +405,87 @@ class TrafficCaptureEngine:
             length = self._extract_length(layers)
             
             # Skip processing if the IP is in the false positives list
-            if src_ip in self.gui.false_positives or dst_ip in self.gui.false_positives:
+            if (src_ip and src_ip in self.gui.false_positives) or (dst_ip and dst_ip in self.gui.false_positives):
                 return False
-            
+
             # Create a connection key that includes ports if available
-            if src_port is not None and dst_port is not None:
-                connection_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
-            else:
-                connection_key = f"{src_ip}->{dst_ip}"
-            
-            # Check for RDP connection (port 3389)
-            is_rdp = 0
-            if dst_port == 3389:
-                is_rdp = 1
-                self.gui.update_output(f"Detected RDP connection from {src_ip}:{src_port} to {dst_ip}:{dst_port}")
-            
-            # Process specific protocol data if present
-            protocol_detected = False
-            
-            # Check for protocol fields using categories
-            for category in ["dns", "http", "tls", "icmp"]:
-                fields = capture_fields.get_fields_by_category(category)
-                layer_names = [f["tshark_field"].replace(".", "_") for f in fields]
-                
-                if any(name in layers for name in layer_names):
-                    # Call the appropriate protocol handler
-                    if category == "dns" and self._has_dns_data(layers):
-                        self._process_dns_packet_ek(layers, src_ip, dst_ip)
-                        protocol_detected = True
-                    elif category == "http" and self._has_http_data(layers):
-                        self._process_http_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
-                        protocol_detected = True
-                    elif category == "tls" and self._has_tls_data(layers):
-                        self._process_tls_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
-                        protocol_detected = True
-                    elif category == "icmp" and "icmp_type" in layers:
-                        self._process_icmp_packet_ek(layers, src_ip, dst_ip)
-                        protocol_detected = True
-            
-            # Port scan detection
-            if dst_port:
-                self._update_port_scan_data(src_ip, dst_ip, dst_port)
-            
-            # Protocol detection based on ports if not already detected
-            if not protocol_detected:
-                # Check standard ports
-                if dst_port == 80:
-                    self.db_manager.add_app_protocol(connection_key, "HTTP", detection_method="port-based")
-                elif dst_port == 443:
-                    self.db_manager.add_app_protocol(connection_key, "HTTPS", detection_method="port-based")
-                elif dst_port == 53 or src_port == 53:
-                    self.db_manager.add_app_protocol(connection_key, "DNS", detection_method="port-based")
+            if src_ip and dst_ip:
+                if src_port is not None and dst_port is not None:
+                    connection_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
                 else:
-                    # Try other protocol detection
-                    self._detect_application_protocol(src_ip, dst_ip, src_port, dst_port, layers, 
-                                                    is_tcp=(src_port is not None and "tcp_srcport" in layers))
-            
-            # Use database manager to add packet
-            return self.db_manager.add_packet(
-                connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp
-            )
+                    connection_key = f"{src_ip}->{dst_ip}"
+                
+                # Extract TTL value and add it to connections
+                ttl_value = self.get_layer_value(layers, "ip_ttl")
+                if ttl_value is None:
+                    # Try IPv6 hop limit if IPv4 TTL not found
+                    ttl_value = self.get_layer_value(layers, "ipv6_hlim")
+                    
+                if ttl_value is not None:
+                    try:
+                        ttl = int(ttl_value)
+                        # Update connection with TTL
+                        self.db_manager.update_connection_ttl(connection_key, ttl)
+                    except ValueError:
+                        pass
+
+                # Check for RDP connection (port 3389)
+                is_rdp = 0
+                if dst_port == 3389:
+                    is_rdp = 1
+                    self.gui.update_output(f"Detected RDP connection from {src_ip}:{src_port} to {dst_ip}:{dst_port}")
+                
+                # Process specific protocol data if present
+                protocol_detected = False
+                
+                # Check for protocol fields using categories - now including ARP
+                for category in ["dns", "http", "tls", "icmp", "arp"]:
+                    fields = capture_fields.get_fields_by_category(category)
+                    layer_names = [f["tshark_field"].replace(".", "_") for f in fields]
+                    
+                    if any(name in layers for name in layer_names):
+                        # Call the appropriate protocol handler
+                        if category == "dns" and self._has_dns_data(layers):
+                            self._process_dns_packet_ek(layers, src_ip, dst_ip)
+                            protocol_detected = True
+                        elif category == "http" and self._has_http_data(layers):
+                            self._process_http_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
+                            protocol_detected = True
+                        elif category == "tls" and self._has_tls_data(layers):
+                            self._process_tls_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
+                            protocol_detected = True
+                        elif category == "icmp" and "icmp_type" in layers:
+                            self._process_icmp_packet_ek(layers, src_ip, dst_ip)
+                            protocol_detected = True
+                        elif category == "arp" and ("arp_src_proto_ipv4" in layers or "arp_dst_proto_ipv4" in layers):
+                            # ARP is already processed above, but mark as detected
+                            protocol_detected = True
+                
+                # Port scan detection
+                if dst_port:
+                    self._update_port_scan_data(src_ip, dst_ip, dst_port)
+                
+                # Protocol detection based on ports if not already detected
+                if not protocol_detected:
+                    # Check standard ports
+                    if dst_port == 80:
+                        self.db_manager.add_app_protocol(connection_key, "HTTP", detection_method="port-based")
+                    elif dst_port == 443:
+                        self.db_manager.add_app_protocol(connection_key, "HTTPS", detection_method="port-based")
+                    elif dst_port == 53 or src_port == 53:
+                        self.db_manager.add_app_protocol(connection_key, "DNS", detection_method="port-based")
+                    else:
+                        # Try other protocol detection
+                        self._detect_application_protocol(src_ip, dst_ip, src_port, dst_port, layers, 
+                                                        is_tcp=(src_port is not None and "tcp_srcport" in layers))
+                
+                # Use database manager to add packet
+                if src_ip and dst_ip:  # Only add if we have both IPs
+                    return self.db_manager.add_packet(
+                        connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp
+                    )
+                    
+            return True  # Return True for successful processing, even for ARP-only packets
                     
         except Exception as e:
             self.gui.update_output(f"Error processing packet: {e}")
@@ -922,3 +950,45 @@ class TrafficCaptureEngine:
         except Exception as e:
             self.gui.update_output(f"Error detecting application protocol: {e}")
             return False
+        
+    def _process_arp_packet_ek(self, layers):
+        """Extract and store ARP packet information"""
+        try:
+            # Extract ARP source and destination IPs
+            arp_src_ip = self.get_layer_value(layers, "arp_src_proto_ipv4")
+            arp_dst_ip = self.get_layer_value(layers, "arp_dst_proto_ipv4")
+            
+            # Extract ARP operation (1=request, 2=reply)
+            operation_raw = self.get_layer_value(layers, "arp_opcode")
+            operation = 0
+            if operation_raw:
+                try:
+                    operation = int(operation_raw)
+                except (ValueError, TypeError):
+                    operation = 0
+            
+            # At least one IP should be present for ARP
+            if arp_src_ip or arp_dst_ip:
+                # Store ARP data using database manager
+                current_time = time.time()
+                success = self.db_manager.add_arp_data(
+                    arp_src_ip or "Unknown",  # Use "Unknown" if source IP is not available
+                    arp_dst_ip or "Unknown",  # Use "Unknown" if destination IP is not available
+                    operation,
+                    current_time
+                )
+                
+                # Log ARP packets for debugging (only occasionally to avoid log flooding)
+                if success and random.random() < 0.1:  # Log ~10% of ARP packets
+                    op_type = "request" if operation == 1 else "reply" if operation == 2 else f"unknown({operation})"
+                    self.gui.update_output(f"ARP {op_type}: {arp_src_ip or 'Unknown'} -> {arp_dst_ip or 'Unknown'}")
+                    
+                return success
+            
+            return False
+        except Exception as e:
+            self.gui.update_output(f"Error processing ARP packet: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
