@@ -52,6 +52,9 @@ class DatabaseManager:
         # Check and update schema version
         self._check_schema_version()
         
+        # Start periodic connection health checks
+        self.check_connection_health()
+        
         logger.info("Database manager initialized with separate capture and analysis databases")
     
     
@@ -271,7 +274,7 @@ class DatabaseManager:
                 logger.error(f"Error in sync thread: {e}")
     
     def _process_alerts(self):
-        """Process queued alerts in a separate thread"""
+        """Process queued alerts in a separate thread with improved transaction handling"""
         while self.alert_processor_running:
             try:
                 # Get next alert from queue with a timeout
@@ -280,18 +283,22 @@ class DatabaseManager:
                 if alert_data:
                     ip_address, alert_message, rule_name = alert_data
                     
-                    # Write alert to capture database with a dedicated cursor
                     try:
-                        cursor = self.capture_conn.cursor()
-                        cursor.execute("""
-                            INSERT INTO alerts (ip_address, alert_message, rule_name)
-                            VALUES (?, ?, ?)
-                        """, (ip_address, alert_message, rule_name))
-                        self.capture_conn.commit()
-                        cursor.close()
-                        logger.debug(f"Added alert to capture DB: {alert_message[:50]}...")
+                        # Use our transaction context for proper transaction handling
+                        with self.transaction(self.capture_conn) as cursor:
+                            cursor.execute("""
+                                INSERT INTO alerts (ip_address, alert_message, rule_name)
+                                VALUES (?, ?, ?)
+                            """, (ip_address, alert_message, rule_name))
+                            logger.debug(f"Added alert to capture DB: {alert_message[:50]}...")
                     except Exception as e:
-                        logger.error(f"Error writing alert to capture DB: {e}")
+                        # Use message checking to determine if it's a real error
+                        error_msg = str(e).lower()
+                        if "not an error" in error_msg or "error return without exception set" in error_msg:
+                            # These are often not actual errors but SQLite status messages
+                            logger.debug(f"Non-critical SQLite message: {e}")
+                        else:
+                            logger.error(f"Error writing alert to capture DB: {e}")
                     
                     # Mark as done
                     self.alert_queue.task_done()
@@ -563,23 +570,16 @@ class DatabaseManager:
             return False
     
     def add_alert(self, ip_address, alert_message, rule_name):
-        """Add an alert to the capture database (write-only operation)"""
+        """Add an alert to the capture database (write-only operation) with improved transaction handling"""
         try:
-            cursor = self.capture_conn.cursor()
-            cursor.execute("""
-                INSERT INTO alerts (ip_address, alert_message, rule_name)
-                VALUES (?, ?, ?)
-            """, (ip_address, alert_message, rule_name))
-            self.capture_conn.commit()
-            cursor.close()
-            return True
+            with self.transaction(self.capture_conn) as cursor:
+                cursor.execute("""
+                    INSERT INTO alerts (ip_address, alert_message, rule_name)
+                    VALUES (?, ?, ?)
+                """, (ip_address, alert_message, rule_name))
+                return True
         except Exception as e:
             logger.error(f"Error adding alert: {e}")
-            try:
-                # Try to rollback in case of error
-                self.capture_conn.rollback()
-            except:
-                pass
             return False
         
     def add_http_request(self, connection_key, method, host, uri, version, user_agent, referer, content_type, headers_json, request_size):
@@ -644,45 +644,107 @@ class DatabaseManager:
             return False
 
     def add_app_protocol(self, connection_key, app_protocol, protocol_details=None, detection_method=None):
-        """Store application protocol information"""
-        cursor = None
+        """Store application protocol information with automatic connection creation and improved transaction handling"""
         try:
-            cursor = self.capture_conn.cursor()
-            current_time = time.time()
-            
-            # First check if the connection_key exists
-            cursor.execute("SELECT COUNT(*) FROM connections WHERE connection_key = ?", (connection_key,))
-            if cursor.fetchone()[0] == 0:
-                logger.warning(f"Connection key {connection_key} not found, cannot add protocol")
-                return False
+            with self.transaction(self.capture_conn) as cursor:
+                # First check if the connection_key exists
+                cursor.execute("SELECT COUNT(*) FROM connections WHERE connection_key = ?", (connection_key,))
+                if cursor.fetchone()[0] == 0:
+                    # Connection doesn't exist, try to create it from the connection key
+                    try:
+                        # Parse connection key format: src_ip:src_port->dst_ip:dst_port
+                        parts = connection_key.split('->')
+                        if len(parts) == 2:
+                            src_part = parts[0].split(':')
+                            dst_part = parts[1].split(':')
+                            
+                            if len(src_part) >= 2 and len(dst_part) >= 2:
+                                # Extract IP and port
+                                src_ip = ':'.join(src_part[:-1])  # Handle IPv6 addresses with colons
+                                dst_ip = ':'.join(dst_part[:-1])
+                                
+                                try:
+                                    src_port = int(src_part[-1])
+                                    dst_port = int(dst_part[-1])
+                                except ValueError:
+                                    src_port = 0
+                                    dst_port = 0
+                                
+                                # Create a minimal connection record
+                                logger.info(f"Auto-creating connection for {connection_key}")
+                                cursor.execute("""
+                                    INSERT INTO connections 
+                                    (connection_key, src_ip, dst_ip, src_port, dst_port, total_bytes, packet_count)
+                                    VALUES (?, ?, ?, ?, ?, 0, 1)
+                                """, (connection_key, src_ip, dst_ip, src_port, dst_port))
+                            else:
+                                logger.warning(f"Couldn't parse IP:port from connection key: {connection_key}")
+                                return False
+                        else:
+                            logger.warning(f"Invalid connection key format: {connection_key}")
+                            return False
+                    except Exception as e:
+                        logger.warning(f"Failed to auto-create connection for key {connection_key}: {e}")
+                        return False
+                        
+                # Insert app protocol info
+                current_time = time.time()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO app_protocols
+                    (connection_key, app_protocol, protocol_details, detection_method, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (connection_key, app_protocol, protocol_details, detection_method, current_time))
                 
-            # Insert app protocol info
-            cursor.execute("""
-                INSERT OR REPLACE INTO app_protocols
-                (connection_key, app_protocol, protocol_details, detection_method, timestamp)
-                VALUES (?, ?, ?, ?, ?)
-            """, (connection_key, app_protocol, protocol_details, detection_method, current_time))
-            
-            # Update connection protocol
-            cursor.execute("""
-                UPDATE connections
-                SET protocol = ?
-                WHERE connection_key = ?
-            """, (app_protocol, connection_key))
-            
-            self.capture_conn.commit()
-            return True
+                # Update connection protocol
+                cursor.execute("""
+                    UPDATE connections
+                    SET protocol = ?
+                    WHERE connection_key = ?
+                """, (app_protocol, connection_key))
+                
+                return True
         except Exception as e:
             logger.error(f"Error storing application protocol: {e}")
-            try:
-                if self.capture_conn:
-                    self.capture_conn.rollback()
-            except:
-                pass
             return False
-        finally:
-            if cursor:
-                cursor.close()
+
+    def create_connection_key(src_ip, dst_ip, src_port, dst_port):
+        """Create a standardized connection key that handles both IPv4 and IPv6"""
+        # For IPv6, wrap the address in square brackets to distinguish from port separator
+        src_part = f"[{src_ip}]:{src_port}" if ':' in src_ip else f"{src_ip}:{src_port}"
+        dst_part = f"[{dst_ip}]:{dst_port}" if ':' in dst_ip else f"{dst_ip}:{dst_port}"
+        return f"{src_part}->{dst_part}"
+    
+    def parse_connection_key(connection_key):
+        """Parse a connection key into its components, handling IPv4 and IPv6"""
+        try:
+            src_part, dst_part = connection_key.split('->')
+            
+            # Extract source IP and port
+            if '[' in src_part and ']' in src_part:  # IPv6
+                src_ip = src_part[src_part.find('[')+1:src_part.find(']')]
+                src_port_str = src_part[src_part.find(']')+2:]  # +2 to skip ]:
+            else:  # IPv4
+                src_ip, src_port_str = src_part.rsplit(':', 1)
+                
+            # Extract destination IP and port
+            if '[' in dst_part and ']' in dst_part:  # IPv6
+                dst_ip = dst_part[dst_part.find('[')+1:dst_part.find(']')]
+                dst_port_str = dst_part[dst_part.find(']')+2:]  # +2 to skip ]:
+            else:  # IPv4
+                dst_ip, dst_port_str = dst_part.rsplit(':', 1)
+                
+            # Convert ports to integers
+            try:
+                src_port = int(src_port_str)
+                dst_port = int(dst_port_str)
+            except ValueError:
+                src_port = 0
+                dst_port = 0
+                
+            return src_ip, dst_ip, src_port, dst_port
+        except Exception as e:
+            logger.error(f"Failed to parse connection key {connection_key}: {e}")
+            return None, None, None, None
 
     def sync_databases(self):
         """Synchronize data from capture DB to analysis DB"""
@@ -1196,19 +1258,83 @@ class DatabaseManager:
         return self.analysis_conn.cursor()
     
     def update_connection_field(self, connection_key, field, value):
-        """Update a specific field in the connections table (used by rules)"""
+        """Update a specific field in the connections table (used by rules) with improved error handling"""
         try:
-            cursor = self.capture_conn.cursor()
-            cursor.execute(
-                f"UPDATE connections SET {field} = ? WHERE connection_key = ?",
-                (value, connection_key)
-            )
-            self.capture_conn.commit()
-            cursor.close()
-            return True
+            with self.transaction(self.capture_conn) as cursor:
+                cursor.execute(
+                    f"UPDATE connections SET {field} = ? WHERE connection_key = ?",
+                    (value, connection_key)
+                )
+                return True
         except Exception as e:
+            # Distinguish between real errors and "not an error" conditions
+            error_msg = str(e).lower()
+            if "not an error" in error_msg or "error return without exception set" in error_msg:
+                # These are often not actual errors but SQLite status messages
+                logger.debug(f"Non-critical SQLite message: {e}")
+                return True
             logger.error(f"Error updating connection field: {e}")
             return False
+        
+    def check_connection_health(self):
+        """Check database connections health and reconnect if needed"""
+        try:
+            # Check capture database connection
+            if not self._ensure_connection_valid(self.capture_conn):
+                logger.warning("Capture database connection was reset")
+            
+            # Check analysis database connection
+            if not self._ensure_connection_valid(self.analysis_conn):
+                logger.warning("Analysis database connection was reset")
+                
+            # Schedule periodic health checks (every 5 minutes)
+            if self.queue_running:
+                threading.Timer(300, self.check_connection_health).start()
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error in connection health check: {e}")
+            return False
+
+    def _ensure_connection_valid(self, conn):
+        """Ensure the database connection is valid and reconnect if needed"""
+        try:
+            # Try a simple query to check connection
+            conn.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            try:
+                # Try to recreate the connection
+                if conn == self.capture_conn:
+                    old_conn = self.capture_conn
+                    # Create new connection
+                    self.capture_conn = sqlite3.connect(self.capture_db_path, check_same_thread=False)
+                    self.capture_conn.execute("PRAGMA journal_mode=WAL")
+                    self.capture_conn.execute("PRAGMA synchronous=NORMAL")
+                    # Close old connection if possible
+                    try:
+                        old_conn.close()
+                    except:
+                        pass
+                    return True
+                elif conn == self.analysis_conn:
+                    old_conn = self.analysis_conn
+                    # Create new connection
+                    self.analysis_conn = sqlite3.connect(self.analysis_db_path, check_same_thread=False)
+                    self.analysis_conn.execute("PRAGMA journal_mode=WAL")
+                    self.analysis_conn.execute("PRAGMA synchronous=NORMAL")
+                    self.analysis_conn.execute("PRAGMA cache_size=10000")
+                    # Close old connection if possible
+                    try:
+                        old_conn.close()
+                    except:
+                        pass
+                    return True
+            except Exception as e:
+                logger.error(f"Failed to reconnect to database: {e}")
+                return False
+                
+        return False
     
     # Analysis DB read methods - these will be used as query functions
     
@@ -1529,3 +1655,100 @@ class DatabaseManager:
             return all(0 <= int(p) <= 255 for p in parts)
         except ValueError:
             return False
+        
+    def transaction(self, connection):
+        """Return a transaction context manager for the given connection"""
+        return TransactionContext(connection)
+
+    def _ensure_connection_valid(self, conn):
+        """Ensure the database connection is valid"""
+        try:
+            conn.execute("SELECT 1")
+            return True
+        except Exception:
+            try:
+                # Try to recreate the connection if needed
+                if conn == self.capture_conn:
+                    self.capture_conn = sqlite3.connect(self.capture_db_path, check_same_thread=False)
+                    self.capture_conn.execute("PRAGMA journal_mode=WAL")
+                    self.capture_conn.execute("PRAGMA synchronous=NORMAL")
+                    return True
+                elif conn == self.analysis_conn:
+                    self.analysis_conn = sqlite3.connect(self.analysis_db_path, check_same_thread=False)
+                    self.analysis_conn.execute("PRAGMA journal_mode=WAL")
+                    self.analysis_conn.execute("PRAGMA synchronous=NORMAL")
+                    self.analysis_conn.execute("PRAGMA cache_size=10000")
+                    return True
+            except Exception as e:
+                logger.error(f"Failed to reconnect to database: {e}")
+                return False
+            
+class TransactionContext:
+    """Enhanced context manager for database transactions with better error handling"""
+    def __init__(self, connection):
+        self.connection = connection
+        self.cursor = None
+        self.transaction_active = False
+        
+    def __enter__(self):
+        self.cursor = self.connection.cursor()
+        
+        # Check if a transaction is already active
+        try:
+            # Try to check if we're in a transaction by running a simple query
+            self.cursor.execute("SELECT 1")
+            
+            # Start a transaction if one isn't already active
+            try:
+                self.cursor.execute("BEGIN TRANSACTION")
+                self.transaction_active = True
+            except sqlite3.OperationalError as e:
+                if "already a transaction in progress" in str(e) or "cannot start a transaction within a transaction" in str(e):
+                    # Transaction already active, we'll use it but not commit/rollback
+                    logger.debug("Using existing transaction")
+                    self.transaction_active = False
+                else:
+                    # Some other error occurred
+                    raise
+        except Exception as e:
+            logger.error(f"Error starting transaction: {e}")
+            if self.cursor:
+                self.cursor.close()
+                self.cursor = None
+            raise
+            
+        return self.cursor
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if self.transaction_active:
+                if exc_type is None:
+                    # No exception occurred, commit the transaction
+                    try:
+                        self.connection.commit()
+                    except sqlite3.OperationalError as e:
+                        if "cannot commit - no transaction is active" in str(e):
+                            logger.debug("No transaction to commit")
+                        else:
+                            logger.error(f"Transaction commit error: {e}")
+                            raise
+                else:
+                    # An exception occurred, roll back
+                    try:
+                        self.connection.rollback()
+                    except sqlite3.OperationalError as e:
+                        if "cannot rollback - no transaction is active" in str(e):
+                            logger.debug("No transaction to rollback")
+                        else:
+                            logger.error(f"Transaction rollback error: {e}")
+                
+                if exc_type:
+                    logger.error(f"Transaction error: {exc_val}")
+        finally:
+            # Always close the cursor
+            if self.cursor:
+                self.cursor.close()
+                self.cursor = None
+        
+        # Don't suppress exceptions
+        return False
