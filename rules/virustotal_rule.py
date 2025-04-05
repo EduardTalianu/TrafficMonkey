@@ -429,11 +429,8 @@ class VirusTotalRule(Rule):
         """Process all pending connection updates"""
         for connection_key, field, value in self.pending_updates:
             try:
-                self.db_manager.queue_query(
-                    self.db_manager.update_connection_field,
-                    None,  # No callback needed
-                    connection_key, field, value
-                )
+                # Use the queue_connection_update method instead
+                self.db_manager.queue_connection_update(connection_key, field, value)
             except Exception as e:
                 logging.error(f"Error queueing connection update: {e}")
         

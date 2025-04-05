@@ -19,13 +19,13 @@ class DatabaseManager:
         # Set up capture database (for writing packet data)
         self.capture_db_path = os.path.join(self.db_dir, "capture.db")
         self.capture_conn = sqlite3.connect(self.capture_db_path, check_same_thread=False)
-        self.capture_cursor = self.capture_conn.cursor()
-        self._setup_capture_db()
         
         # Set up analysis database (for querying statistics)
         self.analysis_db_path = os.path.join(self.db_dir, "analysis.db")
         self.analysis_conn = sqlite3.connect(self.analysis_db_path, check_same_thread=False)
-        self.analysis_cursor = self.analysis_conn.cursor()
+        
+        # Setup databases
+        self._setup_capture_db()
         self._setup_analysis_db()
         
         # Set up synchronization
@@ -57,52 +57,71 @@ class DatabaseManager:
     
     def _setup_capture_db(self):
         """Set up capture database optimized for writing"""
-        # Enable WAL mode for better write performance
-        self.capture_cursor.execute("PRAGMA journal_mode=WAL")
-        self.capture_cursor.execute("PRAGMA synchronous=NORMAL")
-        
-        # Create tables for capture
-        self._create_tables(self.capture_cursor)
-        self.capture_conn.commit()
-        logger.info("Capture database initialized for write operations")
+        cursor = self.capture_conn.cursor()
+        try:
+            # Enable WAL mode for better write performance
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            
+            # Create tables for capture
+            self._create_tables(cursor)
+            self.capture_conn.commit()
+            logger.info("Capture database initialized for write operations")
+        finally:
+            cursor.close()
     
     def _setup_analysis_db(self):
         """Set up analysis database optimized for reading"""
-        # Configure for read performance
-        self.analysis_cursor.execute("PRAGMA journal_mode=WAL")
-        self.analysis_cursor.execute("PRAGMA synchronous=NORMAL")
-        self.analysis_cursor.execute("PRAGMA cache_size=10000")
-        
-        # Create the same tables
-        self._create_tables(self.analysis_cursor)
-        
-        # Add additional indices for query performance
-        self.analysis_cursor.execute("CREATE INDEX IF NOT EXISTS idx_connections_bytes ON connections(total_bytes DESC)")
-        self.analysis_cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp DESC)")
-        self.analysis_conn.commit()
-        logger.info("Analysis database initialized for read operations")
+        cursor = self.analysis_conn.cursor()
+        try:
+            # Configure for read performance
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA cache_size=10000")
+            
+            # Create the same tables
+            self._create_tables(cursor)
+            
+            # Add additional indices for query performance
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_connections_bytes ON connections(total_bytes DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp DESC)")
+            self.analysis_conn.commit()
+            logger.info("Analysis database initialized for read operations")
+        finally:
+            cursor.close()
     
     def _check_schema_version(self):
         """Check and update schema version if needed"""
-        # Check current version in capture database
-        self.capture_cursor.execute("PRAGMA user_version")
-        current_version = self.capture_cursor.fetchone()[0]
-        
-        target_version = capture_fields.SCHEMA_VERSION
-        
-        if current_version < target_version:
-            logger.info(f"Updating schema from version {current_version} to {target_version}")
-            # For a simple implementation, we just update the version number
-            self.capture_cursor.execute(f"PRAGMA user_version = {target_version}")
-            self.capture_conn.commit()
-        
-        # Also update analysis database version
-        self.analysis_cursor.execute("PRAGMA user_version")
-        analysis_version = self.analysis_cursor.fetchone()[0]
-        
-        if analysis_version < target_version:
-            self.analysis_cursor.execute(f"PRAGMA user_version = {target_version}")
-            self.analysis_conn.commit()
+        try:
+            # Use dedicated cursors for schema version operations
+            capture_cursor = self.capture_conn.cursor()
+            
+            # Check current version in capture database
+            capture_cursor.execute("PRAGMA user_version")
+            current_version = capture_cursor.fetchone()[0]
+            
+            target_version = capture_fields.SCHEMA_VERSION
+            
+            if current_version < target_version:
+                logger.info(f"Updating schema from version {current_version} to {target_version}")
+                # For a simple implementation, we just update the version number
+                capture_cursor.execute(f"PRAGMA user_version = {target_version}")
+                self.capture_conn.commit()
+            
+            capture_cursor.close()
+            
+            # Also update analysis database version with its own cursor
+            analysis_cursor = self.analysis_conn.cursor()
+            analysis_cursor.execute("PRAGMA user_version")
+            analysis_version = analysis_cursor.fetchone()[0]
+            
+            if analysis_version < target_version:
+                analysis_cursor.execute(f"PRAGMA user_version = {target_version}")
+                self.analysis_conn.commit()
+            
+            analysis_cursor.close()
+        except Exception as e:
+            logger.error(f"Error checking schema version: {e}")
     
     def _create_tables(self, cursor):
         """Create tables based on field definitions from capture_fields.py only"""
@@ -261,25 +280,33 @@ class DatabaseManager:
                 if alert_data:
                     ip_address, alert_message, rule_name = alert_data
                     
-                    # Write alert to capture database
+                    # Write alert to capture database with a dedicated cursor
                     try:
-                        self.capture_cursor.execute("""
+                        cursor = self.capture_conn.cursor()
+                        cursor.execute("""
                             INSERT INTO alerts (ip_address, alert_message, rule_name)
                             VALUES (?, ?, ?)
                         """, (ip_address, alert_message, rule_name))
                         self.capture_conn.commit()
+                        cursor.close()
                         logger.debug(f"Added alert to capture DB: {alert_message[:50]}...")
                     except Exception as e:
                         logger.error(f"Error writing alert to capture DB: {e}")
-                
-                # Mark as done
-                self.alert_queue.task_done()
-                
+                    
+                    # Mark as done
+                    self.alert_queue.task_done()
+                    
             except queue.Empty:
                 # No alerts in queue, just continue
                 pass
             except Exception as e:
                 logger.error(f"Error in alert processor: {e}")
+
+    def queue_connection_update(self, connection_key, field, value):
+        """Add a connection update to the processing queue"""
+        self.query_queue.put((self.update_connection_field, (connection_key, field, value), {}, None))
+        logger.debug(f"Queued update for connection {connection_key}, field {field}")
+        return True
     
     def sync_databases(self):
         """Synchronize data from capture DB to analysis DB with improved reliability"""
@@ -503,11 +530,15 @@ class DatabaseManager:
         """Store DNS query information"""
         try:
             current_time = time.time()
-            self.capture_cursor.execute("""
+            # Create a dedicated cursor for this operation
+            cursor = self.capture_conn.cursor()
+            cursor.execute("""
                 INSERT INTO dns_queries
                 (timestamp, src_ip, query_domain, query_type)
                 VALUES (?, ?, ?, ?)
             """, (current_time, src_ip, query_domain, query_type))
+            self.capture_conn.commit()
+            cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error storing DNS query: {e}")
@@ -517,11 +548,15 @@ class DatabaseManager:
         """Store ICMP packet information"""
         try:
             current_time = time.time()
-            self.capture_cursor.execute("""
+            # Create a dedicated cursor for this operation
+            cursor = self.capture_conn.cursor()
+            cursor.execute("""
                 INSERT INTO icmp_packets
                 (src_ip, dst_ip, icmp_type, timestamp)
                 VALUES (?, ?, ?, ?)
             """, (src_ip, dst_ip, icmp_type, current_time))
+            self.capture_conn.commit()
+            cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error storing ICMP packet: {e}")
@@ -540,6 +575,11 @@ class DatabaseManager:
             return True
         except Exception as e:
             logger.error(f"Error adding alert: {e}")
+            try:
+                # Try to rollback in case of error
+                self.capture_conn.rollback()
+            except:
+                pass
             return False
         
     def add_http_request(self, connection_key, method, host, uri, version, user_agent, referer, content_type, headers_json, request_size):
@@ -568,11 +608,15 @@ class DatabaseManager:
         """Store HTTP response information"""
         try:
             current_time = time.time()
-            self.capture_cursor.execute("""
+            # Create a dedicated cursor for this operation
+            cursor = self.capture_conn.cursor()
+            cursor.execute("""
                 INSERT INTO http_responses
                 (http_request_id, status_code, content_type, content_length, server, response_headers, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (http_request_id, status_code, content_type, content_length, server, headers_json, current_time))
+            self.capture_conn.commit()
+            cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error storing HTTP response: {e}")
@@ -601,15 +645,25 @@ class DatabaseManager:
 
     def add_app_protocol(self, connection_key, app_protocol, protocol_details=None, detection_method=None):
         """Store application protocol information"""
+        cursor = None
         try:
             cursor = self.capture_conn.cursor()
             current_time = time.time()
+            
+            # First check if the connection_key exists
+            cursor.execute("SELECT COUNT(*) FROM connections WHERE connection_key = ?", (connection_key,))
+            if cursor.fetchone()[0] == 0:
+                logger.warning(f"Connection key {connection_key} not found, cannot add protocol")
+                return False
+                
+            # Insert app protocol info
             cursor.execute("""
                 INSERT OR REPLACE INTO app_protocols
                 (connection_key, app_protocol, protocol_details, detection_method, timestamp)
                 VALUES (?, ?, ?, ?, ?)
             """, (connection_key, app_protocol, protocol_details, detection_method, current_time))
             
+            # Update connection protocol
             cursor.execute("""
                 UPDATE connections
                 SET protocol = ?
@@ -617,11 +671,18 @@ class DatabaseManager:
             """, (app_protocol, connection_key))
             
             self.capture_conn.commit()
-            cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error storing application protocol: {e}")
+            try:
+                if self.capture_conn:
+                    self.capture_conn.rollback()
+            except:
+                pass
             return False
+        finally:
+            if cursor:
+                cursor.close()
 
     def sync_databases(self):
         """Synchronize data from capture DB to analysis DB"""
@@ -1357,13 +1418,17 @@ class DatabaseManager:
     def clear_alerts(self):
         """Clear all alerts from both databases"""
         try:
-            # Clear from capture DB first
-            self.capture_cursor.execute("DELETE FROM alerts")
+            # Use dedicated cursor for capture DB
+            capture_cursor = self.capture_conn.cursor()
+            capture_cursor.execute("DELETE FROM alerts")
             self.capture_conn.commit()
+            capture_cursor.close()
             
-            # Then clear from analysis DB
-            self.analysis_cursor.execute("DELETE FROM alerts")
+            # Use dedicated cursor for analysis DB
+            analysis_cursor = self.analysis_conn.cursor()
+            analysis_cursor.execute("DELETE FROM alerts")
             self.analysis_conn.commit()
+            analysis_cursor.close()
             
             return True
         except Exception as e:

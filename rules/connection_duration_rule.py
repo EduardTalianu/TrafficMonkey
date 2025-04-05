@@ -18,8 +18,8 @@ class ConnectionDurationRule(Rule):
         # Local list for returning alerts to UI immediately
         alerts = []
         
-        # Clear previous alerts to queue
-        self.alerts_to_queue = []
+        # List for storing alerts to be queued after analysis is complete
+        pending_alerts = []
         
         current_time = time.time()
         
@@ -47,7 +47,7 @@ class ConnectionDurationRule(Rule):
                 # SQLite datetime string format
                 duration_query = """
                     SELECT connection_key, src_ip, dst_ip, src_port, dst_port, total_bytes,
-                           julianday('now') - julianday(timestamp) as duration_days
+                        julianday('now') - julianday(timestamp) as duration_days
                     FROM connections
                     WHERE total_bytes > ?
                     AND julianday('now') - julianday(timestamp) > ?
@@ -58,7 +58,7 @@ class ConnectionDurationRule(Rule):
                 # Numeric timestamp (likely timestamp format)
                 duration_query = """
                     SELECT connection_key, src_ip, dst_ip, src_port, dst_port, total_bytes,
-                           (strftime('%s', 'now') - timestamp) / 60 as duration_minutes
+                        (strftime('%s', 'now') - timestamp) / 60 as duration_minutes
                     FROM connections
                     WHERE total_bytes > ?
                     AND (strftime('%s', 'now') - timestamp) / 60 > ?
@@ -110,8 +110,8 @@ class ConnectionDurationRule(Rule):
                 # Add to immediate alerts list for UI
                 alerts.append(alert_msg)
                 
-                # Save alert info for later queueing - use the destination as the alert target
-                self.alerts_to_queue.append((dst_ip, alert_msg))
+                # Add to pending alerts list for queueing - use the destination as the alert target
+                pending_alerts.append((dst_ip, alert_msg, self.name))
                 
                 # Add to detected set
                 self.detected_connections.add(connection_key)
@@ -120,6 +120,13 @@ class ConnectionDurationRule(Rule):
                 if len(self.detected_connections) > 1000:
                     # Clear out half the old entries when we hit the limit
                     self.detected_connections = set(list(self.detected_connections)[-500:])
+            
+            # Queue all pending alerts AFTER all database operations are complete
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
             
             return alerts
             
