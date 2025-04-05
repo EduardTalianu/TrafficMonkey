@@ -26,6 +26,7 @@ class ICMPFloodRule(Rule):
     
     def analyze(self, db_cursor):
         alerts = []
+        pending_alerts = []  # List for storing alerts to be queued after analysis
         current_time = time.time()
         
         try:
@@ -61,7 +62,10 @@ class ICMPFloodRule(Rule):
                 alerts.append(alert_msg)
                 self.last_alert_time[src_ip] = current_time
                 
-                # Get ICMP types distribution - store another query
+                # Add to pending alerts for queueing
+                pending_alerts.append((src_ip, alert_msg, self.name))
+                
+                # Get ICMP types distribution
                 db_cursor.execute("""
                     SELECT icmp_type, COUNT(*) as type_count
                     FROM icmp_packets
@@ -79,10 +83,22 @@ class ICMPFloodRule(Rule):
                     type_info = ", ".join([f"Type {t}: {c}" for t, c in icmp_types[:3]])  # Show top 3 types
                     alerts.append(f"  ICMP Type Distribution: {type_info}")
             
+            # Queue all pending alerts AFTER all database operations are complete
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.db_manager.queue_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error queueing alert: {e}")
+            
             return alerts
         except Exception as e:
             error_msg = f"Error in ICMP Flood rule: {str(e)}"
             logging.error(error_msg)
+            # Try to queue the error alert
+            try:
+                self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+            except Exception as e:
+                logging.error(f"Failed to queue error alert: {e}")
             return [error_msg]
     
     def update_param(self, param_name, value):

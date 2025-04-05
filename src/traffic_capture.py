@@ -597,11 +597,14 @@ class TrafficCaptureEngine:
             # Check for ICMP floods using the analysis database and queue system
             def check_icmp_flood():
                 try:
+                    cursor = self.db_manager.get_cursor_for_rules()
                     current_time = time.time()
-                    count = self.db_manager.analysis_cursor.execute("""
+                    count = cursor.execute("""
                         SELECT COUNT(*) FROM icmp_packets 
                         WHERE src_ip = ? AND dst_ip = ? AND timestamp > ?
                     """, (src_ip, dst_ip, current_time - 10)).fetchone()[0]  # Last 10 seconds
+                    
+                    cursor.close()  # Make sure to close the cursor
                     
                     if count > 10:  # Log if more than 10 ICMP packets in 10 seconds
                         self.gui.update_output(f"High ICMP traffic: {src_ip} sent {count} ICMP packets to {dst_ip} in the last 10 seconds")
