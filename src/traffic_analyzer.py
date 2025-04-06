@@ -27,6 +27,9 @@ from traffic_capture import TrafficCaptureEngine
 # Import the database manager
 from database_manager import DatabaseManager
 
+# Import the analysis manager
+from analysis_manager import AnalysisManager
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -556,9 +559,13 @@ class LiveCaptureGUI:
         self.false_positives = self.load_false_positives()
 
         # IMPORTANT: Explicitly create the database manager first
-        # Import the database manager class directly
-        from database_manager import DatabaseManager
         self.db_manager = db_manager
+        
+        # Initialize the analysis manager with the database manager
+        self.analysis_manager = AnalysisManager(self.app_root, self.db_manager)
+        
+        # Link the database manager to the analysis manager for compatibility
+        setattr(self.db_manager, 'analysis_manager', self.analysis_manager)
         
         # Only after db_manager is created, initialize the capture engine
         from traffic_capture import TrafficCaptureEngine
@@ -640,6 +647,7 @@ class LiveCaptureGUI:
         
         # Fetch fresh data
         data = query_func(*args, **kwargs)
+        return data
 
     def on_closing(self):
         """Handle application closing"""
@@ -651,6 +659,10 @@ class LiveCaptureGUI:
             # Close database connections
             if hasattr(self, 'db_manager'):
                 self.db_manager.close()
+            
+            # Close analysis manager if it exists
+            if hasattr(self, 'analysis_manager'):
+                self.analysis_manager.close()
                 
             # Destroy the window
             self.master.destroy()
@@ -1001,137 +1013,6 @@ class LiveCaptureGUI:
         else:
             ip_var.set("")
 
-    # Database and UI update methods
-    def setup_database(self):
-        """Set up the database manager"""
-        try:
-            # Create the database manager
-            self.db_manager = DatabaseManager(self.app_root)
-            
-            logger.info("Database manager initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Database setup error: {e}")
-            print(f"Database setup error: {e}")
-            return False
-
-    def clear_alerts(self):
-        """Clear all alerts from the database"""
-        if messagebox.askyesno("Clear Alerts", "Are you sure you want to clear all alerts?"):
-            # Queue the clear operation
-            self.db_manager.queue_query(
-                self.db_manager.clear_alerts,
-                callback=self._after_clear_alerts
-            )
-            
-            # Clear the alerts dictionaries
-            self.capture_engine.alerts_by_ip.clear()
-            
-            self.update_output("Alert clearing operation queued")
-
-    def _after_clear_alerts(self, success):
-        """Callback after clearing alerts"""
-        if success:
-            # Refresh all subtabs after clearing alerts
-            for subtab in self.subtabs:
-                if hasattr(subtab, 'refresh'):
-                    subtab.refresh()
-            
-            self.update_output("All alerts cleared")
-        else:
-            self.update_output("Error clearing alerts")
-
-    def _get_malicious_ip_data(self):
-        """Get data for malicious IP display with improved duplicate handling"""
-        try:
-            # Create a dedicated cursor for this operation
-            cursor = self.db_manager.analysis_conn.cursor()
-            
-            # Get all alerts (not just ones with "Malicious" in the message)
-            query = """
-                SELECT ip_address, alert_message, rule_name, timestamp
-                FROM alerts
-                ORDER BY timestamp DESC
-            """
-            
-            rows = cursor.execute(query).fetchall()
-            
-            if not rows:
-                cursor.close()
-                return []
-            
-            # Get local machine's IP addresses to exclude
-            local_ips = self.get_local_ips()
-            if local_ips is None:
-                local_ips = set(['127.0.0.1', 'localhost'])
-            
-            # Use a dictionary to store results by IP to prevent duplicates
-            result_dict = {}
-            
-            # Process each IP from alerts
-            for row in rows:
-                ip = row[0]
-                alert = row[1]
-                rule = row[2]
-                timestamp = row[3]
-                
-                # Skip local IPs
-                if ip in local_ips:
-                    continue
-                
-                # Skip if we've already added this IP with the same rule (prevents duplicates)
-                dict_key = f"{ip}:{rule}"
-                if dict_key in result_dict:
-                    continue
-                
-                # Determine alert type from the rule name
-                if "VirusTotal" in rule:
-                    alert_type = "VirusTotal"
-                else:
-                    alert_type = rule
-                
-                # Determine status
-                status = "False Positive" if ip in self.false_positives else "Active"
-                
-                # Add to results dictionary
-                result_dict[dict_key] = (ip, alert_type, status, timestamp)
-                
-                # Extract any additional IPs from the alert message
-                additional_ips = self.extract_ips_from_message(alert)
-                if additional_ips:
-                    for add_ip in additional_ips:
-                        # Skip local IPs
-                        if add_ip in local_ips:
-                            continue
-                        
-                        # Skip if already added with same rule
-                        add_dict_key = f"{add_ip}:{rule}"
-                        if add_dict_key in result_dict:
-                            continue
-                        
-                        # Add to results with related alert info
-                        add_status = "False Positive" if add_ip in self.false_positives else "Active"
-                        result_dict[add_dict_key] = (add_ip, alert_type, add_status, timestamp)
-            
-            # Convert dictionary to list
-            result_data = list(result_dict.values())
-            
-            # Close the dedicated cursor
-            cursor.close()
-            
-            return result_data
-                
-        except Exception as e:
-            logging.error(f"Error getting malicious IPs: {e}")
-            return []
-
-    def extract_ips_from_message(self, message):
-        """Extract all IP addresses from an alert message"""
-        # Regular expression to match IPv4 addresses
-        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
-        return re.findall(ip_pattern, message)
-    
     def get_local_ips(self):
         """Get local machine IP addresses to exclude from alerts"""
         local_ips = set(['127.0.0.1', 'localhost'])
@@ -1144,13 +1025,6 @@ class LiveCaptureGUI:
                 local_ips.update(host_ips)
             except:
                 pass  # Ignore errors in getting IP from hostname
-            
-            # Common local network ranges
-            local_patterns = [
-                r'192\.168\.',
-                r'10\.',
-                r'172\.(1[6-9]|2[0-9]|3[0-1])\.'
-            ]
             
             # Check all interfaces
             if hasattr(self, 'capture_engine') and self.capture_engine:
@@ -1168,73 +1042,11 @@ class LiveCaptureGUI:
                 
         return local_ips
 
-    def _get_ip_rule_details(self, ip_address):
-        """Get rule details for an IP, showing each distinct rule type only once"""
-        try:
-            cursor = self.db_manager.analysis_conn.cursor()
-            
-            query = """
-                SELECT rule_name, COUNT(*) as alert_count, MAX(timestamp) as last_alert
-                FROM alerts
-                WHERE ip_address = ?
-                GROUP BY rule_name
-                ORDER BY last_alert DESC
-            """
-            
-            rows = cursor.execute(query, (ip_address,)).fetchall()
-            cursor.close()
-            return rows
-        except Exception as e:
-            logging.error(f"Error getting rule details for IP {ip_address}: {e}")
-            return []
-
-    def _get_leaderboard_data(self):
-        """Get data for the threat leaderboard with correct rule type counting"""
-        try:
-            cursor = self.db_manager.analysis_conn.cursor()
-            
-            # First, get distinct rule types triggered by each IP
-            query = """
-                SELECT 
-                    ip_address, 
-                    COUNT(DISTINCT rule_name) as distinct_rules,
-                    MAX(timestamp) as last_alert
-                FROM alerts
-                GROUP BY ip_address
-                ORDER BY distinct_rules DESC
-            """
-            
-            rows = cursor.execute(query).fetchall()
-            
-            # Get local machine's IP addresses to exclude
-            local_ips = self.get_local_ips()
-            if local_ips is None:
-                local_ips = set(['127.0.0.1', 'localhost'])
-            
-            # Process results and add total alert count for reference
-            result_data = []
-            for ip, distinct_rules, last_alert in rows:
-                # Skip local IPs
-                if ip in local_ips:
-                    continue
-                
-                # Get total number of alerts for this IP (just for reference)
-                total_alerts = cursor.execute(
-                    "SELECT COUNT(*) FROM alerts WHERE ip_address = ?", 
-                    (ip,)
-                ).fetchone()[0]
-                
-                # Determine status
-                status = "False Positive" if ip in self.false_positives else "Active"
-                
-                # Add to results
-                result_data.append((ip, distinct_rules, total_alerts, status, last_alert))
-            
-            cursor.close()
-            return result_data
-        except Exception as e:
-            logging.error(f"Error getting leaderboard data: {e}")
-            return []
+    def extract_ips_from_message(self, message):
+        """Extract all IP addresses from an alert message"""
+        # Regular expression to match IPv4 addresses
+        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+        return re.findall(ip_pattern, message)
 
     def manage_false_positives(self):
         """Open dialog to manage false positives"""
@@ -1634,6 +1446,32 @@ class LiveCaptureGUI:
                 if self.selected_rule.update_param(param_name, var.get()):
                     self.update_output(f"Updated {param_name} to {var.get()} for {self.selected_rule.name}")
             self.show_rule_details(None)
+
+    def clear_alerts(self):
+        """Clear all alerts from the database"""
+        if messagebox.askyesno("Clear Alerts", "Are you sure you want to clear all alerts?"):
+            # Queue the clear operation
+            self.db_manager.queue_query(
+                self.db_manager.clear_alerts,
+                callback=self._after_clear_alerts
+            )
+            
+            # Clear the alerts dictionaries
+            self.capture_engine.alerts_by_ip.clear()
+            
+            self.update_output("Alert clearing operation queued")
+
+    def _after_clear_alerts(self, success):
+        """Callback after clearing alerts"""
+        if success:
+            # Refresh all subtabs after clearing alerts
+            for subtab in self.subtabs:
+                if hasattr(subtab, 'refresh'):
+                    subtab.refresh()
+            
+            self.update_output("All alerts cleared")
+        else:
+            self.update_output("Error clearing alerts")
 
     @property
     def packet_count(self):

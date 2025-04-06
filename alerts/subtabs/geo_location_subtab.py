@@ -433,10 +433,11 @@ class GeoLocationSubtab(SubtabBase):
             self.update_output("No GeoIP databases loaded. Please load databases first.")
             return
         
-        # Define the function to get IPs from the database using queue system
+        # Define the function to get IPs from the database using analysis_manager
         def get_all_ips():
             try:
-                cursor = gui.db_manager.analysis_conn.cursor()
+                # Use analysis_manager's cursor instead of db_manager
+                cursor = gui.analysis_manager.get_cursor()
                 
                 # List to store all unique IP addresses with counts
                 ip_data = {}
@@ -651,10 +652,10 @@ class GeoLocationSubtab(SubtabBase):
             finally:
                 cursor.close()
         
-        # Queue the database query
-        gui.db_manager.queue_query(
+        # Queue the database query using analysis_manager
+        gui.analysis_manager.queue_query(
             get_all_ips,
-            callback=self._process_geo_data
+            self._process_geo_data
         )
         
         filter_status = []
@@ -750,9 +751,18 @@ class GeoLocationSubtab(SubtabBase):
         # Get detailed location information
         location = self.get_ip_location(ip)
         
-        # Add IP alerts count information
-        def get_ip_alert_count():
-            cursor = gui.db_manager.analysis_conn.cursor()
+        # Add IP alerts count information - using analysis_manager
+        gui.analysis_manager.queue_query(
+            lambda: self._get_ip_alert_count(ip),
+            lambda result: self._update_location_details(ip, location, result)
+        )
+    
+    def _get_ip_alert_count(self, ip):
+        """Get alert count for an IP from analysis_1.db"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            
+            # Get alert count
             count = cursor.execute(
                 "SELECT COUNT(*) FROM alerts WHERE ip_address = ?", 
                 (ip,)
@@ -770,21 +780,26 @@ class GeoLocationSubtab(SubtabBase):
             if isinstance(last_seen, (int, float)):
                 last_seen = datetime.fromtimestamp(float(last_seen)).strftime('%Y-%m-%d %H:%M:%S')
                 
+            cursor.close()
             return count, last_seen
-        
-        # Queue the database query
-        gui.db_manager.queue_query(
-            get_ip_alert_count,
-            callback=lambda result: self._update_location_details(ip, location, result)
-        )
+        except Exception as e:
+            gui.update_output(f"Error getting alert count: {e}")
+            return 0, "Error"
     
     def _update_location_details(self, ip, location, alert_info):
         """Update the location details with alert and connection information"""
         alert_count, last_seen = alert_info
         
-        # Get connection count information
-        def get_ip_connection_data():
-            cursor = gui.db_manager.analysis_conn.cursor()
+        # Get connection count information using analysis_manager
+        gui.analysis_manager.queue_query(
+            lambda: self._get_ip_connection_data(ip),
+            lambda result: self._update_connection_details(ip, location, alert_info, result)
+        )
+    
+    def _get_ip_connection_data(self, ip):
+        """Get connection data for an IP from analysis_1.db"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
             
             # Source connections
             src_count = cursor.execute(
@@ -810,13 +825,11 @@ class GeoLocationSubtab(SubtabBase):
                 (f"{ip}:%->%", f"%->%:{ip}")
             ).fetchone()[0]
             
+            cursor.close()
             return src_count, dst_count, dns_count, tls_count
-        
-        # Queue the database query for connection data
-        gui.db_manager.queue_query(
-            get_ip_connection_data,
-            callback=lambda result: self._update_connection_details(ip, location, alert_info, result)
-        )
+        except Exception as e:
+            gui.update_output(f"Error getting connection data: {e}")
+            return 0, 0, 0, 0
 
     def _update_connection_details(self, ip, location, alert_info, connection_data):
         """Update the details with connection information"""
@@ -862,23 +875,31 @@ class GeoLocationSubtab(SubtabBase):
         gui.tree_manager.populate_tree(self.geo_details_tree, details)
         
         # Queue query to get alert types for this IP
-        def get_ip_alert_types():
-            cursor = gui.db_manager.analysis_conn.cursor()
-            return cursor.execute("""
+        gui.analysis_manager.queue_query(
+            lambda: self._get_ip_alert_types(ip),
+            self._add_alert_type_details
+        )
+        
+        self.update_output(f"Showing location details for IP: {ip}")
+    
+    def _get_ip_alert_types(self, ip):
+        """Get alert types for an IP from analysis_1.db"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            
+            rows = cursor.execute("""
                 SELECT rule_name, COUNT(*) as count
                 FROM alerts
                 WHERE ip_address = ?
                 GROUP BY rule_name
                 ORDER BY count DESC
             """, (ip,)).fetchall()
-        
-        # Queue the query
-        gui.db_manager.queue_query(
-            get_ip_alert_types,
-            callback=lambda rows: self._add_alert_type_details(rows)
-        )
-        
-        self.update_output(f"Showing location details for IP: {ip}")
+            
+            cursor.close()
+            return rows
+        except Exception as e:
+            gui.update_output(f"Error getting alert types: {e}")
+            return []
     
     def _add_alert_type_details(self, rows):
         """Add alert type information to the details display"""

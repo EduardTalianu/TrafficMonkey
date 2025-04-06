@@ -329,8 +329,6 @@ class DatabaseManager:
             return []
         finally:
             cursor.close()
-
-    
     
     def _process_queue(self):
         """Process database query queue in a separate thread"""
@@ -416,17 +414,17 @@ class DatabaseManager:
             logger.error(f"Error updating port scan data: {e}")
             return False
     
-    def add_dns_query(self, src_ip, query_domain, query_type):
-        """Store DNS query information"""
+    def add_dns_query(self, src_ip, query_domain, query_type, response_domain=None, response_type=None):
+        """Store DNS query information with optional response fields"""
         try:
             current_time = time.time()
             # Create a dedicated cursor for this operation
             cursor = self.capture_conn.cursor()
             cursor.execute("""
                 INSERT INTO dns_queries
-                (timestamp, src_ip, query_domain, query_type)
-                VALUES (?, ?, ?, ?)
-            """, (current_time, src_ip, query_domain, query_type))
+                (timestamp, src_ip, query_domain, query_type, response_domain, response_type)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (current_time, src_ip, query_domain, query_type, response_domain, response_type))
             self.capture_conn.commit()
             cursor.close()
             return True
@@ -661,55 +659,6 @@ class DatabaseManager:
             logger.error(f"Failed to parse connection key {connection_key}: {e}")
             return None, None, None, None
 
-    def check_arp_data_tables(self):
-        """Debug helper to check ARP table structure in both databases"""
-        # Check capture DB
-        try:
-            capture_cursor = self.capture_conn.cursor()
-            capture_cursor.execute("PRAGMA table_info(arp_data)")
-            capture_cols = capture_cursor.fetchall()
-            
-            analysis_cursor = self.analysis_conn.cursor()
-            analysis_cursor.execute("PRAGMA table_info(arp_data)")
-            analysis_cols = analysis_cursor.fetchall()
-            
-            logger.info("ARP table structure in capture database:")
-            for col in capture_cols:
-                logger.info(f"  {col[1]}: {col[2]}")
-            
-            logger.info("ARP table structure in analysis database:")
-            for col in analysis_cols:
-                logger.info(f"  {col[1]}: {col[2]}")
-            
-            # Check if table exists in both databases
-            capture_cursor.execute("SELECT COUNT(*) FROM arp_data")
-            capture_count = capture_cursor.fetchone()[0]
-            
-            try:
-                analysis_cursor.execute("SELECT COUNT(*) FROM arp_data")
-                analysis_count = analysis_cursor.fetchone()[0]
-            except sqlite3.OperationalError:
-                analysis_count = "Table doesn't exist"
-            
-            logger.info(f"ARP record count: capture_db={capture_count}, analysis_db={analysis_count}")
-            
-            # Check sample data
-            if capture_count > 0:
-                capture_cursor.execute("SELECT * FROM arp_data LIMIT 1")
-                sample = capture_cursor.fetchone()
-                logger.info(f"Sample ARP record from capture database: {sample}")
-                
-                # Check timestamp type
-                if sample and len(sample) > 1:
-                    logger.info(f"Timestamp type: {type(sample[1]).__name__}")
-            
-            capture_cursor.close()
-            analysis_cursor.close()
-            
-        except Exception as e:
-            logger.error(f"Error checking ARP tables: {e}")
-
-    # Replace the entire sync_databases method with this version to fix the duplication
     def sync_databases(self):
         """Synchronize data from capture DB to analysis DB with improved table detection and creation"""
         try:
@@ -843,12 +792,6 @@ class DatabaseManager:
                     except Exception as e:
                         logger.error(f"Error syncing table {table_name}: {e}")
                 
-                # After all syncing is done, perform DNS resolution for TLS connections
-                resolved = self.resolve_domain_names(sync_analysis_cursor)
-                if resolved > 0:
-                    logger.info(f"Resolved {resolved} domain names")
-                    sync_count += resolved
-                
                 # Commit the transaction
                 self.analysis_conn.commit()
                 self.last_sync_time = current_time
@@ -860,9 +803,6 @@ class DatabaseManager:
                 if tables_created > 0:
                     logger.info(f"Created {tables_created} missing tables in analysis database")
                 logger.info(f"Synchronized {sync_count} records between databases")
-                
-                # Run ARP table check after sync
-                self.check_arp_data_tables()
                 
                 return sync_count
                     
@@ -876,405 +816,7 @@ class DatabaseManager:
             import traceback
             traceback.print_exc()
             return 0
-    
 
-    # Query methods for HTTP and TLS data
-    def get_http_requests_by_host(self, host_filter=None, limit=100):
-        """Get HTTP requests filtered by host pattern with improved error handling"""
-        try:
-            cursor = self.analysis_conn.cursor()
-            
-            # First check if we have any HTTP requests (for debugging)
-            count = cursor.execute("SELECT COUNT(*) FROM http_requests").fetchone()[0]
-            logger.info(f"Total HTTP requests in database: {count}")
-            
-            if count == 0:
-                cursor.close()
-                return []
-            
-            if host_filter:
-                filter_pattern = f"%{host_filter}%"
-                cursor.execute("""
-                    SELECT r.id, r.method, r.host, r.uri, r.user_agent, r.timestamp, 
-                        resp.status_code, resp.content_type
-                    FROM http_requests r
-                    LEFT JOIN http_responses resp ON r.id = resp.http_request_id
-                    WHERE r.host LIKE ?
-                    ORDER BY r.timestamp DESC
-                    LIMIT ?
-                """, (filter_pattern, limit))
-            else:
-                cursor.execute("""
-                    SELECT r.id, r.method, r.host, r.uri, r.user_agent, r.timestamp, 
-                        resp.status_code, resp.content_type
-                    FROM http_requests r
-                    LEFT JOIN http_responses resp ON r.id = resp.http_request_id
-                    ORDER BY r.timestamp DESC
-                    LIMIT ?
-                """, (limit,))
-            
-            # Process results safely
-            results = []
-            for row in cursor.fetchall():
-                try:
-                    # Make sure we have a complete row
-                    if len(row) < 8:
-                        continue
-                    
-                    # Format timestamps consistently
-                    timestamp = row[5]
-                    if isinstance(timestamp, (int, float)):
-                        formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
-                    else:
-                        formatted_time = timestamp
-                    
-                    # Create a new row with the formatted timestamp
-                    new_row = list(row)
-                    new_row[5] = formatted_time
-                    
-                    results.append(tuple(new_row))
-                except Exception as e:
-                    logger.error(f"Error processing HTTP request row: {e}")
-            
-            cursor.close()
-            return results
-        except Exception as e:
-            logger.error(f"Error retrieving HTTP requests: {e}")
-            return []
-
-
-    def get_tls_connections(self, filter_pattern=None, limit=100):
-        """Get TLS connections with optional filtering and improved error handling"""
-        try:
-            cursor = self.analysis_conn.cursor()
-            
-            # First check if we have any TLS connections at all (for debugging)
-            count = cursor.execute("SELECT COUNT(*) FROM tls_connections").fetchone()[0]
-            logger.info(f"Total TLS connections in database: {count}")
-            
-            if count == 0:
-                cursor.close()
-                return []
-            
-            # Try the query with modified JOIN logic that's more tolerant
-            if filter_pattern:
-                pattern = f"%{filter_pattern}%"
-                query = """
-                    SELECT t.server_name, t.tls_version, t.cipher_suite, t.ja3_fingerprint,
-                        c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp,
-                        t.connection_key
-                    FROM tls_connections t
-                    LEFT JOIN connections c ON t.connection_key = c.connection_key
-                    WHERE (t.server_name LIKE ? OR t.ja3_fingerprint LIKE ?)
-                    ORDER BY t.timestamp DESC
-                    LIMIT ?
-                """
-                cursor.execute(query, (pattern, pattern, limit))
-            else:
-                query = """
-                    SELECT t.server_name, t.tls_version, t.cipher_suite, t.ja3_fingerprint,
-                        c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp,
-                        t.connection_key
-                    FROM tls_connections t
-                    LEFT JOIN connections c ON t.connection_key = c.connection_key
-                    ORDER BY t.timestamp DESC
-                    LIMIT ?
-                """
-                cursor.execute(query, (limit,))
-            
-            rows = cursor.fetchall()
-            
-            # Process results to handle possible NULL values from LEFT JOIN
-            results = []
-            for row in rows:
-                try:
-                    # Extract values with safety
-                    server_name = row[0] if row[0] is not None else "Unknown"
-                    tls_version = row[1] if row[1] is not None else "Unknown"
-                    cipher_suite = row[2] if row[2] is not None else "Unknown"
-                    ja3_fp = row[3] if row[3] is not None else "N/A"
-                    src_ip = row[4]
-                    dst_ip = row[5]
-                    src_port = row[6]
-                    dst_port = row[7]
-                    timestamp = row[8]
-                    conn_key = row[9]
-                    
-                    # If the JOIN failed (connection record not found), extract IPs from connection_key
-                    if src_ip is None or dst_ip is None:
-                        try:
-                            # Try to parse connection key in format "src_ip:src_port->dst_ip:dst_port"
-                            parts = conn_key.split('->')
-                            if len(parts) == 2:
-                                src_part = parts[0].split(':')
-                                dst_part = parts[1].split(':')
-                                if len(src_part) == 2 and len(dst_part) == 2:
-                                    src_ip = src_part[0]
-                                    try:
-                                        src_port = int(src_part[1])
-                                    except ValueError:
-                                        src_port = 0
-                                    dst_ip = dst_part[0]
-                                    try:
-                                        dst_port = int(dst_part[1])
-                                    except ValueError:
-                                        dst_port = 0
-                        except Exception:
-                            # If parsing fails, use placeholders
-                            src_ip = src_ip or "Unknown"
-                            dst_ip = dst_ip or "Unknown"
-                            src_port = src_port or 0
-                            dst_port = dst_port or 0
-                    
-                    # Create a new result tuple with guaranteed non-NULL values
-                    result = (
-                        server_name,
-                        tls_version,
-                        cipher_suite,
-                        ja3_fp,
-                        src_ip or "Unknown",
-                        dst_ip or "Unknown",
-                        src_port or 0,
-                        dst_port or 0,
-                        timestamp
-                    )
-                    results.append(result)
-                except Exception as e:
-                    logger.error(f"Error processing TLS connection row: {e}")
-            
-            cursor.close()
-            return results
-        except Exception as e:
-            logger.error(f"Error retrieving TLS connections: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
-
-    def check_tls_tables(self):
-        """Check TLS tables and log status for debugging"""
-        try:
-            cursor = self.analysis_conn.cursor()
-            
-            # Check connections table
-            conn_count = cursor.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
-            logger.info(f"Total connections: {conn_count}")
-            
-            # Check TLS connections table
-            tls_count = cursor.execute("SELECT COUNT(*) FROM tls_connections").fetchone()[0]
-            logger.info(f"Total TLS connections: {tls_count}")
-            
-            # Check HTTPS connections specifically
-            https_count = cursor.execute(
-                "SELECT COUNT(*) FROM connections WHERE dst_port = 443"
-            ).fetchone()[0]
-            logger.info(f"HTTPS connections (port 443): {https_count}")
-            
-            # Check for successful joins
-            join_count = cursor.execute("""
-                SELECT COUNT(*) FROM tls_connections t
-                JOIN connections c ON t.connection_key = c.connection_key
-            """).fetchone()[0]
-            logger.info(f"Successful TLS-connections joins: {join_count}")
-            
-            # Sample TLS connection keys
-            cursor.execute("SELECT connection_key FROM tls_connections LIMIT 5")
-            tls_keys = [row[0] for row in cursor.fetchall()]
-            logger.info(f"Sample TLS connection keys: {tls_keys}")
-            
-            # Sample connection keys
-            cursor.execute("SELECT connection_key FROM connections LIMIT 5")
-            conn_keys = [row[0] for row in cursor.fetchall()]
-            logger.info(f"Sample connection keys: {conn_keys}")
-            
-            # Check last sync time
-            last_sync = getattr(self, 'last_sync_time', 0)
-            current_time = time.time()
-            time_since_sync = current_time - last_sync
-            logger.info(f"Time since last database sync: {time_since_sync:.1f} seconds")
-            
-            cursor.close()
-            return {
-                "connections": conn_count,
-                "https_connections": https_count,
-                "tls_connections": tls_count,
-                "successful_joins": join_count,
-                "tls_keys": tls_keys,
-                "conn_keys": conn_keys,
-                "time_since_sync": time_since_sync
-            }
-        except Exception as e:
-            logger.error(f"Error checking TLS tables: {e}")
-            return None
-
-    def get_suspicious_tls_connections(self):
-        """Get potentially suspicious TLS connections based on version and cipher suite with improved error handling"""
-        try:
-            cursor = self.analysis_conn.cursor()
-            
-            # Check if we have any TLS connections first
-            count = cursor.execute("SELECT COUNT(*) FROM tls_connections").fetchone()[0]
-            if count == 0:
-                cursor.close()
-                return []
-            
-            # Query for old TLS versions and weak ciphers using LEFT JOIN for better compatibility
-            cursor.execute("""
-                SELECT t.server_name, t.tls_version, t.cipher_suite, t.ja3_fingerprint,
-                    c.src_ip, c.dst_ip, t.timestamp
-                FROM tls_connections t
-                LEFT JOIN connections c ON t.connection_key = c.connection_key
-                WHERE t.tls_version IN ('SSLv3', 'TLSv1.0', 'TLSv1.1')
-                OR t.cipher_suite LIKE '%NULL%'
-                OR t.cipher_suite LIKE '%EXPORT%'
-                OR t.cipher_suite LIKE '%DES%'
-                OR t.cipher_suite LIKE '%RC4%'
-                OR t.cipher_suite LIKE '%MD5%'
-                ORDER BY t.timestamp DESC
-            """)
-            
-            # Process results safely
-            results = []
-            for row in cursor.fetchall():
-                try:
-                    # Handle potential NULL values from LEFT JOIN
-                    server_name = row[0] if row[0] else "Unknown"
-                    tls_version = row[1] if row[1] else "Unknown"
-                    cipher_suite = row[2] if row[2] else "Unknown"
-                    ja3_fp = row[3] if row[3] else "N/A"
-                    
-                    # Extract source and destination IPs from connection key if needed
-                    src_ip = row[4]
-                    dst_ip = row[5]
-                    timestamp = row[6]
-                    
-                    if src_ip is None or dst_ip is None:
-                        # If the connection lookup failed, try to extract from the connection_key
-                        connection_key = cursor.execute(
-                            "SELECT connection_key FROM tls_connections WHERE server_name = ? AND tls_version = ? AND timestamp = ?",
-                            (server_name, tls_version, timestamp)
-                        ).fetchone()
-                        
-                        if connection_key and '->' in connection_key[0]:
-                            parts = connection_key[0].split('->')
-                            src_part = parts[0].split(':')[0] if ':' in parts[0] else parts[0]
-                            dst_part = parts[1].split(':')[0] if ':' in parts[1] else parts[1]
-                            src_ip = src_part
-                            dst_ip = dst_part
-                    
-                    # Create result with non-NULL values
-                    result = (
-                        server_name,
-                        tls_version,
-                        cipher_suite,
-                        ja3_fp,
-                        src_ip or "Unknown",
-                        dst_ip or "Unknown",
-                        timestamp
-                    )
-                    results.append(result)
-                except Exception as e:
-                    logger.error(f"Error processing suspicious TLS connection: {e}")
-            
-            cursor.close()
-            return results
-        except Exception as e:
-            logger.error(f"Error retrieving suspicious TLS connections: {e}")
-            return []
-    
-    def commit_capture(self):
-        """Commit changes to the capture database"""
-        try:
-            self.capture_conn.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Error committing to capture DB: {e}")
-            return False
-    
-    def get_cursor_for_rules(self):
-        """Get a dedicated cursor to the analysis database for rules to use"""
-        return self.analysis_conn.cursor()
-    
-    def update_connection_field(self, connection_key, field, value):
-        """Update a specific field in the connections table (used by rules) with improved error handling"""
-        try:
-            with self.transaction(self.capture_conn) as cursor:
-                cursor.execute(
-                    f"UPDATE connections SET {field} = ? WHERE connection_key = ?",
-                    (value, connection_key)
-                )
-                return True
-        except Exception as e:
-            # Distinguish between real errors and "not an error" conditions
-            error_msg = str(e).lower()
-            if "not an error" in error_msg or "error return without exception set" in error_msg:
-                # These are often not actual errors but SQLite status messages
-                logger.debug(f"Non-critical SQLite message: {e}")
-                return True
-            logger.error(f"Error updating connection field: {e}")
-            return False
-        
-    def check_connection_health(self):
-        """Check database connections health and reconnect if needed"""
-        try:
-            # Check capture database connection
-            if not self._ensure_connection_valid(self.capture_conn):
-                logger.warning("Capture database connection was reset")
-            
-            # Check analysis database connection
-            if not self._ensure_connection_valid(self.analysis_conn):
-                logger.warning("Analysis database connection was reset")
-                
-            # Schedule periodic health checks (every 5 minutes)
-            if self.queue_running:
-                threading.Timer(300, self.check_connection_health).start()
-                
-            return True
-        except Exception as e:
-            logger.error(f"Error in connection health check: {e}")
-            return False
-
-    def _ensure_connection_valid(self, conn):
-        """Ensure the database connection is valid and reconnect if needed"""
-        try:
-            # Try a simple query to check connection
-            conn.execute("SELECT 1").fetchone()
-            return True
-        except Exception:
-            try:
-                # Try to recreate the connection
-                if conn == self.capture_conn:
-                    old_conn = self.capture_conn
-                    # Create new connection
-                    self.capture_conn = sqlite3.connect(self.capture_db_path, check_same_thread=False)
-                    self.capture_conn.execute("PRAGMA journal_mode=WAL")
-                    self.capture_conn.execute("PRAGMA synchronous=NORMAL")
-                    # Close old connection if possible
-                    try:
-                        old_conn.close()
-                    except:
-                        pass
-                    return True
-                elif conn == self.analysis_conn:
-                    old_conn = self.analysis_conn
-                    # Create new connection
-                    self.analysis_conn = sqlite3.connect(self.analysis_db_path, check_same_thread=False)
-                    self.analysis_conn.execute("PRAGMA journal_mode=WAL")
-                    self.analysis_conn.execute("PRAGMA synchronous=NORMAL")
-                    self.analysis_conn.execute("PRAGMA cache_size=10000")
-                    # Close old connection if possible
-                    try:
-                        old_conn.close()
-                    except:
-                        pass
-                    return True
-            except Exception as e:
-                logger.error(f"Failed to reconnect to database: {e}")
-                return False
-                
-        return False
-    
-    # Analysis DB read methods - these will be used as query functions
-    
     def get_database_stats(self):
         """Get database statistics from analysis DB using a dedicated cursor"""
         try:
@@ -1498,6 +1040,98 @@ class DatabaseManager:
             logger.error(f"Error clearing alerts: {e}")
             return False
     
+    def commit_capture(self):
+        """Commit changes to the capture database"""
+        try:
+            self.capture_conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error committing to capture DB: {e}")
+            return False
+    
+    def get_cursor_for_rules(self):
+        """Get a dedicated cursor to the analysis database for rules to use"""
+        return self.analysis_conn.cursor()
+    
+    def update_connection_field(self, connection_key, field, value):
+        """Update a specific field in the connections table (used by rules) with improved error handling"""
+        try:
+            with self.transaction(self.capture_conn) as cursor:
+                cursor.execute(
+                    f"UPDATE connections SET {field} = ? WHERE connection_key = ?",
+                    (value, connection_key)
+                )
+                return True
+        except Exception as e:
+            # Distinguish between real errors and "not an error" conditions
+            error_msg = str(e).lower()
+            if "not an error" in error_msg or "error return without exception set" in error_msg:
+                # These are often not actual errors but SQLite status messages
+                logger.debug(f"Non-critical SQLite message: {e}")
+                return True
+            logger.error(f"Error updating connection field: {e}")
+            return False
+        
+    def check_connection_health(self):
+        """Check database connections health and reconnect if needed"""
+        try:
+            # Check capture database connection
+            if not self._ensure_connection_valid(self.capture_conn):
+                logger.warning("Capture database connection was reset")
+            
+            # Check analysis database connection
+            if not self._ensure_connection_valid(self.analysis_conn):
+                logger.warning("Analysis database connection was reset")
+                
+            # Schedule periodic health checks (every 5 minutes)
+            if self.queue_running:
+                threading.Timer(300, self.check_connection_health).start()
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error in connection health check: {e}")
+            return False
+
+    def _ensure_connection_valid(self, conn):
+        """Ensure the database connection is valid and reconnect if needed"""
+        try:
+            # Try a simple query to check connection
+            conn.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            try:
+                # Try to recreate the connection
+                if conn == self.capture_conn:
+                    old_conn = self.capture_conn
+                    # Create new connection
+                    self.capture_conn = sqlite3.connect(self.capture_db_path, check_same_thread=False)
+                    self.capture_conn.execute("PRAGMA journal_mode=WAL")
+                    self.capture_conn.execute("PRAGMA synchronous=NORMAL")
+                    # Close old connection if possible
+                    try:
+                        old_conn.close()
+                    except:
+                        pass
+                    return True
+                elif conn == self.analysis_conn:
+                    old_conn = self.analysis_conn
+                    # Create new connection
+                    self.analysis_conn = sqlite3.connect(self.analysis_db_path, check_same_thread=False)
+                    self.analysis_conn.execute("PRAGMA journal_mode=WAL")
+                    self.analysis_conn.execute("PRAGMA synchronous=NORMAL")
+                    self.analysis_conn.execute("PRAGMA cache_size=10000")
+                    # Close old connection if possible
+                    try:
+                        old_conn.close()
+                    except:
+                        pass
+                    return True
+            except Exception as e:
+                logger.error(f"Failed to reconnect to database: {e}")
+                return False
+                
+        return False
+    
     def close(self):
         """Close all database connections and stop all threads"""
         try:
@@ -1522,103 +1156,9 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error closing database connections: {e}")
     
-    def resolve_domain_names(self, db_cursor):
-        """Add this method to DatabaseManager to resolve IP addresses to hostnames"""
-        import socket
-        
-        try:
-            # Get all TLS connections with server names that look like IP addresses
-            db_cursor.execute("""
-                SELECT id, server_name, connection_key
-                FROM tls_connections
-                WHERE server_name LIKE '%\\.%\\.%\\.%' 
-                OR server_name IS NULL
-                LIMIT 100
-            """)
-            
-            rows = db_cursor.fetchall()
-            updates = 0
-            
-            for row in rows:
-                tls_id, server_name, connection_key = row
-                
-                # Extract destination IP from connection key
-                try:
-                    dst_ip = connection_key.split('->')[1].split(':')[0]
-                except IndexError:
-                    continue
-                    
-                # Skip if we already have a non-IP server name
-                if server_name and not self._is_ip_address(server_name):
-                    continue
-                    
-                # Try reverse DNS lookup
-                try:
-                    hostname, _, _ = socket.gethostbyaddr(dst_ip)
-                    if hostname and hostname != dst_ip and not self._is_ip_address(hostname):
-                        # Update the server name in the database
-                        db_cursor.execute("""
-                            UPDATE tls_connections
-                            SET server_name = ?
-                            WHERE id = ?
-                        """, (hostname, tls_id))
-                        
-                        updates += 1
-                        logger.info(f"Resolved {dst_ip} to {hostname}")
-                except (socket.herror, socket.gaierror):
-                    # If reverse lookup fails, that's okay
-                    pass
-                    
-            if updates > 0:
-                logger.info(f"Resolved {updates} domain names for TLS connections")
-            
-            return updates
-            
-        except Exception as e:
-            logger.error(f"Error in resolve_domain_names: {e}")
-            return 0
-            
-    def _is_ip_address(self, value):
-        """Check if a string is an IP address"""
-        if not value:
-            return False
-            
-        # Simple IPv4 check
-        parts = value.split('.')
-        if len(parts) != 4:
-            return False
-            
-        try:
-            return all(0 <= int(p) <= 255 for p in parts)
-        except ValueError:
-            return False
-        
     def transaction(self, connection):
         """Return a transaction context manager for the given connection"""
         return TransactionContext(connection)
-
-    def _ensure_connection_valid(self, conn):
-        """Ensure the database connection is valid"""
-        try:
-            conn.execute("SELECT 1")
-            return True
-        except Exception:
-            try:
-                # Try to recreate the connection if needed
-                if conn == self.capture_conn:
-                    self.capture_conn = sqlite3.connect(self.capture_db_path, check_same_thread=False)
-                    self.capture_conn.execute("PRAGMA journal_mode=WAL")
-                    self.capture_conn.execute("PRAGMA synchronous=NORMAL")
-                    return True
-                elif conn == self.analysis_conn:
-                    self.analysis_conn = sqlite3.connect(self.analysis_db_path, check_same_thread=False)
-                    self.analysis_conn.execute("PRAGMA journal_mode=WAL")
-                    self.analysis_conn.execute("PRAGMA synchronous=NORMAL")
-                    self.analysis_conn.execute("PRAGMA cache_size=10000")
-                    return True
-            except Exception as e:
-                logger.error(f"Failed to reconnect to database: {e}")
-                return False
             
 class TransactionContext:
     """Enhanced context manager for database transactions with better error handling"""

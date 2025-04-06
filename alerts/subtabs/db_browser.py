@@ -16,7 +16,7 @@ class DatabaseBrowserSubtab(SubtabBase):
         self.results_tree = None
         self.query_text = None
         self.table_var = tk.StringVar()
-        self.db_var = tk.StringVar(value="analysis")
+        self.db_var = tk.StringVar(value="analysis_1")  # Updated default to analysis_1
         self.limit_var = tk.StringVar(value="100")
         self.status_var = tk.StringVar(value="Ready")
         self.column_names = []
@@ -50,7 +50,7 @@ class DatabaseBrowserSubtab(SubtabBase):
         # Database selection
         ttk.Label(control_frame, text="Database:").pack(side="left", padx=5)
         db_combobox = ttk.Combobox(control_frame, textvariable=self.db_var, 
-                                  values=["capture", "analysis"], width=10, state="readonly")
+                                  values=["capture", "analysis", "analysis_1"], width=10, state="readonly")
         db_combobox.pack(side="left", padx=5)
         db_combobox.bind("<<ComboboxSelected>>", lambda e: self.refresh_tables())
         
@@ -102,7 +102,7 @@ class DatabaseBrowserSubtab(SubtabBase):
         
         ttk.Label(db_frame, text="Database:").pack(side="left", padx=5)
         query_db_combobox = ttk.Combobox(db_frame, textvariable=self.db_var, 
-                                        values=["capture", "analysis"], width=10, state="readonly")
+                                        values=["capture", "analysis", "analysis_1"], width=10, state="readonly")
         query_db_combobox.pack(side="left", padx=5)
         
         ttk.Button(db_frame, text="Run Query", 
@@ -344,7 +344,13 @@ class DatabaseBrowserSubtab(SubtabBase):
         db_type = self.db_var.get()
         if db_type == "capture":
             return self.gui.db_manager.capture_conn
-        else:  # default to analysis
+        elif db_type == "analysis":
+            return self.gui.db_manager.analysis_conn
+        elif db_type == "analysis_1":
+            # Use analysis_manager for analysis_1.db connection
+            return self.gui.analysis_manager.analysis1_conn
+        else:
+            # Default to analysis
             return self.gui.db_manager.analysis_conn
     
     def update_table_info(self, table_name, schema, row_count, limit):

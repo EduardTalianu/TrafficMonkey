@@ -1,4 +1,6 @@
 # SubtabBase class is injected by the Loader
+import time
+import math
 
 class ConnectionGraphSubtab(SubtabBase):
     """Subtab that displays network connections as a visual graph"""
@@ -109,14 +111,33 @@ class ConnectionGraphSubtab(SubtabBase):
         # Clear existing items
         gui.tree_manager.clear_tree(self.connections_tree)
         
-        # Queue the connections query using the database manager
-        gui.db_manager.queue_query(
-            gui.db_manager.get_top_connections,
-            callback=self._update_connections_display,
-            limit=self.max_nodes_var.get()
+        # Queue the connections query using the analysis manager instead of db_manager
+        gui.analysis_manager.queue_query(
+            self._get_top_connections,
+            self._update_connections_display
         )
         
         self.update_output("Connections refresh queued")
+    
+    def _get_top_connections(self):
+        """Get top connections from analysis_1.db"""
+        try:
+            limit = self.max_nodes_var.get()
+            cursor = gui.analysis_manager.get_cursor()
+            
+            cursor.execute("""
+                SELECT src_ip, dst_ip, total_bytes, packet_count, timestamp
+                FROM connections
+                ORDER BY total_bytes DESC
+                LIMIT ?
+            """, (limit,))
+            
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except Exception as e:
+            gui.update_output(f"Error getting top connections: {e}")
+            return []
     
     def _update_connections_display(self, connections):
         """Update the connections display with the results using queue-based DB access"""
@@ -149,10 +170,17 @@ class ConnectionGraphSubtab(SubtabBase):
                 'packet_count': packet_count
             })
         
-        # Define query function to get alert counts
-        def get_alert_counts(connection_data):
+        # Queue the query using analysis_manager
+        gui.analysis_manager.queue_query(
+            lambda: self._get_alert_counts(connection_data),
+            self._display_connections_with_alerts
+        )
+    
+    def _get_alert_counts(self, connection_data):
+        """Get alert counts for connections from analysis_1.db"""
+        try:
             results = []
-            cursor = gui.db_manager.analysis_conn.cursor()
+            cursor = gui.analysis_manager.get_cursor()
             
             # Process each connection
             for conn in connection_data:
@@ -177,14 +205,9 @@ class ConnectionGraphSubtab(SubtabBase):
             
             cursor.close()
             return results
-        
-        # Queue the query with callback
-        gui.db_manager.queue_query(
-            get_alert_counts,
-            callback=self._display_connections_with_alerts,
-            connection_data=connection_data
-        )
-    
+        except Exception as e:
+            gui.update_output(f"Error getting alert counts: {e}")
+            return []
 
     def _display_connections_with_alerts(self, results):
         """Process query results and update the tree display"""
@@ -269,7 +292,6 @@ class ConnectionGraphSubtab(SubtabBase):
             all_ips = list(all_ips)[:max_nodes]
         
         # Position nodes in a circle
-        import math
         angle_step = 2 * math.pi / len(all_ips)
         
         for i, ip in enumerate(all_ips):

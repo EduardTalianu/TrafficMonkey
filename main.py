@@ -72,13 +72,22 @@ def main():
         # Import the database manager first
         from src.database_manager import DatabaseManager
         
-        # Create LiveCaptureGUI with pre-initialized database manager
-        from src.traffic_analyzer import LiveCaptureGUI
-        
         # Create the database manager first
         db_manager = DatabaseManager(app_root)
         
-        # Create the application with pre-initialized manager
+        # Import and initialize the analysis manager in the background
+        # but don't integrate it with the main app yet
+        try:
+            from src.analysis_manager import AnalysisManager
+            analysis_manager = AnalysisManager(app_root, db_manager)
+            logging.info("Analysis manager initialized in parallel mode")
+        except Exception as e:
+            logging.warning(f"Could not initialize analysis manager: {e}")
+        
+        # Create LiveCaptureGUI with pre-initialized database manager
+        from src.traffic_analyzer import LiveCaptureGUI
+        
+        # Create the application with the database manager only (no analysis manager yet)
         app = LiveCaptureGUI(root, db_manager)
         
         # Start the main event loop

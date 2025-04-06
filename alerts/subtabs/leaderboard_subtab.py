@@ -1,4 +1,5 @@
 # SubtabBase class is injected by the Loader
+import time
 
 class LeaderboardSubtab(SubtabBase):
     """Subtab that displays a threat leaderboard"""
@@ -83,22 +84,95 @@ class LeaderboardSubtab(SubtabBase):
         # Clear current items
         gui.tree_manager.clear_tree(self.leaderboard_tree)
         
-        # Queue the leaderboard query
-        gui.db_manager.queue_query(
-            gui._get_leaderboard_data,
-            callback=self._update_leaderboard_display
+        # Queue the leaderboard query using analysis_manager instead of db_manager
+        gui.analysis_manager.queue_query(
+            self._get_leaderboard_data,
+            self._update_leaderboard_display
         )
         
         self.update_output("Refreshing threat leaderboard...")
     
+    def _get_leaderboard_data(self):
+        """Get leaderboard data from analysis_1.db"""
+        try:
+            # Either use the provided method in analysis_manager if it exists
+            if hasattr(gui.analysis_manager, 'get_leaderboard_data'):
+                return gui.analysis_manager.get_leaderboard_data(limit=100)
+            
+            # Or implement the query directly
+            cursor = gui.analysis_manager.get_cursor()
+            
+            # Get IPs with the most distinct rule types triggered
+            cursor.execute("""
+                SELECT 
+                    ip_address, 
+                    COUNT(DISTINCT rule_name) as distinct_rules,
+                    COUNT(*) as total_alerts,
+                    CASE WHEN ip_address IN (
+                        SELECT ip_address FROM alerts 
+                        WHERE timestamp > datetime('now', '-1 hour')
+                    ) THEN 'Active' ELSE 'Inactive' END as status,
+                    MAX(timestamp) as last_alert
+                FROM alerts
+                GROUP BY ip_address
+                ORDER BY distinct_rules DESC, total_alerts DESC
+                LIMIT 100
+            """)
+            
+            results = []
+            for row in cursor.fetchall():
+                # Skip false positives
+                if row[0] in gui.false_positives:
+                    continue
+                
+                # Include all fields including timestamp for sorting
+                results.append(row)
+            
+            cursor.close()
+            return results
+        except Exception as e:
+            gui.update_output(f"Error getting leaderboard data: {e}")
+            return []
+    
     def _update_leaderboard_display(self, data):
         """Update the leaderboard display with the results"""
         try:
-            # Extract just the fields we want to display (excluding timestamp which is used for sorting)
-            display_data = [(row[0], row[1], row[2], row[3]) for row in data]
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                # Handle data from analysis_manager.get_leaderboard_data()
+                display_data = []
+                for item in data:
+                    # Skip false positives
+                    if item["ip_address"] in gui.false_positives:
+                        continue
+                    
+                    # Format timestamp if present
+                    last_alert = item.get("last_alert_time")
+                    if isinstance(last_alert, (int, float)):
+                        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_alert))
+                        # Determine activity status based on numeric timestamp
+                        status = "Active" if time.time() - last_alert < 3600 else "Inactive"
+                    else:
+                        timestamp = str(last_alert) if last_alert else "Unknown"
+                        # Default status if we can't determine activity
+                        status = "Unknown"
+                    
+                    display_data.append((
+                        item["ip_address"],
+                        item["distinct_rule_count"],
+                        item["total_alert_count"],
+                        status
+                    ))
+                
+                # Populate tree using TreeViewManager
+                gui.tree_manager.populate_tree(self.leaderboard_tree, display_data)
+            else:
+                # Handle direct SQL query results
+                # Extract just the fields we want to display (excluding timestamp which is used for sorting)
+                display_data = [(row[0], row[1], row[2], row[3]) for row in data]
+                
+                # Populate tree using TreeViewManager
+                gui.tree_manager.populate_tree(self.leaderboard_tree, display_data)
             
-            # Populate tree using TreeViewManager
-            gui.tree_manager.populate_tree(self.leaderboard_tree, display_data)
             self.update_output(f"Leaderboard updated with {len(data)} IP addresses")
         except Exception as e:
             self.update_output(f"Error updating leaderboard display: {e}")
@@ -116,12 +190,44 @@ class LeaderboardSubtab(SubtabBase):
         ip = self.leaderboard_tree.item(selected[0], "values")[0]
         self.leaderboard_ip_var.set(ip)
         
-        # Queue the query for rule details by IP
-        gui.db_manager.queue_query(
-            gui._get_ip_rule_details,
-            callback=lambda rows: self._update_leaderboard_details_display(rows, ip),
-            ip_address=ip
+        # Queue the query for rule details by IP using analysis_manager
+        gui.analysis_manager.queue_query(
+            lambda: self._get_ip_rule_details(ip),
+            lambda rows: self._update_leaderboard_details_display(rows, ip)
         )
+    
+    def _get_ip_rule_details(self, ip_address):
+        """Get rule details for an IP from analysis_1.db"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            
+            # Get rule statistics for this IP
+            cursor.execute("""
+                SELECT 
+                    rule_name,
+                    COUNT(*) as alert_count,
+                    MAX(timestamp) as last_alert
+                FROM alerts
+                WHERE ip_address = ?
+                GROUP BY rule_name
+                ORDER BY alert_count DESC, last_alert DESC
+            """, (ip_address,))
+            
+            results = []
+            for rule_name, count, timestamp in cursor.fetchall():
+                # Format timestamp
+                if isinstance(timestamp, (int, float)):
+                    formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+                else:
+                    formatted_time = str(timestamp)
+                
+                results.append((rule_name, count, formatted_time))
+            
+            cursor.close()
+            return results
+        except Exception as e:
+            gui.update_output(f"Error getting rule details for IP {ip_address}: {e}")
+            return []
     
     def _update_leaderboard_details_display(self, rows, ip):
         """Update the leaderboard details display with rule information"""

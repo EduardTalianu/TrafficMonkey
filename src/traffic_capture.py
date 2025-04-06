@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger('traffic_capture')
 
 class TrafficCaptureEngine:
-    """Handles traffic capture and processing logic"""
+    """Handles traffic capture and basic protocol information extraction"""
     
     def __init__(self, gui):
         """Initialize the traffic capture engine"""
@@ -32,6 +32,9 @@ class TrafficCaptureEngine:
         
         # Use the database manager from the GUI
         self.db_manager = gui.db_manager
+        
+        # Reference to analysis manager (for advanced analysis)
+        self.analysis_manager = getattr(gui, 'analysis_manager', None)
         
         # Create logs directory if it doesn't exist
         self.logs_dir = os.path.join(gui.app_root, "logs", "packets")
@@ -220,7 +223,13 @@ class TrafficCaptureEngine:
                                 packet_type = self.determine_packet_type(packet_data)
                                 self.save_packet_sample(packet_data, packet_type)
                                 
-                            self.process_packet_ek(packet_data)
+                            # Process packet with simplified protocol handling (store basic data)
+                            processed = self.process_packet_ek(packet_data)
+                            
+                            # Forward packet to analysis_manager for advanced analysis
+                            if processed and self.analysis_manager:
+                                self.analysis_manager.receive_packet_data(packet_data)
+                                
                             self.packet_count += 1
                             self.packet_batch_count += 1
                         except json.JSONDecodeError as e:
@@ -283,6 +292,8 @@ class TrafficCaptureEngine:
             return "tcp"
         elif "udp_srcport" in layers:
             return "udp"
+        elif "arp_src_proto_ipv4" in layers or "arp_dst_proto_ipv4" in layers:
+            return "arp"
         
         return "unknown"
     
@@ -388,7 +399,7 @@ class TrafficCaptureEngine:
             
             # Check for ARP data - check if any ARP field is present
             if "arp_src_proto_ipv4" in layers or "arp_dst_proto_ipv4" in layers or "arp_opcode" in layers:
-                # Process ARP packet using dedicated method
+                # Process ARP packet using dedicated method - this stores data in capture.db
                 self._process_arp_packet_ek(layers)
                 # Still continue processing as a normal packet if IP fields are present
 
@@ -435,67 +446,52 @@ class TrafficCaptureEngine:
                     is_rdp = 1
                     self.gui.update_output(f"Detected RDP connection from {src_ip}:{src_port} to {dst_ip}:{dst_port}")
                 
-                # Process specific protocol data if present
-                protocol_detected = False
+                # Process protocol-specific data to store in capture.db
+                # This doesn't do advanced analysis but ensures data is available for analysis_manager
                 
-                # Check for protocol fields using categories - now including ARP
-                for category in ["dns", "http", "tls", "icmp", "arp"]:
-                    fields = capture_fields.get_fields_by_category(category)
-                    layer_names = [f["tshark_field"].replace(".", "_") for f in fields]
-                    
-                    if any(name in layers for name in layer_names):
-                        # Call the appropriate protocol handler
-                        if category == "dns" and self._has_dns_data(layers):
-                            self._process_dns_packet_ek(layers, src_ip, dst_ip)
-                            protocol_detected = True
-                        elif category == "http" and self._has_http_data(layers):
-                            self._process_http_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
-                            protocol_detected = True
-                        elif category == "tls" and self._has_tls_data(layers):
-                            self._process_tls_packet_ek(layers, src_ip, dst_ip, src_port, dst_port)
-                            protocol_detected = True
-                        elif category == "icmp" and "icmp_type" in layers:
-                            self._process_icmp_packet_ek(layers, src_ip, dst_ip)
-                            protocol_detected = True
-                        elif category == "arp" and ("arp_src_proto_ipv4" in layers or "arp_dst_proto_ipv4" in layers):
-                            # ARP is already processed above, but mark as detected
-                            protocol_detected = True
+                # Check for DNS protocol
+                if "dns_qry_name" in layers:
+                    self._store_dns_data(layers, src_ip)
                 
-                # Port scan detection
+                # Check for HTTP protocol
+                if self._has_http_data(layers):
+                    self._store_http_data(layers, src_ip, dst_ip, src_port, dst_port, connection_key)
+                
+                # Check for TLS protocol
+                if self._has_tls_data(layers):
+                    self._store_tls_data(layers, connection_key)
+                
+                # Check for ICMP protocol
+                if "icmp_type" in layers:
+                    self._store_icmp_data(layers, src_ip, dst_ip)
+                
+                # Track ports for port scan detection
                 if dst_port:
-                    self._update_port_scan_data(src_ip, dst_ip, dst_port)
+                    self.db_manager.add_port_scan_data(src_ip, dst_ip, dst_port)
                 
-                # Protocol detection based on ports if not already detected
-                if not protocol_detected:
-                    # Check standard ports
+                # Store basic protocol info based on port
+                if dst_port:
+                    # Store based on common port numbers - simplified detection
                     if dst_port == 80:
                         self.db_manager.add_app_protocol(connection_key, "HTTP", detection_method="port-based")
                     elif dst_port == 443:
                         self.db_manager.add_app_protocol(connection_key, "HTTPS", detection_method="port-based")
                     elif dst_port == 53 or src_port == 53:
                         self.db_manager.add_app_protocol(connection_key, "DNS", detection_method="port-based")
-                    else:
-                        # Try other protocol detection
-                        self._detect_application_protocol(src_ip, dst_ip, src_port, dst_port, layers, 
-                                                        is_tcp=(src_port is not None and "tcp_srcport" in layers))
                 
-                # Use database manager to add packet
+                # Store the basic connection in the database
                 if src_ip and dst_ip:  # Only add if we have both IPs
                     return self.db_manager.add_packet(
                         connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp
                     )
                     
-            return True  # Return True for successful processing, even for ARP-only packets
+            return True  # Return True for successful processing
                     
         except Exception as e:
             self.gui.update_output(f"Error processing packet: {e}")
             import traceback
             traceback.print_exc()
             return False
-    
-    def _has_dns_data(self, layers):
-        """Check if layers contain DNS query data"""
-        return "dns_qry_name" in layers
     
     def _has_http_data(self, layers):
         """Check if layers contain HTTP data"""
@@ -570,104 +566,37 @@ class TrafficCaptureEngine:
                     pass
         return length
 
-    def _update_port_scan_data(self, src_ip, dst_ip, dst_port):
-        """Update port scan detection data"""
-        if not dst_port:
-            return
-            
-        # Use database manager to store port scan data
-        self.db_manager.add_port_scan_data(src_ip, dst_ip, dst_port)
-
-    def _process_dns_packet_ek(self, layers, src_ip, dst_ip):
-        """Extract and store DNS query information from EK format"""
+    def _store_dns_data(self, layers, src_ip):
+        """Extract all DNS data and store to capture.db"""
         try:
-            # Extract query name directly from layers
+            # Extract query name and type
             query_name = self.get_layer_value(layers, "dns_qry_name")
-            
-            # Extract query type
-            query_type_raw = self.get_layer_value(layers, "dns_qry_type")
-            query_type = query_type_raw or "unknown"
-            
-            # If we don't have a query name, can't process this DNS packet
             if not query_name:
                 return False
                 
-            # Store DNS query using database manager
-            self.db_manager.add_dns_query(src_ip, query_name, query_type)
+            query_type = self.get_layer_value(layers, "dns_qry_type") or "unknown"
             
-            # Periodically log DNS activity
-            if random.random() < 0.01:  # Log approximately 1% of DNS queries
-                self.gui.update_output(f"DNS Query: {src_ip} -> {query_name} (Type: {query_type})")
+            # Also extract response data if available
+            resp_name = self.get_layer_value(layers, "dns_resp_name")
+            resp_type = self.get_layer_value(layers, "dns_resp_type")
             
-            return True
-                
+            # Store DNS query in database with response fields if available
+            # We need to modify the database_manager.add_dns_query method to accept these fields
+            return self.db_manager.add_dns_query(
+                src_ip, 
+                query_name, 
+                query_type,
+                resp_name,  # This will need to be added to the method
+                resp_type   # This will need to be added to the method
+            )
         except Exception as e:
-            self.gui.update_output(f"Error processing DNS packet: {e}")
+            self.gui.update_output(f"Error storing DNS data: {e}")
             return False
 
-    def _process_icmp_packet_ek(self, layers, src_ip, dst_ip):
-        """Extract and store ICMP packet information from EK format"""
+    def _store_http_data(self, layers, src_ip, dst_ip, src_port, dst_port, connection_key):
+        """Extract HTTP data and store to capture.db including individual headers"""
         try:
-            # Extract ICMP type directly from layers
-            icmp_type_raw = self.get_layer_value(layers, "icmp_type")
-            
-            # Parse ICMP type
-            icmp_type = 0
-            if icmp_type_raw is not None:
-                try:
-                    icmp_type = int(icmp_type_raw)
-                except (ValueError, TypeError):
-                    icmp_type = 0
-                
-            # Store ICMP packet using database manager
-            self.db_manager.add_icmp_packet(src_ip, dst_ip, icmp_type)
-            
-            # Check for ICMP floods using the analysis database and queue system
-            def check_icmp_flood():
-                try:
-                    cursor = self.db_manager.get_cursor_for_rules()
-                    current_time = time.time()
-                    count = cursor.execute("""
-                        SELECT COUNT(*) FROM icmp_packets 
-                        WHERE src_ip = ? AND dst_ip = ? AND timestamp > ?
-                    """, (src_ip, dst_ip, current_time - 10)).fetchone()[0]  # Last 10 seconds
-                    
-                    cursor.close()  # Make sure to close the cursor
-                    
-                    if count > 10:  # Log if more than 10 ICMP packets in 10 seconds
-                        self.gui.update_output(f"High ICMP traffic: {src_ip} sent {count} ICMP packets to {dst_ip} in the last 10 seconds")
-                except Exception as e:
-                    self.gui.update_output(f"Error checking ICMP flood: {e}")
-            
-            # Queue the ICMP flood check
-            self.db_manager.queue_query(check_icmp_flood)
-            
-            return True
-                
-        except Exception as e:
-            self.gui.update_output(f"Error processing ICMP packet: {e}")
-            return False
-            
-    def add_alert(self, ip_address, alert_message, rule_name):
-        """Add an alert through the database manager's queue"""
-        # Store in in-memory collection first
-        if alert_message not in self.alerts_by_ip[ip_address]:
-            self.alerts_by_ip[ip_address].add(alert_message)
-            
-            # Queue the alert for processing
-            return self.db_manager.queue_alert(ip_address, alert_message, rule_name)
-        return False
-    
-    def _process_http_packet_ek(self, layers, src_ip, dst_ip, src_port, dst_port):
-        """Extract and store HTTP packet information from EK format"""
-        try:
-            # Create connection key
-            connection_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
-            
-            # Record application protocol
-            self.db_manager.add_app_protocol(connection_key, "HTTP", detection_method="direct")
-            
-            # Extract HTTP fields directly from layers
+            # Extract HTTP fields
             method = self.get_layer_value(layers, "http_request_method")
             uri = self.get_layer_value(layers, "http_request_uri")
             host = self.get_layer_value(layers, "http_host")
@@ -687,42 +616,44 @@ class TrafficCaptureEngine:
             
             # Determine if this is a request or response
             is_request = method is not None or uri is not None or host is not None
-            is_response = status_code_raw is not None
             
-            # Process as a request
+            # Store HTTP request if present
+            request_id = None
             if is_request:
-                return self._process_http_request(
-                    connection_key, 
+                # Create headers dictionary
+                headers = {"Host": host or dst_ip}
+                if user_agent:
+                    headers["User-Agent"] = user_agent
+                if content_type:
+                    headers["Content-Type"] = content_type
+                if content_length > 0:
+                    headers["Content-Length"] = str(content_length)
+                    
+                # Convert headers to JSON
+                headers_json = json.dumps(headers)
+                
+                # Store HTTP request
+                request_id = self.db_manager.add_http_request(
+                    connection_key,
                     method or "GET",  # Default method
                     host or dst_ip,   # Use destination IP if host not available
                     uri or "/",       # Default URI
-                    user_agent or "", 
+                    "HTTP/1.1",       # Assumed version
+                    user_agent or "",
+                    "",               # No referer
                     content_type or "",
+                    headers_json,
                     content_length
                 )
-            # Process as a response
-            elif is_response:
-                # Try to find the corresponding request
-                cursor = self.db_manager.get_cursor_for_rules()
-                cursor.execute("""
-                    SELECT id FROM http_requests 
-                    WHERE connection_key = ? 
-                    ORDER BY timestamp DESC LIMIT 1
-                """, (connection_key,))
                 
-                result = cursor.fetchone()
-                cursor.close()
-                
-                if result:
-                    request_id = result[0]
-                    
-                    # Parse status code
-                    status_code = 0
-                    if status_code_raw:
-                        try:
-                            status_code = int(status_code_raw)
-                        except (ValueError, TypeError):
-                            status_code = 0
+                # Store individual headers in http_headers table
+                if request_id:
+                    self.db_manager.add_http_headers(request_id, connection_key, headers_json, is_request=True)
+            
+            # Store HTTP response if present
+            if status_code_raw and request_id:
+                try:
+                    status_code = int(status_code_raw)
                     
                     # Create headers dictionary
                     headers = {}
@@ -732,12 +663,12 @@ class TrafficCaptureEngine:
                         headers["Content-Type"] = content_type
                     if content_length > 0:
                         headers["Content-Length"] = str(content_length)
-                    
+                        
                     # Convert headers to JSON
                     headers_json = json.dumps(headers)
                     
-                    # Store the response
-                    return self.db_manager.add_http_response(
+                    # Store HTTP response
+                    self.db_manager.add_http_response(
                         request_id,
                         status_code,
                         content_type or "",
@@ -745,152 +676,20 @@ class TrafficCaptureEngine:
                         server or "",
                         headers_json
                     )
+                    
+                    # Store individual headers in http_headers table
+                    self.db_manager.add_http_headers(request_id, connection_key, headers_json, is_request=False)
+                except (ValueError, TypeError):
+                    pass
             
-            # If it has host information but doesn't clearly fit request/response pattern
-            if host:
-                # Create minimal request
-                headers = {"Host": host}
-                if user_agent:
-                    headers["User-Agent"] = user_agent
-                
-                headers_json = json.dumps(headers)
-                
-                # Store minimal HTTP request
-                self.db_manager.add_http_request(
-                    connection_key, 
-                    "GET",         # Assumed method
-                    host,
-                    "/",           # Assumed path
-                    "HTTP/1.1",    # Assumed version
-                    user_agent or "",
-                    "",            # No referer
-                    content_type or "",
-                    headers_json,
-                    content_length
-                )
-                return True
-            
-            return False
-            
+            return True
         except Exception as e:
-            self.gui.update_output(f"Error processing HTTP packet: {e}")
-            import traceback
-            traceback.print_exc()
+            self.gui.update_output(f"Error storing HTTP data: {e}")
             return False
-
-    def _process_http_request(self, connection_key, method, host, uri, user_agent, content_type, content_length):
-        """Process HTTP request with simplified field extraction"""
-        try:
-            # Create headers dictionary
-            headers = {"Host": host}
-            
-            if user_agent:
-                headers["User-Agent"] = user_agent
-                
-            if content_type:
-                headers["Content-Type"] = content_type
-                
-            if content_length > 0:
-                headers["Content-Length"] = str(content_length)
-            
-            # Convert headers to JSON
-            headers_json = json.dumps(headers)
-            
-            # Store in database
-            request_id = self.db_manager.add_http_request(
-                connection_key,
-                method,
-                host,
-                uri,
-                "HTTP/1.1",    # Assumed version
-                user_agent or "",
-                "",            # No referer in EK format
-                content_type or "",
-                headers_json,
-                content_length
-            )
-            
-            # Log a small percentage of HTTP requests for monitoring
-            if random.random() < 0.05:  # Log roughly 5% of requests
-                self.gui.update_output(f"HTTP: {method} {host}{uri}")
-            
-            return request_id is not None
-            
-        except Exception as e:
-            self.gui.update_output(f"Error processing HTTP request: {e}")
-            return False
-
-    def _process_tls_packet_ek(self, layers, src_ip, dst_ip, src_port, dst_port):
-        """Extract and store TLS/SSL packet information from EK format"""
-        try:
-            # Create connection key
-            connection_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
-            
-            # Record application protocol
-            self.db_manager.add_app_protocol(connection_key, "TLS/SSL", detection_method="direct")
-            
-            # Extract TLS fields directly from layers
-            tls_version = self.get_layer_value(layers, "tls_handshake_version")
-            cipher_suite = self.get_layer_value(layers, "tls_handshake_ciphersuite")
-            server_name = self.get_layer_value(layers, "tls_handshake_extensions_server_name")
-            
-            # Set default values if needed
-            if not tls_version:
-                if dst_port == 443:
-                    tls_version = "TLSv1.2 (assumed)"
-                else:
-                    tls_version = "Unknown"
-            
-            if not cipher_suite:
-                cipher_suite = "Unknown"
-            
-            # If no server name available, use destination IP
-            if not server_name:
-                server_name = dst_ip
-            
-            # We don't attempt to calculate JA3/JA3S fingerprints here
-            ja3_fingerprint = ""
-            ja3s_fingerprint = ""
-            cert_issuer = ""
-            cert_subject = ""
-            cert_valid_from = ""
-            cert_valid_to = ""
-            cert_serial = ""
-            
-            # Store in database
-            success = self.db_manager.add_tls_connection(
-                connection_key, tls_version, cipher_suite, server_name, 
-                ja3_fingerprint, ja3s_fingerprint, cert_issuer, cert_subject,
-                cert_valid_from, cert_valid_to, cert_serial
-            )
-            
-            # Log success or failure
-            if success:
-                self.gui.update_output(f"Stored TLS connection: {server_name} ({tls_version})")
-                
-                # Trigger a refresh of the TLS tab if it's currently visible
-                if hasattr(self.gui, 'subtabs') and self.gui.subtabs:
-                    for subtab in self.gui.subtabs:
-                        if hasattr(subtab, 'name') and subtab.name == "HTTP/TLS Monitor":
-                            self.gui.master.after(5000, subtab.refresh_tls_connections)
-                            break
-            else:
-                self.gui.update_output(f"Failed to store TLS connection for {connection_key}")
-                
-            return success
-            
-        except Exception as e:
-            self.gui.update_output(f"Error processing TLS packet: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def _detect_application_protocol(self, src_ip, dst_ip, src_port, dst_port, layers, is_tcp=True):
+        
+    def _detect_application_protocol(self, src_ip, dst_ip, src_port, dst_port, layers, connection_key):
         """Detect application protocol based on port numbers and packet content"""
         try:
-            # Create connection key
-            connection_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
-            
             # Common protocol port mappings
             tcp_port_protocols = {
                 21: "FTP",
@@ -931,6 +730,9 @@ class TrafficCaptureEngine:
             }
             
             protocol = None
+            
+            # Check if this is TCP (by checking for TCP fields)
+            is_tcp = "tcp_srcport" in layers
             port_map = tcp_port_protocols if is_tcp else udp_port_protocols
             
             # Check destination port
@@ -950,7 +752,71 @@ class TrafficCaptureEngine:
         except Exception as e:
             self.gui.update_output(f"Error detecting application protocol: {e}")
             return False
-        
+
+    def _store_tls_data(self, layers, connection_key):
+        """Extract basic TLS data and store to capture.db"""
+        try:
+            # Extract TLS fields
+            tls_version = self.get_layer_value(layers, "tls_handshake_version")
+            cipher_suite = self.get_layer_value(layers, "tls_handshake_ciphersuite")
+            server_name = self.get_layer_value(layers, "tls_handshake_extensions_server_name")
+            
+            # Set default values if needed
+            if not tls_version:
+                # Try to determine from connection key
+                if "443" in connection_key:
+                    tls_version = "TLSv1.2 (assumed)"
+                else:
+                    tls_version = "Unknown"
+            
+            if not cipher_suite:
+                cipher_suite = "Unknown"
+            
+            # Extract destination IP from connection key
+            dst_ip = connection_key.split('->')[1].split(':')[0] if '->' in connection_key else None
+            
+            # If no server name available, use destination IP
+            if not server_name and dst_ip:
+                server_name = dst_ip
+            
+            # Store in database (without JA3 fingerprinting, which would be in analysis_manager)
+            ja3_fingerprint = ""
+            ja3s_fingerprint = ""
+            cert_issuer = ""
+            cert_subject = ""
+            cert_valid_from = ""
+            cert_valid_to = ""
+            cert_serial = ""
+            
+            # Store TLS connection info
+            return self.db_manager.add_tls_connection(
+                connection_key, tls_version, cipher_suite, server_name, 
+                ja3_fingerprint, ja3s_fingerprint, cert_issuer, cert_subject,
+                cert_valid_from, cert_valid_to, cert_serial
+            )
+        except Exception as e:
+            self.gui.update_output(f"Error storing TLS data: {e}")
+            return False
+
+    def _store_icmp_data(self, layers, src_ip, dst_ip):
+        """Extract basic ICMP data and store to capture.db"""
+        try:
+            # Extract ICMP type
+            icmp_type_raw = self.get_layer_value(layers, "icmp_type")
+            icmp_type = 0
+            
+            if icmp_type_raw is not None:
+                try:
+                    icmp_type = int(icmp_type_raw)
+                except (ValueError, TypeError):
+                    icmp_type = 0
+            
+            # Store ICMP packet
+            return self.db_manager.add_icmp_packet(src_ip, dst_ip, icmp_type)
+        except Exception as e:
+            self.gui.update_output(f"Error storing ICMP data: {e}")
+            return False
+
     def _process_arp_packet_ek(self, layers):
         """Extract and store ARP packet information"""
         try:
@@ -969,7 +835,7 @@ class TrafficCaptureEngine:
             
             # At least one IP should be present for ARP
             if arp_src_ip or arp_dst_ip:
-                # Store ARP data using database manager
+                # Store ARP data
                 current_time = time.time()
                 success = self.db_manager.add_arp_data(
                     arp_src_ip or "Unknown",  # Use "Unknown" if source IP is not available
@@ -978,7 +844,7 @@ class TrafficCaptureEngine:
                     current_time
                 )
                 
-                # Log ARP packets for debugging (only occasionally to avoid log flooding)
+                # Occasionally log ARP packets for debugging
                 if success and random.random() < 0.1:  # Log ~10% of ARP packets
                     op_type = "request" if operation == 1 else "reply" if operation == 2 else f"unknown({operation})"
                     self.gui.update_output(f"ARP {op_type}: {arp_src_ip or 'Unknown'} -> {arp_dst_ip or 'Unknown'}")
@@ -991,4 +857,13 @@ class TrafficCaptureEngine:
             import traceback
             traceback.print_exc()
             return False
-        
+
+    def add_alert(self, ip_address, alert_message, rule_name):
+        """Add an alert through the database manager's queue"""
+        # Store in in-memory collection first
+        if alert_message not in self.alerts_by_ip[ip_address]:
+            self.alerts_by_ip[ip_address].add(alert_message)
+            
+            # Queue the alert for processing
+            return self.db_manager.queue_alert(ip_address, alert_message, rule_name)
+        return False

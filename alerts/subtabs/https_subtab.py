@@ -230,9 +230,9 @@ class HttpTlsMonitor(SubtabBase):
         scrollbar.pack(side="right", fill="y")
         debug_text.config(yscrollcommand=scrollbar.set)
         
-        # Define query functions using queue system
+        # Define query functions using analysis_manager
         def get_table_counts():
-            conn = self.gui.db_manager.analysis_conn
+            conn = self.gui.analysis_manager.analysis1_conn
             cursor = conn.cursor()
             
             tables = {}
@@ -252,7 +252,7 @@ class HttpTlsMonitor(SubtabBase):
             return tables
         
         def check_tls_connections():
-            conn = self.gui.db_manager.analysis_conn
+            conn = self.gui.analysis_manager.analysis1_conn
             cursor = conn.cursor()
             
             # Look for port 443 connections
@@ -285,7 +285,7 @@ class HttpTlsMonitor(SubtabBase):
             }
         
         def check_http_requests():
-            conn = self.gui.db_manager.analysis_conn
+            conn = self.gui.analysis_manager.analysis1_conn
             cursor = conn.cursor()
             
             # Count HTTP requests
@@ -293,8 +293,11 @@ class HttpTlsMonitor(SubtabBase):
             http_requests = cursor.fetchone()[0]
             
             # Count HTTP responses
-            cursor.execute("SELECT COUNT(*) FROM http_responses")
-            http_responses = cursor.fetchone()[0]
+            try:
+                cursor.execute("SELECT COUNT(*) FROM http_responses")
+                http_responses = cursor.fetchone()[0]
+            except:
+                http_responses = 0
             
             # Get sample HTTP requests
             cursor.execute("""
@@ -313,14 +316,14 @@ class HttpTlsMonitor(SubtabBase):
                 "recent_requests": recent_requests
             }
         
-        # Queue the database queries
-        self.gui.db_manager.queue_query(
+        # Queue the database queries using analysis_manager
+        self.gui.analysis_manager.queue_query(
             get_table_counts,
-            callback=lambda tables: self.gui.db_manager.queue_query(
+            lambda tables: self.gui.analysis_manager.queue_query(
                 check_tls_connections,
-                callback=lambda tls_info: self.gui.db_manager.queue_query(
+                lambda tls_info: self.gui.analysis_manager.queue_query(
                     check_http_requests,
-                    callback=lambda http_info: self._display_debug_info(debug_text, tables, tls_info, http_info),
+                    lambda http_info: self._display_debug_info(debug_text, tables, tls_info, http_info),
                 ),
             ),
         )
@@ -399,20 +402,90 @@ class HttpTlsMonitor(SubtabBase):
         self.update_output("HTTP/TLS monitor refreshed")
     
     def refresh_http_requests(self, host_filter=None):
-        """Refresh HTTP request data"""
-        if not self.gui or not hasattr(self.gui, 'db_manager'):
+        """Refresh HTTP request data using analysis_manager"""
+        if not self.gui or not hasattr(self.gui, 'analysis_manager'):
             return
             
         # Clear tree
         for item in self.http_tree.get_children():
             self.http_tree.delete(item)
         
-        # Get HTTP requests
-        db_manager = self.gui.db_manager
+        # Get HTTP requests using analysis_manager
+        self.gui.analysis_manager.queue_query(
+            lambda: self._get_http_requests(host_filter),
+            self._update_http_display
+        )
         
-        # Format query results
-        http_requests = db_manager.get_http_requests_by_host(host_filter, limit=200)
-        
+    def _get_http_requests(self, host_filter=None):
+        """Get HTTP requests from analysis_1.db"""
+        try:
+            limit = 200
+            cursor = self.gui.analysis_manager.get_cursor()
+            
+            # First, check table structure to see if http_responses exists and has content_type
+            has_content_type = False
+            try:
+                cursor.execute("PRAGMA table_info(http_responses)")
+                columns = cursor.fetchall()
+                column_names = [col[1] for col in columns]
+                has_content_type = 'content_type' in column_names
+            except:
+                has_content_type = False
+            
+            # Build query based on available columns
+            if host_filter:
+                filter_pattern = f"%{host_filter}%"
+                if has_content_type:
+                    cursor.execute("""
+                        SELECT r.id, r.method, r.host, r.uri, r.user_agent, r.timestamp, 
+                            resp.status_code, resp.content_type
+                        FROM http_requests r
+                        LEFT JOIN http_responses resp ON r.id = resp.http_request_id
+                        WHERE r.host LIKE ?
+                        ORDER BY r.timestamp DESC
+                        LIMIT ?
+                    """, (filter_pattern, limit))
+                else:
+                    # Fallback query without content_type
+                    cursor.execute("""
+                        SELECT r.id, r.method, r.host, r.uri, r.user_agent, r.timestamp, 
+                            resp.status_code, 'text/html'
+                        FROM http_requests r
+                        LEFT JOIN http_responses resp ON r.id = resp.http_request_id
+                        WHERE r.host LIKE ?
+                        ORDER BY r.timestamp DESC
+                        LIMIT ?
+                    """, (filter_pattern, limit))
+            else:
+                if has_content_type:
+                    cursor.execute("""
+                        SELECT r.id, r.method, r.host, r.uri, r.user_agent, r.timestamp, 
+                            resp.status_code, resp.content_type
+                        FROM http_requests r
+                        LEFT JOIN http_responses resp ON r.id = resp.http_request_id
+                        ORDER BY r.timestamp DESC
+                        LIMIT ?
+                    """, (limit,))
+                else:
+                    # Fallback query without content_type
+                    cursor.execute("""
+                        SELECT r.id, r.method, r.host, r.uri, r.user_agent, r.timestamp, 
+                            resp.status_code, 'text/html'
+                        FROM http_requests r
+                        LEFT JOIN http_responses resp ON r.id = resp.http_request_id
+                        ORDER BY r.timestamp DESC
+                        LIMIT ?
+                    """, (limit,))
+            
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except Exception as e:
+            self.update_output(f"Error getting HTTP requests: {e}")
+            return []
+    
+    def _update_http_display(self, http_requests):
+        """Update HTTP requests display with the query results"""
         if not http_requests:
             self.update_output("No HTTP requests found")
             return
@@ -439,31 +512,111 @@ class HttpTlsMonitor(SubtabBase):
     
     def refresh_tls_connections(self, filter_pattern=None, force=False):
         """Refresh TLS connection data with improved error handling and debugging"""
-        if not self.gui or not hasattr(self.gui, 'db_manager'):
-            self.update_output("GUI or database manager not available")
+        if not self.gui or not hasattr(self.gui, 'analysis_manager'):
+            self.update_output("GUI or analysis manager not available")
             return
             
         # Clear tree
         for item in self.tls_tree.get_children():
             self.tls_tree.delete(item)
         
-        db_manager = self.gui.db_manager
-        
         # Force a database sync if requested
-        if force:
+        if force and hasattr(self.gui.analysis_manager, 'sync_from_analysis_db'):
             self.update_output("Forcing database sync before refreshing TLS data...")
-            sync_count = db_manager.sync_databases()
-            self.update_output(f"Synced {sync_count} records between databases")
+            self.gui.analysis_manager.queue_query(
+                self.gui.analysis_manager.sync_from_analysis_db,
+                lambda sync_count: self.update_output(f"Synced {sync_count} records between databases")
+            )
         
-        # Check TLS table status for debugging
-        if hasattr(db_manager, 'check_tls_tables'):
-            status = db_manager.check_tls_tables()
-            if status:
-                self.update_output(f"TLS status: {status['tls_connections']} records, {status['successful_joins']} successful joins")
+        # Queue the TLS connections query
+        self.gui.analysis_manager.queue_query(
+            lambda: self._get_tls_connections(filter_pattern),
+            self._update_tls_display
+        )
         
-        # Get TLS connections
-        tls_connections = db_manager.get_tls_connections(filter_pattern, limit=200)
-        
+    def _get_tls_connections(self, filter_pattern=None):
+        """Get TLS connections from analysis_1.db"""
+        try:
+            limit = 200
+            cursor = self.gui.analysis_manager.get_cursor()
+            
+            # First check if we have any TLS connections at all (for debugging)
+            count = cursor.execute("SELECT COUNT(*) FROM tls_connections").fetchone()[0]
+            self.update_output(f"Total TLS connections in database: {count}")
+            
+            if count == 0:
+                cursor.close()
+                return []
+            
+            # Check if ja3_fingerprint column exists
+            cursor.execute("PRAGMA table_info(tls_connections)")
+            columns = cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            has_ja3 = 'ja3_fingerprint' in column_names
+            
+            # Try the query with modified JOIN logic that's more tolerant
+            if filter_pattern:
+                pattern = f"%{filter_pattern}%"
+                if has_ja3:
+                    query = """
+                        SELECT t.server_name, t.tls_version, t.cipher_suite, t.ja3_fingerprint,
+                            c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp,
+                            t.connection_key
+                        FROM tls_connections t
+                        LEFT JOIN connections c ON t.connection_key = c.connection_key
+                        WHERE (t.server_name LIKE ? OR t.ja3_fingerprint LIKE ?)
+                        ORDER BY t.timestamp DESC
+                        LIMIT ?
+                    """
+                    rows = cursor.execute(query, (pattern, pattern, limit)).fetchall()
+                else:
+                    # Modified query without ja3_fingerprint
+                    query = """
+                        SELECT t.server_name, t.tls_version, t.cipher_suite, 'N/A',
+                            c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp,
+                            t.connection_key
+                        FROM tls_connections t
+                        LEFT JOIN connections c ON t.connection_key = c.connection_key
+                        WHERE t.server_name LIKE ?
+                        ORDER BY t.timestamp DESC
+                        LIMIT ?
+                    """
+                    rows = cursor.execute(query, (pattern, limit)).fetchall()
+            else:
+                if has_ja3:
+                    query = """
+                        SELECT t.server_name, t.tls_version, t.cipher_suite, t.ja3_fingerprint,
+                            c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp,
+                            t.connection_key
+                        FROM tls_connections t
+                        LEFT JOIN connections c ON t.connection_key = c.connection_key
+                        ORDER BY t.timestamp DESC
+                        LIMIT ?
+                    """
+                    rows = cursor.execute(query, (limit,)).fetchall()
+                else:
+                    # Modified query without ja3_fingerprint
+                    query = """
+                        SELECT t.server_name, t.tls_version, t.cipher_suite, 'N/A',
+                            c.src_ip, c.dst_ip, c.src_port, c.dst_port, t.timestamp,
+                            t.connection_key
+                        FROM tls_connections t
+                        LEFT JOIN connections c ON t.connection_key = c.connection_key
+                        ORDER BY t.timestamp DESC
+                        LIMIT ?
+                    """
+                    rows = cursor.execute(query, (limit,)).fetchall()
+            
+            cursor.close()
+            return rows
+        except Exception as e:
+            self.update_output(f"Error getting TLS connections: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+            
+    def _update_tls_display(self, tls_connections):
+        """Update TLS connections display with the query results"""
         if not tls_connections:
             self.update_output("No TLS connections found in database")
             
@@ -486,7 +639,7 @@ class HttpTlsMonitor(SubtabBase):
             
             # Check connection counts
             try:
-                conn_cursor = db_manager.analysis_conn.cursor()
+                conn_cursor = self.gui.analysis_manager.get_cursor()
                 https_count = conn_cursor.execute("SELECT COUNT(*) FROM connections WHERE dst_port = 443").fetchone()[0]
                 self.tls_details_text.insert(tk.END, f"\nHTTPS connections in database: {https_count}\n")
                 conn_cursor.close()
@@ -514,9 +667,9 @@ class HttpTlsMonitor(SubtabBase):
                 server_name = conn[0] if conn[0] else "Unknown"
                 tls_version = conn[1] if conn[1] else "Unknown"
                 cipher_suite = conn[2] if conn[2] else "Unknown"
-                src_ip = conn[4] if len(conn) > 4 else "Unknown"
-                dst_ip = conn[5] if len(conn) > 5 else "Unknown"
-                timestamp = conn[8] if len(conn) > 8 else time.time()
+                src_ip = conn[4] if len(conn) > 4 and conn[4] else "Unknown"
+                dst_ip = conn[5] if len(conn) > 5 and conn[5] else "Unknown"
+                timestamp = conn[8] if len(conn) > 8 and conn[8] else time.time()
                 
                 # Format the timestamp
                 if isinstance(timestamp, float):
@@ -531,17 +684,24 @@ class HttpTlsMonitor(SubtabBase):
 
     def debug_tls_processing(self):
         """Force a check of TLS processing and database status using queue system"""
-        if not self.gui or not hasattr(self.gui, 'db_manager'):
-            self.update_output("GUI or database manager not available")
+        if not self.gui or not hasattr(self.gui, 'analysis_manager'):
+            self.update_output("GUI or analysis manager not available")
             return
                 
         # Clear the details text area
         self.tls_details_text.delete(1.0, tk.END)
         self.tls_details_text.insert(tk.END, "TLS Debug Information:\n\n")
         
-        # Define query function to check TLS tables
-        def check_tls_tables():
-            cursor = self.gui.db_manager.analysis_conn.cursor()
+        # Queue the query using analysis_manager
+        self.gui.analysis_manager.queue_query(
+            self._check_tls_tables,
+            self._update_tls_debug_display
+        )
+    
+    def _check_tls_tables(self):
+        """Check TLS tables using analysis_1.db"""
+        try:
+            cursor = self.gui.analysis_manager.get_cursor()
             
             # Check connections table
             conn_count = cursor.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
@@ -555,10 +715,13 @@ class HttpTlsMonitor(SubtabBase):
             ).fetchone()[0]
             
             # Check for successful joins
-            join_count = cursor.execute("""
-                SELECT COUNT(*) FROM tls_connections t
-                JOIN connections c ON t.connection_key = c.connection_key
-            """).fetchone()[0]
+            try:
+                join_count = cursor.execute("""
+                    SELECT COUNT(*) FROM tls_connections t
+                    JOIN connections c ON t.connection_key = c.connection_key
+                """).fetchone()[0]
+            except:
+                join_count = 0
             
             # Sample TLS connection keys
             cursor.execute("SELECT connection_key FROM tls_connections LIMIT 5")
@@ -588,12 +751,9 @@ class HttpTlsMonitor(SubtabBase):
                 "conn_keys": conn_keys,
                 "recent_https": recent_https
             }
-        
-        # Queue the query
-        self.gui.db_manager.queue_query(
-            check_tls_tables,
-            callback=self._update_tls_debug_display
-        )
+        except Exception as e:
+            self.update_output(f"Error checking TLS tables: {e}")
+            return None
     
     def _update_tls_debug_display(self, status):
         """Update TLS debug display with the query results"""
@@ -640,19 +800,76 @@ class HttpTlsMonitor(SubtabBase):
 
     def refresh_suspicious_tls(self):
         """Refresh suspicious TLS connection data"""
-        if not self.gui or not hasattr(self.gui, 'db_manager'):
+        if not self.gui or not hasattr(self.gui, 'analysis_manager'):
             return
             
         # Clear tree
         for item in self.suspicious_tls_tree.get_children():
             self.suspicious_tls_tree.delete(item)
         
-        # Get suspicious TLS connections
-        db_manager = self.gui.db_manager
+        # Get suspicious TLS connections using analysis_manager
+        self.gui.analysis_manager.queue_query(
+            self._get_suspicious_tls_connections,
+            self._update_suspicious_tls_display
+        )
         
-        # Format query results
-        suspicious_connections = db_manager.get_suspicious_tls_connections()
-        
+    def _get_suspicious_tls_connections(self):
+        """Get suspicious TLS connections from analysis_1.db"""
+        try:
+            cursor = self.gui.analysis_manager.get_cursor()
+            
+            # Check if we have any TLS connections first
+            count = cursor.execute("SELECT COUNT(*) FROM tls_connections").fetchone()[0]
+            if count == 0:
+                cursor.close()
+                return []
+            
+            # Check if ja3_fingerprint column exists
+            cursor.execute("PRAGMA table_info(tls_connections)")
+            columns = cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            has_ja3 = 'ja3_fingerprint' in column_names
+                
+            # Query for old TLS versions and weak ciphers
+            if has_ja3:
+                cursor.execute("""
+                    SELECT t.server_name, t.tls_version, t.cipher_suite, t.ja3_fingerprint,
+                        c.src_ip, c.dst_ip, t.timestamp
+                    FROM tls_connections t
+                    LEFT JOIN connections c ON t.connection_key = c.connection_key
+                    WHERE t.tls_version IN ('SSLv3', 'TLSv1.0', 'TLSv1.1')
+                    OR t.cipher_suite LIKE '%NULL%'
+                    OR t.cipher_suite LIKE '%EXPORT%'
+                    OR t.cipher_suite LIKE '%DES%'
+                    OR t.cipher_suite LIKE '%RC4%'
+                    OR t.cipher_suite LIKE '%MD5%'
+                    ORDER BY t.timestamp DESC
+                """)
+            else:
+                # Modified query without ja3_fingerprint
+                cursor.execute("""
+                    SELECT t.server_name, t.tls_version, t.cipher_suite, 'N/A',
+                        c.src_ip, c.dst_ip, t.timestamp
+                    FROM tls_connections t
+                    LEFT JOIN connections c ON t.connection_key = c.connection_key
+                    WHERE t.tls_version IN ('SSLv3', 'TLSv1.0', 'TLSv1.1')
+                    OR t.cipher_suite LIKE '%NULL%'
+                    OR t.cipher_suite LIKE '%EXPORT%'
+                    OR t.cipher_suite LIKE '%DES%'
+                    OR t.cipher_suite LIKE '%RC4%'
+                    OR t.cipher_suite LIKE '%MD5%'
+                    ORDER BY t.timestamp DESC
+                """)
+            
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except Exception as e:
+            self.update_output(f"Error getting suspicious TLS connections: {e}")
+            return []
+    
+    def _update_suspicious_tls_display(self, suspicious_connections):
+        """Update suspicious TLS display with the query results"""
         if not suspicious_connections:
             self.update_output("No suspicious TLS connections found")
             return
@@ -662,9 +879,9 @@ class HttpTlsMonitor(SubtabBase):
             server_name = conn[0] if conn[0] else "Unknown"
             tls_version = conn[1] if conn[1] else "Unknown"
             cipher_suite = conn[2] if conn[2] else "Unknown"
-            src_ip = conn[4]
-            dst_ip = conn[5]
-            timestamp = conn[6]
+            src_ip = conn[4] if len(conn) > 4 and conn[4] else "Unknown"
+            dst_ip = conn[5] if len(conn) > 5 and conn[5] else "Unknown"
+            timestamp = conn[6] if len(conn) > 6 and conn[6] else time.time()
             
             # Format the timestamp
             if isinstance(timestamp, float):
@@ -706,65 +923,138 @@ class HttpTlsMonitor(SubtabBase):
         details = f"Method: {method}\nHost: {host}\nPath: {path}\nStatus: {status}\nContent-Type: {content_type}\n\n"
         
         # If we have the request ID, we could get more details from the database
-        if req_id and req_id.isdigit() and self.gui and hasattr(self.gui, 'db_manager'):
-            db_manager = self.gui.db_manager
-            cursor = db_manager.analysis_conn.cursor()
+        if req_id and req_id.isdigit():
+            # Queue query to get more details using analysis_manager
+            self.gui.analysis_manager.queue_query(
+                lambda: self._get_http_request_details(int(req_id)),
+                lambda result: self._update_http_details_display(result, details)
+            )
+        else:
+            # Just display the basic details if we don't have an ID
+            self.http_details_text.insert(tk.END, details)
+    
+    def _get_http_request_details(self, req_id):
+        """Get HTTP request details from analysis_1.db"""
+        try:
+            cursor = self.gui.analysis_manager.get_cursor()
             
             # Get request headers
             cursor.execute("""
                 SELECT request_headers, user_agent 
                 FROM http_requests 
                 WHERE id = ?
-            """, (int(req_id),))
+            """, (req_id,))
             
             request_result = cursor.fetchone()
-            if request_result:
-                headers_json = request_result[0]
-                user_agent = request_result[1]
-                
-                if headers_json:
-                    import json
-                    try:
-                        headers = json.loads(headers_json)
-                        details += "Headers:\n"
-                        for name, value in headers.items():
-                            details += f"  {name}: {value}\n"
-                    except:
-                        pass
-                
-                if user_agent:
-                    details += f"\nUser-Agent: {user_agent}\n"
             
-            # Get response details if available
-            cursor.execute("""
-                SELECT status_code, content_type, content_length, server, response_headers 
-                FROM http_responses 
-                WHERE http_request_id = ?
-            """, (int(req_id),))
-            
-            response_result = cursor.fetchone()
-            if response_result:
-                details += "\nResponse:\n"
-                details += f"  Status: {response_result[0]}\n"
-                details += f"  Content-Type: {response_result[1] or 'unknown'}\n"
-                details += f"  Content-Length: {response_result[2] or 'unknown'}\n"
-                details += f"  Server: {response_result[3] or 'unknown'}\n"
+            # Check if http_responses has the proper columns
+            response_result = None
+            try:
+                # See if the http_responses table exists and has the right columns
+                cursor.execute("PRAGMA table_info(http_responses)")
+                columns = cursor.fetchall()
+                column_names = [col[1] for col in columns]
                 
-                # Parse response headers if available
-                response_headers = response_result[4]
-                if response_headers:
-                    import json
-                    try:
-                        headers = json.loads(response_headers)
-                        details += "  Headers:\n"
-                        for name, value in headers.items():
-                            details += f"    {name}: {value}\n"
-                    except:
-                        pass
+                # Only proceed if necessary columns exist
+                if 'http_request_id' in column_names:
+                    # Adjust column names based on what's available
+                    columns_to_select = ['status_code']
+                    if 'content_type' in column_names:
+                        columns_to_select.append('content_type')
+                    else:
+                        columns_to_select.append("'unknown' as content_type")
+                        
+                    if 'content_length' in column_names:
+                        columns_to_select.append('content_length')
+                    else:
+                        columns_to_select.append("0 as content_length")
+                        
+                    if 'server' in column_names:
+                        columns_to_select.append('server')
+                    else:
+                        columns_to_select.append("'unknown' as server")
+                        
+                    if 'response_headers' in column_names:
+                        columns_to_select.append('response_headers')
+                    else:
+                        columns_to_select.append("'' as response_headers")
+                    
+                    # Build the query with available columns
+                    query = f"""
+                        SELECT {', '.join(columns_to_select)}
+                        FROM http_responses 
+                        WHERE http_request_id = ?
+                    """
+                    cursor.execute(query, (req_id,))
+                    response_result = cursor.fetchone()
+            except Exception as e:
+                self.update_output(f"Error checking http_responses: {e}")
+                response_result = None
             
             cursor.close()
+            return {
+                "request": request_result,
+                "response": response_result
+            }
+        except Exception as e:
+            self.update_output(f"Error getting HTTP request details: {e}")
+            return {"request": None, "response": None}
+    
+    def _update_http_details_display(self, result, basic_details):
+        """Update HTTP details display with the query results"""
+        details = basic_details
+        
+        # Add request details
+        request_result = result["request"]
+        if request_result:
+            headers_json = request_result[0]
+            user_agent = request_result[1]
+            
+            if headers_json:
+                import json
+                try:
+                    headers = json.loads(headers_json)
+                    details += "Headers:\n"
+                    for name, value in headers.items():
+                        details += f"  {name}: {value}\n"
+                except:
+                    pass
+            
+            if user_agent:
+                details += f"\nUser-Agent: {user_agent}\n"
+        
+        # Add response details
+        response_result = result["response"]
+        if response_result:
+            details += "\nResponse:\n"
+            details += f"  Status: {response_result[0]}\n"
+            
+            # Check if we have content-type (index 1)
+            if len(response_result) > 1:
+                details += f"  Content-Type: {response_result[1] or 'unknown'}\n"
+            
+            # Check if we have content-length (index 2)
+            if len(response_result) > 2:
+                details += f"  Content-Length: {response_result[2] or 'unknown'}\n"
+            
+            # Check if we have server (index 3)
+            if len(response_result) > 3:
+                details += f"  Server: {response_result[3] or 'unknown'}\n"
+            
+            # Parse response headers if available (index 4)
+            if len(response_result) > 4 and response_result[4]:
+                response_headers = response_result[4]
+                import json
+                try:
+                    headers = json.loads(response_headers)
+                    details += "  Headers:\n"
+                    for name, value in headers.items():
+                        details += f"    {name}: {value}\n"
+                except:
+                    pass
         
         # Display the details
+        self.http_details_text.delete(1.0, tk.END)
         self.http_details_text.insert(tk.END, details)
     
     def show_tls_details(self, event):
@@ -792,53 +1082,100 @@ class HttpTlsMonitor(SubtabBase):
         details = f"Server Name: {server_name}\nTLS Version: {tls_version}\nCipher Suite: {cipher_suite}\n"
         details += f"Source IP: {src_ip}\nDestination IP: {dst_ip}\n\n"
         
-        # Get JA3 fingerprint if available
-        if self.gui and hasattr(self.gui, 'db_manager'):
-            db_manager = self.gui.db_manager
-            cursor = db_manager.analysis_conn.cursor()
+        # Get certificate info using analysis_manager
+        self.gui.analysis_manager.queue_query(
+            lambda: self._get_tls_details(server_name, src_ip, dst_ip),
+            lambda result: self._update_tls_details_display(result, details, tls_version, cipher_suite)
+        )
+    
+    def _get_tls_details(self, server_name, src_ip, dst_ip):
+        """Get TLS details from analysis_1.db"""
+        try:
+            cursor = self.gui.analysis_manager.get_cursor()
             
-            # Construct connection key
-            src_port = 0
-            dst_port = 443  # Assume HTTPS
+            # Check what columns are available
+            cursor.execute("PRAGMA table_info(tls_connections)")
+            columns = cursor.fetchall()
+            column_names = [col[1] for col in columns]
             
-            # Try to find the connection from both directions
-            cursor.execute("""
-                SELECT ja3_fingerprint, ja3s_fingerprint, certificate_issuer, certificate_subject,
-                       certificate_validity_start, certificate_validity_end
+            # Build a list of columns to select based on what's available
+            select_columns = []
+            if 'ja3_fingerprint' in column_names:
+                select_columns.append('ja3_fingerprint')
+            else:
+                select_columns.append("'N/A' as ja3_fingerprint")
+                
+            if 'ja3s_fingerprint' in column_names:
+                select_columns.append('ja3s_fingerprint')
+            else:
+                select_columns.append("'N/A' as ja3s_fingerprint")
+                
+            if 'certificate_issuer' in column_names:
+                select_columns.append('certificate_issuer')
+            else:
+                select_columns.append("'Unknown' as certificate_issuer")
+                
+            if 'certificate_subject' in column_names:
+                select_columns.append('certificate_subject')
+            else:
+                select_columns.append("'Unknown' as certificate_subject")
+                
+            if 'certificate_validity_start' in column_names:
+                select_columns.append('certificate_validity_start')
+            else:
+                select_columns.append("'Unknown' as certificate_validity_start")
+                
+            if 'certificate_validity_end' in column_names:
+                select_columns.append('certificate_validity_end')
+            else:
+                select_columns.append("'Unknown' as certificate_validity_end")
+            
+            # Build the query
+            query = f"""
+                SELECT {', '.join(select_columns)}
                 FROM tls_connections
                 WHERE server_name = ? AND 
                       (connection_key LIKE ? OR connection_key LIKE ?)
                 ORDER BY timestamp DESC
                 LIMIT 1
-            """, (server_name, f"{src_ip}:%->%", f"%->{dst_ip}:%"))
+            """
+            
+            cursor.execute(query, (server_name, f"{src_ip}:%->%", f"%->{dst_ip}:%"))
             
             result = cursor.fetchone()
-            if result:
-                ja3 = result[0]
-                ja3s = result[1]
-                cert_issuer = result[2]
-                cert_subject = result[3]
-                cert_valid_from = result[4]
-                cert_valid_to = result[5]
-                
-                if ja3:
-                    details += f"JA3 Fingerprint: {ja3}\n"
-                if ja3s:
-                    details += f"JA3S Fingerprint: {ja3s}\n"
-                
-                details += "\nCertificate Information:\n"
-                if cert_issuer:
-                    details += f"  Issuer: {cert_issuer}\n"
-                if cert_subject:
-                    details += f"  Subject: {cert_subject}\n"
-                if cert_valid_from:
-                    details += f"  Valid From: {cert_valid_from}\n"
-                if cert_valid_to:
-                    details += f"  Valid To: {cert_valid_to}\n"
-            
             cursor.close()
+            return result
+        except Exception as e:
+            self.update_output(f"Error getting TLS details: {e}")
+            return None
+    
+    def _update_tls_details_display(self, result, details, tls_version, cipher_suite):
+        """Update TLS details display with the query results"""
+        if result:
+            ja3 = result[0] if len(result) > 0 else None
+            ja3s = result[1] if len(result) > 1 else None
+            cert_issuer = result[2] if len(result) > 2 else None
+            cert_subject = result[3] if len(result) > 3 else None
+            cert_valid_from = result[4] if len(result) > 4 else None
+            cert_valid_to = result[5] if len(result) > 5 else None
+            
+            if ja3 and ja3 != 'N/A':
+                details += f"JA3 Fingerprint: {ja3}\n"
+            if ja3s and ja3s != 'N/A':
+                details += f"JA3S Fingerprint: {ja3s}\n"
+            
+            details += "\nCertificate Information:\n"
+            if cert_issuer and cert_issuer != 'Unknown':
+                details += f"  Issuer: {cert_issuer}\n"
+            if cert_subject and cert_subject != 'Unknown':
+                details += f"  Subject: {cert_subject}\n"
+            if cert_valid_from and cert_valid_from != 'Unknown':
+                details += f"  Valid From: {cert_valid_from}\n"
+            if cert_valid_to and cert_valid_to != 'Unknown':
+                details += f"  Valid To: {cert_valid_to}\n"
         
         # Display the details
+        self.tls_details_text.delete(1.0, tk.END)
         self.tls_details_text.insert(tk.END, details)
         
         # Add security assessment

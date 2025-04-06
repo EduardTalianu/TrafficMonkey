@@ -66,13 +66,56 @@ class MaliciousSubtab(SubtabBase):
         # Clear current items
         gui.tree_manager.clear_tree(self.malicious_tree)
         
-        # Queue a query to get alert data
-        gui.db_manager.queue_query(
-            gui._get_malicious_ip_data,
-            callback=self._update_malicious_display
+        # Use analysis_manager instead of db_manager
+        # Queue the query to get malicious IP data directly through analysis_manager
+        gui.analysis_manager.queue_query(
+            self._get_malicious_ip_data,
+            self._update_malicious_display
         )
         
         self.update_output("Refreshing malicious IP list...")
+    
+    def _get_malicious_ip_data(self):
+        """Get malicious IP data from analysis_1.db"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            
+            # Query to find malicious IPs from alerts
+            # This reads from analysis_1.db instead of analysis.db
+            cursor.execute("""
+                SELECT 
+                    ip_address,
+                    rule_name,
+                    'Active' as status,
+                    MAX(timestamp) as last_seen
+                FROM alerts
+                WHERE 
+                    rule_name LIKE '%Malicious%' OR 
+                    rule_name LIKE '%Suspicious%' OR 
+                    rule_name LIKE '%VirusTotal%' OR
+                    rule_name LIKE '%Threat%'
+                GROUP BY ip_address
+                ORDER BY last_seen DESC
+            """)
+            
+            results = []
+            for ip, rule_name, status, timestamp in cursor.fetchall():
+                # Skip false positives
+                if ip in gui.false_positives:
+                    continue
+                    
+                # Format timestamp
+                if isinstance(timestamp, (int, float)):
+                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+                
+                results.append((ip, rule_name, status, timestamp))
+                
+            cursor.close()
+            return results
+            
+        except Exception as e:
+            gui.update_output(f"Error getting malicious IP data: {e}")
+            return []
     
     def _update_malicious_display(self, data):
         """Update the malicious IP display"""

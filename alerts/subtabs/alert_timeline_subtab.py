@@ -190,33 +190,45 @@ class AlertTimelineSubtab(SubtabBase):
         start_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
         end_str = datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
         
-        # Query alerts in this time window
-        sql = """
-            SELECT timestamp, rule_name, ip_address, alert_message
-            FROM alerts
-            WHERE timestamp BETWEEN ? AND ?
-        """
-        
-        # Add alert type filter if selected
-        selected_type = self.selected_alert_type_var.get()
-        if selected_type != "All Types":
-            sql += " AND rule_name = ?"
-            params = (start_str, end_str, selected_type)
-        else:
-            params = (start_str, end_str)
-        
-        sql += " ORDER BY timestamp DESC"
-        
-        # Execute query
-        def get_alerts_in_timeframe():
-            cursor = gui.db_manager.analysis_conn.cursor()
-            return cursor.execute(sql, params).fetchall()
-        
-        # Queue the query
-        gui.db_manager.queue_query(
-            get_alerts_in_timeframe,
-            callback=lambda rows: self._update_details_tree(rows, time_str)
+        # Query alerts in this time window using analysis_manager
+        gui.analysis_manager.queue_query(
+            lambda: self._get_alerts_in_timeframe(start_time, end_time),
+            lambda rows: self._update_details_tree(rows, time_str)
         )
+    
+    def _get_alerts_in_timeframe(self, start_time, end_time):
+        """Get alerts in a specific timeframe from analysis_1.db"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            
+            # Format time range for query
+            start_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
+            end_str = datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Create SQL query
+            sql = """
+                SELECT timestamp, rule_name, ip_address, alert_message
+                FROM alerts
+                WHERE timestamp BETWEEN ? AND ?
+            """
+            
+            # Add alert type filter if selected
+            selected_type = self.selected_alert_type_var.get()
+            if selected_type != "All Types":
+                sql += " AND rule_name = ?"
+                params = (start_str, end_str, selected_type)
+            else:
+                params = (start_str, end_str)
+            
+            sql += " ORDER BY timestamp DESC"
+            
+            # Execute query
+            rows = cursor.execute(sql, params).fetchall()
+            cursor.close()
+            return rows
+        except Exception as e:
+            gui.update_output(f"Error getting alerts in timeframe: {e}")
+            return []
     
     def _update_details_tree(self, rows, time_str):
         """Update details tree with alerts for selected time period"""
@@ -245,18 +257,25 @@ class AlertTimelineSubtab(SubtabBase):
             widget.destroy()
         
         # First, get all rule types for the alert type combo
-        def get_alert_types():
-            cursor = gui.db_manager.analysis_conn.cursor()
-            return cursor.execute("SELECT DISTINCT rule_name FROM alerts ORDER BY rule_name").fetchall()
-        
-        # Update alert types and then get timeline data
-        gui.db_manager.queue_query(
-            get_alert_types,
-            callback=self._update_alert_types
+        # Use analysis_manager instead of db_manager
+        gui.analysis_manager.queue_query(
+            self._get_alert_types,
+            self._update_alert_types
         )
         
         # Get timeline data
         self._get_timeline_data()
+    
+    def _get_alert_types(self):
+        """Get alert types from analysis_1.db"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            rule_types = cursor.execute("SELECT DISTINCT rule_name FROM alerts ORDER BY rule_name").fetchall()
+            cursor.close()
+            return rule_types
+        except Exception as e:
+            gui.update_output(f"Error getting alert types: {e}")
+            return []
     
     def _update_alert_types(self, rule_types):
         """Update the alert type combobox"""
@@ -318,26 +337,11 @@ class AlertTimelineSubtab(SubtabBase):
             format_str = "%m-%d"
         elif self.current_time_range == "All":
             # Get earliest alert time or default to 30 days
-            def get_earliest_alert():
-                cursor = gui.db_manager.analysis_conn.cursor()
-                earliest = cursor.execute("SELECT MIN(timestamp) FROM alerts").fetchone()[0]
-                if earliest:
-                    try:
-                        # Try to parse as datetime string
-                        dt = datetime.datetime.strptime(earliest, '%Y-%m-%d %H:%M:%S')
-                        return dt.timestamp()
-                    except (ValueError, TypeError):
-                        # If it's not a datetime string, it might be a timestamp
-                        try:
-                            return float(earliest)
-                        except:
-                            return now - 2592000  # Default to 30 days
-                return now - 2592000  # Default to 30 days
-            
-            start_time = get_earliest_alert()
-            interval_seconds = max(86400, int((now - start_time) / 20))  # At most 20 intervals
-            interval = f"{interval_seconds} seconds"
-            format_str = "%m-%d"
+            gui.analysis_manager.queue_query(
+                self._get_earliest_alert_time,
+                lambda start_t: self._continue_timeline_data(start_t, now, format_str)
+            )
+            return  # Early return - will continue after getting earliest time
         else:
             # Default to 24h
             start_time = now - 86400
@@ -345,44 +349,84 @@ class AlertTimelineSubtab(SubtabBase):
             interval_seconds = 7200
             format_str = "%m-%d %H:%M"
         
+        # Standard flow - continue with timeline data 
+        self._continue_timeline_data(start_time, now, format_str, interval_seconds)
+    
+    def _get_earliest_alert_time(self):
+        """Get earliest alert time from analysis_1.db"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            earliest = cursor.execute("SELECT MIN(timestamp) FROM alerts").fetchone()[0]
+            cursor.close()
+            
+            now = time.time()
+            if earliest:
+                try:
+                    # Try to parse as datetime string
+                    dt = datetime.datetime.strptime(earliest, '%Y-%m-%d %H:%M:%S')
+                    return dt.timestamp()
+                except (ValueError, TypeError):
+                    # If it's not a datetime string, it might be a timestamp
+                    try:
+                        return float(earliest)
+                    except:
+                        return now - 2592000  # Default to 30 days
+            return now - 2592000  # Default to 30 days
+        except Exception as e:
+            gui.update_output(f"Error getting earliest alert time: {e}")
+            return time.time() - 2592000  # Default to 30 days
+    
+    def _continue_timeline_data(self, start_time, now, format_str, interval_seconds=None):
+        """Continue with timeline data after potentially getting earliest time"""
+        # For "All" time range, calculate interval based on total time span
+        if interval_seconds is None:
+            interval_seconds = max(86400, int((now - start_time) / 20))  # At most 20 intervals
+        
         # Convert start time to formatted string for SQLite
         start_time_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
         
-        # Construct SQL query
-        sql = """
-            SELECT 
-                strftime('%Y-%m-%d %H:%M:%S', 
-                    datetime(timestamp, 'localtime', 'start of day', 
-                    '+' || ((strftime('%H', timestamp, 'localtime') * 3600 + 
-                    strftime('%M', timestamp, 'localtime') * 60 + 
-                    strftime('%S', timestamp, 'localtime')) / ? * ?) || ' seconds')) as time_slot,
-                rule_name,
-                COUNT(*) as alert_count
-            FROM alerts
-            WHERE timestamp >= ?
-        """
-        
-        # Add filter for alert type if selected
-        selected_type = self.selected_alert_type_var.get()
-        if selected_type != "All Types":
-            sql += " AND rule_name = ?"
-            params = (interval_seconds, interval_seconds, start_time_str, selected_type)
-        else:
-            params = (interval_seconds, interval_seconds, start_time_str)
-        
-        # Group by time slot and rule
-        sql += " GROUP BY time_slot, rule_name ORDER BY time_slot, rule_name"
-        
-        # Define query function
-        def get_timeline_data():
-            cursor = gui.db_manager.analysis_conn.cursor()
-            return cursor.execute(sql, params).fetchall()
-        
-        # Queue the query
-        gui.db_manager.queue_query(
-            get_timeline_data,
-            callback=lambda rows: self._draw_timeline(rows, start_time, now, interval_seconds, format_str)
+        # Queue the timeline data query using analysis_manager
+        gui.analysis_manager.queue_query(
+            lambda: self._query_timeline_data(start_time_str, interval_seconds),
+            lambda rows: self._draw_timeline(rows, start_time, now, interval_seconds, format_str)
         )
+    
+    def _query_timeline_data(self, start_time_str, interval_seconds):
+        """Query timeline data from analysis_1.db"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            
+            # Construct SQL query
+            sql = """
+                SELECT 
+                    strftime('%Y-%m-%d %H:%M:%S', 
+                        datetime(timestamp, 'localtime', 'start of day', 
+                        '+' || ((strftime('%H', timestamp, 'localtime') * 3600 + 
+                        strftime('%M', timestamp, 'localtime') * 60 + 
+                        strftime('%S', timestamp, 'localtime')) / ? * ?) || ' seconds')) as time_slot,
+                    rule_name,
+                    COUNT(*) as alert_count
+                FROM alerts
+                WHERE timestamp >= ?
+            """
+            
+            # Add filter for alert type if selected
+            selected_type = self.selected_alert_type_var.get()
+            if selected_type != "All Types":
+                sql += " AND rule_name = ?"
+                params = (interval_seconds, interval_seconds, start_time_str, selected_type)
+            else:
+                params = (interval_seconds, interval_seconds, start_time_str)
+            
+            # Group by time slot and rule
+            sql += " GROUP BY time_slot, rule_name ORDER BY time_slot, rule_name"
+            
+            rows = cursor.execute(sql, params).fetchall()
+            cursor.close()
+            return rows
+        except Exception as e:
+            gui.update_output(f"Error querying timeline data: {e}")
+            return []
     
     def _draw_timeline(self, rows, start_time, end_time, interval_seconds, time_format):
         """Draw the timeline visualization based on the retrieved data"""
@@ -561,30 +605,16 @@ class AlertTimelineSubtab(SubtabBase):
                 # Update y_offset for next bar in stack
                 y_offset -= bar_height
         
-        # Update statistics
+        # Update statistics with data from analysis_1.db
         if total_alerts > 0:
             # Most common rule
             most_common_rule = max(rule_totals.items(), key=lambda x: x[1])
             
-            # Most targeted IP (query from database)
-            def get_most_targeted_ip():
-                cursor = gui.db_manager.analysis_conn.cursor()
-                start_time_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
-                sql = """
-                    SELECT ip_address, COUNT(*) as count
-                    FROM alerts
-                    WHERE timestamp >= ?
-                """
-                if self.selected_alert_type_var.get() != "All Types":
-                    sql += " AND rule_name = ?"
-                    params = (start_time_str, self.selected_alert_type_var.get())
-                else:
-                    params = (start_time_str,)
-                    
-                sql += " GROUP BY ip_address ORDER BY count DESC LIMIT 1"
-                
-                result = cursor.execute(sql, params).fetchone()
-                return result if result else ("None", 0)
+            # Query for most targeted IP using analysis_manager
+            gui.analysis_manager.queue_query(
+                lambda: self._get_most_targeted_ip(start_time),
+                self._update_most_targeted_ip_stat
+            )
             
             # Calculate alert density (alerts per hour)
             time_range_hours = (end_time - start_time) / 3600
@@ -611,13 +641,40 @@ class AlertTimelineSubtab(SubtabBase):
             )
             
             self.stats_labels["Alert Density:"].config(text=f"{alert_density:.2f} alerts/hour")
-            
-            # Query for most targeted IP
-            gui.db_manager.queue_query(
-                get_most_targeted_ip,
-                callback=lambda result: self.stats_labels["Most Targeted IP:"].config(
-                    text=f"{result[0]} ({result[1]})" if result else "--"
-                )
-            )
         
         self.update_output(f"Timeline updated with {total_alerts} alerts across {len(sorted_slots)} time periods")
+    
+    def _get_most_targeted_ip(self, start_time):
+        """Get most targeted IP from analysis_1.db"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            
+            start_time_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
+            sql = """
+                SELECT ip_address, COUNT(*) as count
+                FROM alerts
+                WHERE timestamp >= ?
+            """
+            
+            if self.selected_alert_type_var.get() != "All Types":
+                sql += " AND rule_name = ?"
+                params = (start_time_str, self.selected_alert_type_var.get())
+            else:
+                params = (start_time_str,)
+                
+            sql += " GROUP BY ip_address ORDER BY count DESC LIMIT 1"
+            
+            result = cursor.execute(sql, params).fetchone()
+            cursor.close()
+            return result if result else ("None", 0)
+        except Exception as e:
+            gui.update_output(f"Error getting most targeted IP: {e}")
+            return ("Error", 0)
+    
+    def _update_most_targeted_ip_stat(self, result):
+        """Update most targeted IP statistic"""
+        if result:
+            ip, count = result
+            self.stats_labels["Most Targeted IP:"].config(text=f"{ip} ({count})")
+        else:
+            self.stats_labels["Most Targeted IP:"].config(text="--")
