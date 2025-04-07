@@ -36,6 +36,9 @@ class CommandControlDetectionRule(Rule):
         }
         self.detected_c2 = {}  # Track detected C2 channels
         
+        # Store reference to analysis_manager (will be set later when analysis_manager is available)
+        self.analysis_manager = None
+        
         # Load known C2 indicators
         self.load_c2_indicators()
     
@@ -162,8 +165,17 @@ class CommandControlDetectionRule(Rule):
         return True, f"matches {c2_type} pattern (interval: {avg_interval:.1f}s, jitter: {jitter:.2f})"
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available (this shouldn't happen with new architecture)
+        if not self.analysis_manager:
+            logging.error("Cannot run Command & Control Detection rule: analysis_manager not available")
+            return ["ERROR: Command & Control Detection rule requires analysis_manager"]
+            
         alerts = []
-        pending_alerts = []  # Track alerts for queueing
+        pending_alerts = []  # Track alerts for writing to analysis_1.db
         current_time = time.time()
         
         # Only run periodically
@@ -274,14 +286,19 @@ class CommandControlDetectionRule(Rule):
                             alert_msg = f"Potential {c2_type} C2 channel: {src_ip} to {dst_ip}:{dst_port} - {reason}"
                             alerts.append(alert_msg)
                             pending_alerts.append((src_ip, alert_msg, self.name))
+                            
+                            # Add threat intelligence to analysis_1.db
+                            self.analysis_manager.queue_query(
+                                lambda ip=src_ip, c2=c2_type: self._add_threat_intel(ip, dst_ip, c2_type)
+                            )
                             break
             
-            # Queue all pending alerts
+            # Write all pending alerts to analysis_1.db
             for ip, msg, rule_name in pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    self.analysis_manager.add_alert(ip, msg, rule_name)
                 except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
+                    logging.error(f"Error adding alert to analysis_1.db: {e}")
             
             # Clean up old detections (after 12 hours)
             old_c2 = [k for k, t in self.detected_c2.items() if current_time - t > 43200]
@@ -294,6 +311,50 @@ class CommandControlDetectionRule(Rule):
             error_msg = f"Error in Command & Control Detection rule: {str(e)}"
             logging.error(error_msg)
             return [error_msg]
+    
+    def _add_threat_intel(self, src_ip, dst_ip, c2_type):
+        """Add threat intelligence data to analysis_1.db for C2 detections"""
+        try:
+            # Build threat intelligence data for the IP
+            threat_data = {
+                "score": 8.0,  # High score for C2 traffic
+                "type": "command_and_control",
+                "confidence": 0.75,
+                "source": "C2_Detection_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "c2_type": c2_type,
+                    "c2_server": dst_ip,
+                    "detection_method": "behavior_analysis"
+                }
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            self.analysis_manager.update_threat_intel(src_ip, threat_data)
+            
+            # Also add data about the destination if it's not in our known list
+            if dst_ip not in self.c2_ips:
+                server_threat_data = {
+                    "score": 9.0,  # Higher score for C2 server
+                    "type": "command_and_control_server",
+                    "confidence": 0.75,
+                    "source": "C2_Detection_Rule",
+                    "first_seen": time.time(),
+                    "details": {
+                        "c2_type": c2_type,
+                        "c2_client": src_ip,
+                        "detection_method": "behavior_analysis"
+                    }
+                }
+                self.analysis_manager.update_threat_intel(dst_ip, server_threat_data)
+                
+                # Consider adding this IP to our known list for future fast matching
+                self.c2_ips.append(dst_ip)
+                
+            return True
+        except Exception as e:
+            logging.error(f"Error adding C2 threat intelligence: {e}")
+            return False
     
     def get_params(self):
         return {

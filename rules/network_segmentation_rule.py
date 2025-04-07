@@ -78,7 +78,11 @@ class NetworkSegmentationRule(Rule):
             # Queue all pending alerts
             for ip, msg, rule_name in pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    # Use analysis_manager to add alerts to analysis_1.db
+                    if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
+                        self.db_manager.analysis_manager.add_alert(ip, msg, rule_name)
+                    else:
+                        self.db_manager.queue_alert(ip, msg, rule_name)
                 except Exception as e:
                     logging.error(f"Error queueing alert: {e}")
             
@@ -87,6 +91,15 @@ class NetworkSegmentationRule(Rule):
         except Exception as e:
             error_msg = f"Error in Network Segmentation rule: {str(e)}"
             logging.error(error_msg)
+            # Try to queue the error alert
+            try:
+                # Use analysis_manager to add alerts to analysis_1.db
+                if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
+                    self.db_manager.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                else:
+                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+            except Exception as e:
+                logging.error(f"Failed to queue error alert: {e}")
             return [error_msg]
     
     def get_params(self):

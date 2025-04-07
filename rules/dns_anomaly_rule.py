@@ -25,6 +25,9 @@ class DNSAnomalyRule(Rule):
         self.check_interval = 600  # Seconds between rule checks
         self.last_check_time = 0
         
+        # Store reference to analysis_manager (will be set later when analysis_manager is available)
+        self.analysis_manager = None
+        
         self.configurable_params = {
             "length_threshold": {
                 "description": "Maximum domain name length before flagging",
@@ -83,8 +86,17 @@ class DNSAnomalyRule(Rule):
         return entropy
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available (this shouldn't happen with new architecture)
+        if not self.analysis_manager:
+            logging.error("Cannot run DNS Anomaly rule: analysis_manager not available")
+            return ["ERROR: DNS Anomaly rule requires analysis_manager"]
+            
         alerts = []
-        # Add this list to store alerts that will be queued
+        # Add this list to store alerts that will be added to analysis_1.db
         pending_alerts = []
         
         current_time = time.time()
@@ -116,7 +128,7 @@ class DNSAnomalyRule(Rule):
             for src_ip, domain, count in long_domains:
                 alert_msg = f"Potential DNS Tunneling: {src_ip} queried unusually long domain: {domain}"
                 alerts.append(alert_msg)
-                # Add the alert to pending_alerts for queueing
+                # Add the alert to pending_alerts for writing to analysis_1.db
                 pending_alerts.append((src_ip, alert_msg, self.name))
             
             # Check for high entropy domain names (potential DGA)
@@ -138,7 +150,7 @@ class DNSAnomalyRule(Rule):
                 if entropy > self.entropy_threshold:
                     alert_msg = f"Potential DGA Domain: {src_ip} queried high-entropy domain: {domain} (entropy: {entropy:.2f})"
                     alerts.append(alert_msg)
-                    # Add the alert to pending_alerts for queueing
+                    # Add the alert to pending_alerts for writing to analysis_1.db
                     pending_alerts.append((src_ip, alert_msg, self.name))
             
             # Check for high query rates (potential DNS flood)
@@ -158,7 +170,7 @@ class DNSAnomalyRule(Rule):
             for src_ip, count in high_rates:
                 alert_msg = f"Potential DNS Flood: {src_ip} made {count} DNS queries in the last minute"
                 alerts.append(alert_msg)
-                # Add the alert to pending_alerts for queueing
+                # Add the alert to pending_alerts for writing to analysis_1.db
                 pending_alerts.append((src_ip, alert_msg, self.name))
             
             # Perform more detailed DNS tunneling analysis less frequently
@@ -238,7 +250,7 @@ class DNSAnomalyRule(Rule):
                                 
                             alert_msg = f"Sustained DNS tunneling activity: {src_ip} made {stats['total_queries']} queries with average length {avg_length:.1f}, entropy {avg_entropy:.2f}, and low length variance ({length_variance:.3f})"
                             alerts.append(alert_msg)
-                            # Add the alert to pending_alerts for queueing
+                            # Add the alert to pending_alerts for writing to analysis_1.db
                             pending_alerts.append((src_ip, alert_msg, self.name))
                             
                             # Add example domains
@@ -253,12 +265,12 @@ class DNSAnomalyRule(Rule):
                                 # Add as a supplementary alert for the same IP
                                 pending_alerts.append((src_ip, example_msg, self.name))
             
-            # Queue all pending alerts
+            # Write all pending alerts to analysis_1.db
             for ip, msg, rule_name in pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    self.analysis_manager.add_alert(ip, msg, rule_name)
                 except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
+                    logging.error(f"Error adding alert to analysis_1.db: {e}")
             
             return alerts
             

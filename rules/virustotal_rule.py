@@ -23,6 +23,9 @@ class VirusTotalRule(Rule):
         self.pending_updates = []
         self.pending_alerts = []
         
+        # Store reference to analysis_manager (will be set later when analysis_manager is available)
+        self.analysis_manager = None
+        
         # Set up cache file path in db directory
         try:
             # Try to locate the db directory from the app_root in the GUI
@@ -426,29 +429,61 @@ class VirusTotalRule(Rule):
         self.pending_alerts.append((ip, message, rule_name))
     
     def process_pending_updates(self):
-        """Process all pending connection updates"""
+        """Process all pending connection updates - uses analysis_1.db exclusively"""
         for connection_key, field, value in self.pending_updates:
             try:
-                # Use the queue_connection_update method instead
-                self.db_manager.queue_connection_update(connection_key, field, value)
+                # Use analysis_manager to update the connection in analysis_1.db
+                self.db_manager.analysis_manager.queue_query(
+                    lambda conn_key=connection_key, f=field, v=value: self._update_connection_in_analysis1(conn_key, f, v)
+                )
             except Exception as e:
                 logging.error(f"Error queueing connection update: {e}")
         
         # Clear the list after processing
         self.pending_updates = []
     
+    def _update_connection_in_analysis1(self, connection_key, field, value):
+        """Update a connection in analysis_1.db directly"""
+        try:
+            # Get a cursor for analysis_1.db
+            cursor = self.db_manager.analysis_manager.analysis1_conn.cursor()
+            # Update the connection
+            cursor.execute(
+                f"UPDATE connections SET {field} = ? WHERE connection_key = ?",
+                (value, connection_key)
+            )
+            # Commit the changes
+            self.db_manager.analysis_manager.analysis1_conn.commit()
+            # Close the cursor
+            cursor.close()
+            logging.debug(f"Updated connection {connection_key} in analysis_1.db")
+            return True
+        except Exception as e:
+            logging.error(f"Error updating connection in analysis_1.db: {e}")
+            return False
+    
     def process_pending_alerts(self):
-        """Process all pending alerts"""
+        """Process all pending alerts - uses analysis_1.db exclusively"""
         for ip, msg, rule_name in self.pending_alerts:
             try:
-                self.db_manager.queue_alert(ip, msg, rule_name)
+                # Use analysis_manager to add alert to analysis_1.db
+                self.db_manager.analysis_manager.add_alert(ip, msg, rule_name)
             except Exception as e:
-                logging.error(f"Error queueing alert: {e}")
+                logging.error(f"Error adding alert to analysis_1.db: {e}")
         
         # Clear the list after processing
         self.pending_alerts = []
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available (this shouldn't happen with new architecture)
+        if not self.analysis_manager:
+            logging.error("Cannot run VirusTotal rule: analysis_manager not available")
+            return ["ERROR: VirusTotal rule requires analysis_manager"]
+        
         # Clear pending updates/alerts from previous runs
         self.pending_updates = []
         self.pending_alerts = []
@@ -461,6 +496,7 @@ class VirusTotalRule(Rule):
         
         try:
             # First, look for any connections already marked as malicious
+            # Note: db_cursor now points to analysis.db (read-only)
             db_cursor.execute("SELECT src_ip, dst_ip, connection_key, vt_result FROM connections WHERE vt_result = 'Malicious'")
             vt_alerts = db_cursor.fetchall()
             
@@ -548,6 +584,11 @@ class VirusTotalRule(Rule):
                         # Create alert message
                         alert_msg = f"Malicious IP detected in connection from {src_ip} to {dst_ip} (VirusTotal detections: {result['total_detections']})"
                         
+                        # Store threat intelligence in analysis_1.db
+                        self.analysis_manager.queue_query(
+                            lambda ip=dst_ip_clean, r=result: self._add_threat_intel(ip, r)
+                        )
+                        
                         # Add to pending alerts instead of queuing directly
                         self.add_pending_alert(dst_ip_clean, alert_msg, self.name)
                         
@@ -624,6 +665,32 @@ class VirusTotalRule(Rule):
             
         return alerts
     
+    def _add_threat_intel(self, ip_address, result):
+        """Add threat intelligence data to analysis_1.db"""
+        if not self.analysis_manager:
+            return False
+            
+        try:
+            # Create threat intelligence data
+            threat_data = {
+                "score": result.get('total_detections', 0),
+                "type": "malware" if result.get('is_malicious', False) else "clean",
+                "confidence": 0.8 if result.get('is_malicious', False) else 0.5,
+                "source": "VirusTotal",
+                "first_seen": time.time(),
+                "details": {
+                    "malicious_count": result.get('malicious_count', 0),
+                    "suspicious_count": result.get('suspicious_count', 0),
+                    "status": result.get('status', 'Unknown')
+                }
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            return self.analysis_manager.update_threat_intel(ip_address, threat_data)
+        except Exception as e:
+            logging.error(f"Error adding threat intelligence data: {e}")
+            return False
+    
     def update_param(self, param_name, value):
         """Update a configurable parameter"""
         if param_name in self.configurable_params:
@@ -656,7 +723,8 @@ class VirusTotalRule(Rule):
     def update_connection(self, connection_key, field, value):
         """
         Override the parent class method to use the queue system instead
-        of direct database access to prevent recursive cursor use
+        of direct database access to prevent recursive cursor use.
+        Now supports writing to analysis_1.db
         """
         # Instead of directly queueing, add to pending updates
         self.add_connection_update(connection_key, field, value)

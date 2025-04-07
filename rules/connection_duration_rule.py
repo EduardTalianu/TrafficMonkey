@@ -13,8 +13,14 @@ class ConnectionDurationRule(Rule):
         self.last_check_time = 0
         self.detected_connections = set()  # Track connections we've already detected
         self.alerts_to_queue = []  # Initialize the alerts_to_queue list
+        self.analysis_manager = None  # Will be set when db_manager is set
     
     def analyze(self, db_cursor):
+        # Get reference to analysis_manager if not already set
+        if not hasattr(self, 'analysis_manager') or not self.analysis_manager:
+            if hasattr(self.db_manager, 'analysis_manager'):
+                self.analysis_manager = self.db_manager.analysis_manager
+
         # Local list for returning alerts to UI immediately
         alerts = []
         
@@ -121,10 +127,15 @@ class ConnectionDurationRule(Rule):
                     # Clear out half the old entries when we hit the limit
                     self.detected_connections = set(list(self.detected_connections)[-500:])
             
-            # Queue all pending alerts AFTER all database operations are complete
+            # Queue all pending alerts to analysis_1.db through analysis_manager if available
             for ip, msg, rule_name in pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    if self.analysis_manager:
+                        # Write alerts to analysis_1.db
+                        self.analysis_manager.add_alert(ip, msg, rule_name)
+                    else:
+                        # Fallback to db_manager (which writes to capture.db)
+                        self.db_manager.queue_alert(ip, msg, rule_name)
                 except Exception as e:
                     logging.error(f"Error queueing alert: {e}")
             
@@ -133,6 +144,14 @@ class ConnectionDurationRule(Rule):
         except Exception as e:
             error_msg = f"Error in Connection Duration rule: {str(e)}"
             logging.error(error_msg)
+            # Try to queue the error alert
+            try:
+                if self.analysis_manager:
+                    self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                else:
+                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+            except:
+                pass
             return [error_msg]
             
     def post_analyze_queue_alerts(self):
@@ -143,7 +162,10 @@ class ConnectionDurationRule(Rule):
         if self.alerts_to_queue:
             for ip, msg in self.alerts_to_queue:
                 try:
-                    self.db_manager.queue_alert(ip, msg, self.name)
+                    if self.analysis_manager:
+                        self.analysis_manager.add_alert(ip, msg, self.name)
+                    else:
+                        self.db_manager.queue_alert(ip, msg, self.name)
                 except Exception as e:
                     logging.error(f"Error queueing alert: {e}")
             # Clear the queue after processing

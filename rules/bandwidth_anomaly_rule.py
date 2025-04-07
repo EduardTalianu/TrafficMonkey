@@ -1,6 +1,7 @@
 # Rule class is injected by the RuleLoader
 import time
 import statistics
+import logging
 
 class BandwidthAnomalyRule(Rule):
     """Rule that detects anomalous bandwidth usage"""
@@ -91,10 +92,13 @@ class BandwidthAnomalyRule(Rule):
             # Queue all pending alerts AFTER all database operations are complete
             for ip, msg, rule_name in pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    # Use analysis_manager to add alerts to analysis_1.db
+                    if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
+                        self.db_manager.analysis_manager.add_alert(ip, msg, rule_name)
+                    else:
+                        self.db_manager.queue_alert(ip, msg, rule_name)
                 except Exception as e:
                     # Log error but continue processing
-                    import logging
                     logging.error(f"Error queueing alert: {e}")
             
             return alerts
@@ -102,7 +106,11 @@ class BandwidthAnomalyRule(Rule):
             error_msg = f"Error in Bandwidth Anomaly rule: {str(e)}"
             # Try to queue the error alert
             try:
-                self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+                # Use analysis_manager to add alerts to analysis_1.db
+                if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
+                    self.db_manager.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                else:
+                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
             except:
                 pass
             return [error_msg]

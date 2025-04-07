@@ -8,8 +8,14 @@ class ConnectionAsymmetryRule(Rule):
         self.asymmetry_ratio = 100.0  # Ratio of outbound to inbound traffic (or vice versa) to consider asymmetric
         self.min_bytes = 10000       # Minimum total bytes to consider
         self.exclude_common = True   # Exclude common services (web, streaming) that are naturally asymmetric
+        self.analysis_manager = None # Will be set when db_manager is set
     
     def analyze(self, db_cursor):
+        # Get reference to analysis_manager if not already set
+        if not hasattr(self, 'analysis_manager') or not self.analysis_manager:
+            if hasattr(self.db_manager, 'analysis_manager'):
+                self.analysis_manager = self.db_manager.analysis_manager
+
         # Local list for returning alerts to UI immediately
         alerts = []
         
@@ -122,10 +128,15 @@ class ConnectionAsymmetryRule(Rule):
                     # Add to pending alerts for queueing - use the receiving IP as target
                     pending_alerts.append((ip1, alert_msg, self.name))
             
-            # Queue all pending alerts AFTER all database operations are complete
+            # Queue all pending alerts to analysis_1.db through analysis_manager if available
             for ip, msg, rule_name in pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    if self.analysis_manager:
+                        # Write alerts to analysis_1.db
+                        self.analysis_manager.add_alert(ip, msg, rule_name)
+                    else:
+                        # Fallback to db_manager (which writes to capture.db)
+                        self.db_manager.queue_alert(ip, msg, rule_name)
                 except Exception as e:
                     logging.error(f"Error queueing alert: {e}")
             
@@ -135,7 +146,10 @@ class ConnectionAsymmetryRule(Rule):
             logging.error(error_msg)
             # Try to queue the error alert
             try:
-                self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+                if self.analysis_manager:
+                    self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                else:
+                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
             except:
                 pass
             return [error_msg]

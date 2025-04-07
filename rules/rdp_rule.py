@@ -11,6 +11,7 @@ class RDPConnectionRule(Rule):
         self.rdp_port = 3389      # Standard RDP port
         self.min_bytes = 1000     # Minimum bytes for a significant RDP connection
         self.alert_on_all = False # Whether to alert on all RDP or just large connections
+        self.analysis_manager = None  # Will be set by access to db_manager.analysis_manager
         
     def analyze(self, db_cursor):
         alerts = []
@@ -29,7 +30,11 @@ class RDPConnectionRule(Rule):
                 # Queue alerts and return
                 for ip, msg, rule_name in pending_alerts:
                     try:
-                        self.db_manager.queue_alert(ip, msg, rule_name)
+                        # Use analysis_manager to add alerts to analysis_1.db
+                        if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
+                            self.db_manager.analysis_manager.add_alert(ip, msg, rule_name)
+                        else:
+                            self.db_manager.queue_alert(ip, msg, rule_name)
                     except Exception as e:
                         logging.error(f"Error queueing alert: {e}")
                         
@@ -67,7 +72,11 @@ class RDPConnectionRule(Rule):
                 # Queue alerts and return
                 for ip, msg, rule_name in pending_alerts:
                     try:
-                        self.db_manager.queue_alert(ip, msg, rule_name)
+                        # Use analysis_manager to add alerts to analysis_1.db
+                        if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
+                            self.db_manager.analysis_manager.add_alert(ip, msg, rule_name)
+                        else:
+                            self.db_manager.queue_alert(ip, msg, rule_name)
                     except Exception as e:
                         logging.error(f"Error queueing alert: {e}")
                         
@@ -103,7 +112,11 @@ class RDPConnectionRule(Rule):
             # Queue all pending alerts
             for ip, msg, rule_name in pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    # Use analysis_manager to add alerts to analysis_1.db
+                    if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
+                        self.db_manager.analysis_manager.add_alert(ip, msg, rule_name)
+                    else:
+                        self.db_manager.queue_alert(ip, msg, rule_name)
                 except Exception as e:
                     logging.error(f"Error queueing alert: {e}")
                     
@@ -114,7 +127,11 @@ class RDPConnectionRule(Rule):
             logging.error(error_msg)
             # Try to queue the error alert
             try:
-                self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+                # Use analysis_manager to add alerts to analysis_1.db
+                if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
+                    self.db_manager.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                else:
+                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
             except Exception as e:
                 logging.error(f"Error queueing alert: {e}")
             return [error_msg]

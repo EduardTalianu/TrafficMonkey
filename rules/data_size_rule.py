@@ -10,6 +10,7 @@ class DataSizeRule(Rule):
         self.destination_threshold_mb = 200  # Lower threshold for single destinations
         self.alert_on_aggregate = True  # Alert on total transfer volume by source
         self.window_minutes = 60  # Time window to aggregate transfers
+        self.analysis_manager = None  # Will be set when db_manager is set
         self.configurable_params = {
             "threshold_mb": {
                 "description": "Threshold for large aggregate data transfers (in MB)",
@@ -38,6 +39,11 @@ class DataSizeRule(Rule):
         }
     
     def analyze(self, db_cursor):
+        # Get reference to analysis_manager if not already set
+        if not hasattr(self, 'analysis_manager') or not self.analysis_manager:
+            if hasattr(self.db_manager, 'analysis_manager'):
+                self.analysis_manager = self.db_manager.analysis_manager
+
         alerts = []
         # Add this list to store alerts that will be queued
         pending_alerts = []
@@ -133,10 +139,15 @@ class DataSizeRule(Rule):
                         # Add as a supplementary alert for the same IP
                         pending_alerts.append((src_ip, dest_message, self.name))
             
-            # Queue all pending alerts
+            # Queue all pending alerts to analysis_1.db through analysis_manager if available
             for ip, msg, rule_name in pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    if self.analysis_manager:
+                        # Write alerts to analysis_1.db
+                        self.analysis_manager.add_alert(ip, msg, rule_name)
+                    else:
+                        # Fallback to db_manager (which writes to capture.db)
+                        self.db_manager.queue_alert(ip, msg, rule_name)
                 except Exception as e:
                     logging.error(f"Error queueing alert: {e}")
             
@@ -145,6 +156,14 @@ class DataSizeRule(Rule):
         except Exception as e:
             error_msg = f"Error in Large Data Transfer rule: {str(e)}"
             logging.error(error_msg)
+            # Try to queue the error alert
+            try:
+                if self.analysis_manager:
+                    self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                else:
+                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+            except:
+                pass
             return [error_msg]
     
     def update_param(self, param_name, value):

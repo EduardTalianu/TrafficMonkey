@@ -12,6 +12,7 @@ class CredentialDumpingRule(Rule):
         )
         self.check_interval = 300  # Seconds between checks
         self.last_check_time = 0
+        self.analysis_manager = None # Will be set when db_manager is set
         
         # Known sensitive Windows system paths that contain credentials
         self.sensitive_windows_paths = [
@@ -158,6 +159,11 @@ class CredentialDumpingRule(Rule):
             return [], []
     
     def analyze(self, db_cursor):
+        # Get reference to analysis_manager if not already set
+        if not hasattr(self, 'analysis_manager') or not self.analysis_manager:
+            if hasattr(self.db_manager, 'analysis_manager'):
+                self.analysis_manager = self.db_manager.analysis_manager
+
         all_alerts = []
         all_pending_alerts = []
         current_time = time.time()
@@ -184,10 +190,15 @@ class CredentialDumpingRule(Rule):
             for key in old_detections:
                 self.detected_dumps.pop(key, None)
             
-            # Queue all pending alerts
+            # Queue all pending alerts to analysis_1.db through analysis_manager if available
             for ip, msg, rule_name in all_pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    if self.analysis_manager:
+                        # Write alerts to analysis_1.db
+                        self.analysis_manager.add_alert(ip, msg, rule_name)
+                    else:
+                        # Fallback to db_manager (which writes to capture.db)
+                        self.db_manager.queue_alert(ip, msg, rule_name)
                 except Exception as e:
                     logging.error(f"Error queueing alert: {e}")
             
@@ -196,6 +207,14 @@ class CredentialDumpingRule(Rule):
         except Exception as e:
             error_msg = f"Error in Credential Dumping Detection rule: {str(e)}"
             logging.error(error_msg)
+            # Try to queue the error alert
+            try:
+                if self.analysis_manager:
+                    self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                else:
+                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+            except:
+                pass
             return [error_msg]
     
     def get_params(self):

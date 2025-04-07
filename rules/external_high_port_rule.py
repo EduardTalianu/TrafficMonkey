@@ -22,6 +22,9 @@ class HighPortConnectionRule(Rule):
                              "172.29.", "172.30.", "172.31."]  # Common local IP prefixes
         self.local_hostname = self._get_local_hostname()
         
+        # Store reference to analysis_manager (will be set later when analysis_manager is available)
+        self.analysis_manager = None
+        
     def _get_local_hostname(self):
         """Get local machine hostname to identify self-connections"""
         import socket
@@ -80,7 +83,17 @@ class HighPortConnectionRule(Rule):
         return port in self.common_excluded_ports
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available
+        if not self.analysis_manager:
+            logging.error("Cannot run External High Port Detector rule: analysis_manager not available")
+            return ["ERROR: External High Port Detector rule requires analysis_manager"]
+            
         alerts = []
+        pending_alerts = []  # For writing to analysis_1.db
         
         try:
             # Check if port columns exist
@@ -127,11 +140,32 @@ class HighPortConnectionRule(Rule):
                     
                     # Alert on very high destination ports on external targets only
                     if dst_port and dst_port > self.port_threshold and not self.is_local_ip(dst_ip):
-                        alerts.append(f"ALERT: External very high destination port connection from {src_ip} to {dst_ip} (port {dst_port}, {total_bytes/1024:.2f} KB)")
+                        alert_msg = f"External very high destination port connection from {src_ip} to {dst_ip} (port {dst_port}, {total_bytes/1024:.2f} KB)"
+                        alerts.append(alert_msg)
+                        pending_alerts.append((src_ip, alert_msg, self.name))
+                        
+                        # Write data to analysis_1.db
+                        self.analysis_manager.queue_query(
+                            lambda s=src_ip, d=dst_ip, p=dst_port, b=total_bytes: self._add_high_port_data(s, d, p, b, "destination")
+                        )
                     
                     # Alert on very high source ports from external sources only
                     elif src_port and src_port > self.port_threshold and not self.is_local_ip(src_ip):
-                        alerts.append(f"ALERT: External very high source port connection from {src_ip} (port {src_port}) to {dst_ip} ({total_bytes/1024:.2f} KB)")
+                        alert_msg = f"External very high source port connection from {src_ip} (port {src_port}) to {dst_ip} ({total_bytes/1024:.2f} KB)"
+                        alerts.append(alert_msg)
+                        pending_alerts.append((src_ip, alert_msg, self.name))
+                        
+                        # Write data to analysis_1.db
+                        self.analysis_manager.queue_query(
+                            lambda s=src_ip, d=dst_ip, p=src_port, b=total_bytes: self._add_high_port_data(s, d, p, b, "source")
+                        )
+                
+                # Write all pending alerts to analysis_1.db
+                for ip, msg, rule_name in pending_alerts:
+                    try:
+                        self.analysis_manager.add_alert(ip, msg, rule_name)
+                    except Exception as e:
+                        logging.error(f"Error adding alert to analysis_1.db: {e}")
                 
                 return alerts
             
@@ -173,11 +207,32 @@ class HighPortConnectionRule(Rule):
                 
                 # Alert on very high destination ports on external targets only
                 if dst_port > self.port_threshold and not self.is_local_ip(dst_ip):
-                    alerts.append(f"ALERT: External very high destination port connection from {src_ip}:{src_port} to {dst_ip}:{dst_port} ({total_bytes/1024:.2f} KB)")
+                    alert_msg = f"External very high destination port connection from {src_ip}:{src_port} to {dst_ip}:{dst_port} ({total_bytes/1024:.2f} KB)"
+                    alerts.append(alert_msg)
+                    pending_alerts.append((src_ip, alert_msg, self.name))
+                    
+                    # Write data to analysis_1.db
+                    self.analysis_manager.queue_query(
+                        lambda s=src_ip, d=dst_ip, p=dst_port, b=total_bytes: self._add_high_port_data(s, d, p, b, "destination")
+                    )
                 
                 # Alert on very high source ports from external sources only
                 elif src_port > self.port_threshold and not self.is_local_ip(src_ip):
-                    alerts.append(f"ALERT: External very high source port connection from {src_ip}:{src_port} to {dst_ip}:{dst_port} ({total_bytes/1024:.2f} KB)")
+                    alert_msg = f"External very high source port connection from {src_ip}:{src_port} to {dst_ip}:{dst_port} ({total_bytes/1024:.2f} KB)"
+                    alerts.append(alert_msg)
+                    pending_alerts.append((src_ip, alert_msg, self.name))
+                    
+                    # Write data to analysis_1.db
+                    self.analysis_manager.queue_query(
+                        lambda s=src_ip, d=dst_ip, p=src_port, b=total_bytes: self._add_high_port_data(s, d, p, b, "source")
+                    )
+            
+            # Write all pending alerts to analysis_1.db
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.analysis_manager.add_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error adding alert to analysis_1.db: {e}")
                     
             return alerts
                 
@@ -185,6 +240,35 @@ class HighPortConnectionRule(Rule):
             error_msg = f"ERROR in External High Port Detector: {str(e)}"
             logging.error(error_msg)
             return [error_msg]
+    
+    def _add_high_port_data(self, src_ip, dst_ip, port, bytes_transferred, port_type):
+        """Add high port connection data to analysis_1.db"""
+        try:
+            # Build threat intelligence data
+            suspicious_ip = src_ip if port_type == "source" else dst_ip
+            other_ip = dst_ip if port_type == "source" else src_ip
+            
+            threat_data = {
+                "score": 4.0,  # Medium score for high port usage
+                "type": "unusual_port_activity",
+                "confidence": 0.6,
+                "source": "High_Port_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "port": port,
+                    "port_type": port_type,
+                    "connection_party": other_ip,
+                    "bytes_transferred": bytes_transferred,
+                    "detection_method": "unusual_port_analysis"
+                }
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            self.analysis_manager.update_threat_intel(suspicious_ip, threat_data)
+            return True
+        except Exception as e:
+            logging.error(f"Error adding high port data to analysis_1.db: {e}")
+            return False
     
     def _extract_port_from_str(self, ip_str):
         """Extract port number from IP string if present (format: ip:port)"""

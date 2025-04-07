@@ -19,10 +19,22 @@ class EnhancedPortScanRule(Rule):
         self.check_interval = 600  # Seconds between rule checks
         self.last_check_time = 0
         self.last_alert_time = {}  # Track last alert time by IP pair
+        
+        # Store reference to analysis_manager (will be set later when analysis_manager is available)
+        self.analysis_manager = None
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available
+        if not self.analysis_manager:
+            logging.error("Cannot run Enhanced Port Scan rule: analysis_manager not available")
+            return ["ERROR: Enhanced Port Scan rule requires analysis_manager"]
+        
         alerts = []
-        # Add this list to store alerts that will be queued
+        # Add this list to store alerts that will be written to analysis_1.db
         pending_alerts = []
         
         current_time = time.time()
@@ -85,8 +97,14 @@ class EnhancedPortScanRule(Rule):
                     self.last_alert_time[ip_pair] = current_time
                     alert_msg = f"Vertical port scan detected: {src_ip} scanned {len(ports)} ports on {dst_ip} with {max_sequential} sequential ports"
                     alerts.append(alert_msg)
-                    # Add the alert to pending_alerts for queueing - use source IP
+                    # Add the alert to pending_alerts for writing to analysis_1.db - use source IP
                     pending_alerts.append((src_ip, alert_msg, self.name))
+                    
+                    # Add threat intelligence to analysis_1.db
+                    self.analysis_manager.queue_query(
+                        lambda s=src_ip, d=dst_ip, p=ports, ms=max_sequential: 
+                        self._add_vertical_scan_data(s, d, p, ms)
+                    )
             
             # Detection 2: Horizontal scan (same port across multiple hosts)
             db_cursor.execute("""
@@ -118,8 +136,14 @@ class EnhancedPortScanRule(Rule):
                 self.last_alert_time[src_ip] = current_time
                 alert_msg = f"Horizontal scan detected: {src_ip} scanned port {dst_port} on {host_count} hosts"
                 alerts.append(alert_msg)
-                # Add the alert to pending_alerts for queueing - use source IP
+                # Add the alert to pending_alerts for writing to analysis_1.db - use source IP
                 pending_alerts.append((src_ip, alert_msg, self.name))
+                
+                # Add threat intelligence to analysis_1.db
+                self.analysis_manager.queue_query(
+                    lambda s=src_ip, p=dst_port, h=hosts: 
+                    self._add_horizontal_scan_data(s, p, h)
+                )
                 
                 # List sample hosts
                 if len(hosts) <= 5:
@@ -169,15 +193,21 @@ class EnhancedPortScanRule(Rule):
                         self.last_alert_time[ip_pair] = current_time
                         alert_msg = f"Rapid port scan: {src_ip} scanned {port_count} ports on {dst_ip} in {time_span:.2f} seconds"
                         alerts.append(alert_msg)
-                        # Add the alert to pending_alerts for queueing - use source IP
+                        # Add the alert to pending_alerts for writing to analysis_1.db - use source IP
                         pending_alerts.append((src_ip, alert_msg, self.name))
+                        
+                        # Add threat intelligence to analysis_1.db
+                        self.analysis_manager.queue_query(
+                            lambda s=src_ip, d=dst_ip, p=port_count, t=time_span: 
+                            self._add_rapid_scan_data(s, d, p, t)
+                        )
             
-            # Queue all pending alerts
+            # Write all pending alerts to analysis_1.db
             for ip, msg, rule_name in pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    self.analysis_manager.add_alert(ip, msg, rule_name)
                 except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
+                    logging.error(f"Error adding alert to analysis_1.db: {e}")
             
             return alerts
             
@@ -185,6 +215,85 @@ class EnhancedPortScanRule(Rule):
             error_msg = f"Error in Enhanced Port Scan rule: {str(e)}"
             logging.error(error_msg)
             return [error_msg]
+    
+    def _add_vertical_scan_data(self, src_ip, dst_ip, ports, max_sequential):
+        """Add vertical port scan data to analysis_1.db"""
+        try:
+            # Build threat intelligence data
+            threat_data = {
+                "score": 6.0,  # Medium-high score for port scanning
+                "type": "port_scanning",
+                "confidence": 0.8,
+                "source": "Port_Scan_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "scan_type": "vertical",
+                    "target": dst_ip,
+                    "ports_scanned": len(ports),
+                    "max_sequential_ports": max_sequential,
+                    "detection_method": "sequential_port_analysis"
+                }
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            self.analysis_manager.update_threat_intel(src_ip, threat_data)
+            return True
+        except Exception as e:
+            logging.error(f"Error adding vertical scan data: {e}")
+            return False
+    
+    def _add_horizontal_scan_data(self, src_ip, dst_port, hosts):
+        """Add horizontal port scan data to analysis_1.db"""
+        try:
+            # Build threat intelligence data
+            threat_data = {
+                "score": 7.0,  # High score for horizontal scanning (more suspicious)
+                "type": "port_scanning",
+                "confidence": 0.9,
+                "source": "Port_Scan_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "scan_type": "horizontal",
+                    "port": dst_port,
+                    "hosts_scanned": len(hosts),
+                    "target_sample": hosts[:5] if len(hosts) > 5 else hosts,
+                    "detection_method": "multiple_host_analysis"
+                }
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            self.analysis_manager.update_threat_intel(src_ip, threat_data)
+            return True
+        except Exception as e:
+            logging.error(f"Error adding horizontal scan data: {e}")
+            return False
+    
+    def _add_rapid_scan_data(self, src_ip, dst_ip, port_count, time_span):
+        """Add rapid port scan data to analysis_1.db"""
+        try:
+            # Build threat intelligence data
+            threat_data = {
+                "score": 8.0,  # High score for rapid scanning (very suspicious)
+                "type": "port_scanning",
+                "confidence": 0.9,
+                "source": "Port_Scan_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "scan_type": "rapid",
+                    "target": dst_ip,
+                    "ports_scanned": port_count,
+                    "time_span_seconds": time_span,
+                    "scan_rate": port_count / time_span if time_span > 0 else 0,
+                    "detection_method": "timing_analysis"
+                }
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            self.analysis_manager.update_threat_intel(src_ip, threat_data)
+            return True
+        except Exception as e:
+            logging.error(f"Error adding rapid scan data: {e}")
+            return False
     
     def get_params(self):
         return {

@@ -30,6 +30,9 @@ class MaliciousFileTransferRule(Rule):
         self.icmp_payload_threshold = 100  # Bytes per packet for ICMP
         self.icmp_packet_threshold = 20  # Minimum packets to analyze
         
+        # Store reference to analysis_manager (will be set later when analysis_manager is available)
+        self.analysis_manager = None
+        
         self.detected_transfers = {}  # Track detected transfers
     
     def calculate_entropy(self, data):
@@ -59,6 +62,7 @@ class MaliciousFileTransferRule(Rule):
     def detect_dns_file_transfer(self, db_cursor):
         """Detect files being transferred via DNS tunneling"""
         alerts = []
+        pending_alerts = []  # To be written to analysis_1.db
         
         try:
             # Check if dns_queries table exists
@@ -156,8 +160,16 @@ class MaliciousFileTransferRule(Rule):
                         elif hex_pct > 30:
                             encoding = "Hex"
                         
-                        alerts.append(f"File transfer via DNS detected: {src_ip} sent {query_count} DNS queries with {encoding}-encoded data " +
-                                     f"(long: {long_pct:.1f}%, high entropy: {entropy_pct:.1f}%)")
+                        alert_msg = f"File transfer via DNS detected: {src_ip} sent {query_count} DNS queries with {encoding}-encoded data " + \
+                                   f"(long: {long_pct:.1f}%, high entropy: {entropy_pct:.1f}%)"
+                        
+                        alerts.append(alert_msg)
+                        pending_alerts.append((src_ip, alert_msg, self.name))
+            
+            # Add alerts to analysis_1.db
+            if self.analysis_manager and pending_alerts:
+                for ip, msg, rule_name in pending_alerts:
+                    self.analysis_manager.add_alert(ip, msg, rule_name)
             
             return alerts
         except Exception as e:
@@ -167,7 +179,7 @@ class MaliciousFileTransferRule(Rule):
     def detect_http_file_transfer(self, db_cursor):
         """Detect unusual HTTP file transfers"""
         alerts = []
-        pending_alerts = []  # Track alerts for queueing
+        pending_alerts = []  # Track alerts for writing to analysis_1.db
         
         try:
             # Check if http_requests table exists
@@ -242,12 +254,10 @@ class MaliciousFileTransferRule(Rule):
                         alerts.append(alert_msg)
                         pending_alerts.append((src_ip, alert_msg, self.name))
             
-            # Queue all pending alerts
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
+            # Write alerts to analysis_1.db
+            if self.analysis_manager and pending_alerts:
+                for ip, msg, rule_name in pending_alerts:
+                    self.analysis_manager.add_alert(ip, msg, rule_name)
             
             return alerts
         except Exception as e:
@@ -257,6 +267,7 @@ class MaliciousFileTransferRule(Rule):
     def detect_icmp_file_transfer(self, db_cursor):
         """Detect files being transferred via ICMP tunneling"""
         alerts = []
+        pending_alerts = []
         
         try:
             # Check if icmp_packets table exists
@@ -282,7 +293,14 @@ class MaliciousFileTransferRule(Rule):
                 
                 if alert_key not in self.detected_transfers:
                     self.detected_transfers[alert_key] = time.time()
-                    alerts.append(f"Potential ICMP tunneling: {src_ip} sent {packet_count} ICMP packets to {dst_ip} in the last 30 minutes")
+                    alert_msg = f"Potential ICMP tunneling: {src_ip} sent {packet_count} ICMP packets to {dst_ip} in the last 30 minutes"
+                    alerts.append(alert_msg)
+                    pending_alerts.append((src_ip, alert_msg, self.name))
+            
+            # Write alerts to analysis_1.db
+            if self.analysis_manager and pending_alerts:
+                for ip, msg, rule_name in pending_alerts:
+                    self.analysis_manager.add_alert(ip, msg, rule_name)
             
             return alerts
         except Exception as e:
@@ -290,8 +308,16 @@ class MaliciousFileTransferRule(Rule):
             return []
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available (this shouldn't happen with new architecture)
+        if not self.analysis_manager:
+            logging.error("Cannot run Malicious File Transfer rule: analysis_manager not available")
+            return ["ERROR: Malicious File Transfer rule requires analysis_manager"]
+        
         alerts = []
-        pending_alerts = []  # Track alerts for queueing
         current_time = time.time()
         
         # Only run periodically
@@ -309,21 +335,6 @@ class MaliciousFileTransferRule(Rule):
             alerts.extend(dns_alerts)
             alerts.extend(http_alerts)
             alerts.extend(icmp_alerts)
-            
-            # Also ensure DNS and ICMP methods queue alerts
-            for alert in dns_alerts + icmp_alerts:
-                # Extract IP from alert message
-                ip_matches = re.findall(r'(\d+\.\d+\.\d+\.\d+)', alert)
-                if ip_matches:
-                    src_ip = ip_matches[0]  # Use first IP as source
-                    pending_alerts.append((src_ip, alert, self.name))
-            
-            # Queue all pending alerts
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
             
             # Clean up old detections (after 6 hours)
             old_detections = [k for k, t in self.detected_transfers.items() if current_time - t > 21600]

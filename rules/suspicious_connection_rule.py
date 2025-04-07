@@ -3,6 +3,7 @@
 import logging
 import os
 import json
+import time
 
 class SuspiciousConnectionRule(Rule):
     def __init__(self):
@@ -12,6 +13,9 @@ class SuspiciousConnectionRule(Rule):
         )
         self.threshold_kb = 10  # Default threshold in KB for suspicious connections
         self.lists_updated = False
+        
+        # Store reference to analysis_manager (will be set later when analysis_manager is available)
+        self.analysis_manager = None
         
         # Set up threat intel file path in db directory
         try:
@@ -158,10 +162,19 @@ class SuspiciousConnectionRule(Rule):
         return match
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available
+        if not self.analysis_manager:
+            logging.error("Cannot run Local Threat Intelligence rule: analysis_manager not available")
+            return ["ERROR: Local Threat Intelligence rule requires analysis_manager"]
+        
         # Local list for returning alerts to UI immediately
         alerts = []
         
-        # List for storing alerts to be queued after analysis is complete
+        # List for storing alerts to be written to analysis_1.db
         pending_alerts = []
         
         try:
@@ -188,6 +201,12 @@ class SuspiciousConnectionRule(Rule):
                     alert_msg = f"ALERT: Connection from suspicious IP {src_ip} to {dst_ip} ({total_bytes/1024:.2f} KB) - Category: {category}"
                     alerts.append(alert_msg)
                     pending_alerts.append((src_ip, alert_msg, self.name))
+                    
+                    # Add threat intelligence to analysis_1.db
+                    self.analysis_manager.queue_query(
+                        lambda s=src_ip, d=dst_ip, b=total_bytes, c=category: 
+                        self._add_threat_intel_data(s, d, b, c, "source")
+                    )
                 
                 # Check destination IP
                 if self.is_suspicious_ip(dst_ip):
@@ -195,24 +214,85 @@ class SuspiciousConnectionRule(Rule):
                     alert_msg = f"ALERT: Connection to suspicious IP {dst_ip} from {src_ip} ({total_bytes/1024:.2f} KB) - Category: {category}"
                     alerts.append(alert_msg)
                     pending_alerts.append((dst_ip, alert_msg, self.name))
+                    
+                    # Add threat intelligence to analysis_1.db
+                    self.analysis_manager.queue_query(
+                        lambda s=src_ip, d=dst_ip, b=total_bytes, c=category: 
+                        self._add_threat_intel_data(s, d, b, c, "destination")
+                    )
             
-            # Queue all pending alerts AFTER all database operations are complete
+            # Write all pending alerts to analysis_1.db
             for ip, msg, rule_name in pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    self.analysis_manager.add_alert(ip, msg, rule_name)
                 except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
+                    logging.error(f"Error adding alert to analysis_1.db: {e}")
             
             return alerts
         except Exception as e:
             error_msg = f"Error in Local Threat Intelligence rule: {str(e)}"
             logging.error(error_msg)
-            # Try to queue the error alert
+            # Try to add the error alert to analysis_1.db
             try:
-                self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+                self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
             except:
                 pass
             return [error_msg]
+    
+    def _add_threat_intel_data(self, src_ip, dst_ip, bytes_transferred, category, flagged_end):
+        """Add threat intelligence data to analysis_1.db"""
+        try:
+            # Determine the suspicious IP and the other party in the connection
+            suspicious_ip = src_ip if flagged_end == "source" else dst_ip
+            other_ip = dst_ip if flagged_end == "source" else src_ip
+            
+            # Build threat intelligence data
+            threat_data = {
+                "score": self._get_threat_score(category),
+                "type": self._normalize_category(category),
+                "confidence": 0.9,  # High confidence since it's from local intel
+                "source": "Local_Threat_Intel",
+                "first_seen": time.time(),
+                "details": {
+                    "category": category,
+                    "connection_party": other_ip,
+                    "bytes_transferred": bytes_transferred,
+                    "detection_method": "local_threat_intel_match"
+                }
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            self.analysis_manager.update_threat_intel(suspicious_ip, threat_data)
+            return True
+        except Exception as e:
+            logging.error(f"Error adding threat intel data: {e}")
+            return False
+    
+    def _get_threat_score(self, category):
+        """Derive threat score from category"""
+        category = category.lower()
+        if "command" in category or "control" in category or "c2" in category:
+            return 9.0  # Very high for C2
+        elif "malware" in category or "botnet" in category:
+            return 8.0  # High for malware
+        elif "scan" in category:
+            return 6.0  # Medium for scanning
+        else:
+            return 5.0  # Default medium score
+    
+    def _normalize_category(self, category):
+        """Normalize category to standard type"""
+        category = category.lower()
+        if "command" in category or "control" in category or "c2" in category:
+            return "command_and_control"
+        elif "malware" in category:
+            return "malware_distribution"
+        elif "botnet" in category:
+            return "botnet"
+        elif "scan" in category:
+            return "scanning"
+        else:
+            return "suspicious_activity"
     
     def get_params(self):
         return {

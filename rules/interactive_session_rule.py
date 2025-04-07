@@ -20,6 +20,9 @@ class InteractiveSessionRule(Rule):
         self.keyboard_interval_max = 10  # Maximum interval for keystrokes (seconds)
         self.traffic_asymmetry_threshold = 5.0  # Asymmetry ratio for command input vs output
         self.detected_sessions = {}  # Track detected sessions
+        
+        # Store reference to analysis_manager (will be set later when analysis_manager is available)
+        self.analysis_manager = None
     
     def is_interactive_traffic_pattern(self, packet_sizes, packet_times):
         """Analyze if traffic pattern resembles human typing and command responses"""
@@ -55,7 +58,17 @@ class InteractiveSessionRule(Rule):
         return True, "interactive pattern detected"
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available
+        if not self.analysis_manager:
+            logging.error("Cannot run Interactive Session Detection rule: analysis_manager not available")
+            return ["ERROR: Interactive Session Detection rule requires analysis_manager"]
+            
         alerts = []
+        pending_alerts = []  # For writing to analysis_1.db
         current_time = time.time()
         
         # Only run this rule periodically
@@ -135,7 +148,14 @@ class InteractiveSessionRule(Rule):
                             ratio = max(inbound / outbound, outbound / inbound)
                             
                             self.detected_sessions[session_id] = current_time
-                            alerts.append(f"Interactive session detected: {src_ip} to {dst_ip}:{dst_port} ({packet_times[-1] - packet_times[0]:.1f} sec duration, traffic ratio: {ratio:.1f}x)")
+                            alert_msg = f"Interactive session detected: {src_ip} to {dst_ip}:{dst_port} ({packet_times[-1] - packet_times[0]:.1f} sec duration, traffic ratio: {ratio:.1f}x)"
+                            alerts.append(alert_msg)
+                            pending_alerts.append((src_ip, alert_msg, self.name))
+                            
+                            # Write behavioral data to analysis_1.db
+                            self.analysis_manager.queue_query(
+                                lambda s=src_ip, d=dst_ip, p=dst_port, r=ratio: self._add_session_data(s, d, p, r)
+                            )
                 
                 # Fallback method using just connection data
                 else:
@@ -183,8 +203,22 @@ class InteractiveSessionRule(Rule):
                                 
                                 if len(human_intervals) >= len(intervals) * 0.5:
                                     self.detected_sessions[session_id] = current_time
-                                    alerts.append(f"Likely interactive session: {src_ip} to {dst_ip}:{dst_port} ({len(transactions)} transactions with human-like timing)")
-                
+                                    alert_msg = f"Likely interactive session: {src_ip} to {dst_ip}:{dst_port} ({len(transactions)} transactions with human-like timing)"
+                                    alerts.append(alert_msg)
+                                    pending_alerts.append((src_ip, alert_msg, self.name))
+                                    
+                                    # Write behavioral data to analysis_1.db
+                                    self.analysis_manager.queue_query(
+                                        lambda s=src_ip, d=dst_ip, p=dst_port: self._add_session_data(s, d, p, 0)
+                                    )
+            
+            # Write all pending alerts to analysis_1.db
+            for ip, msg, rule_name in pending_alerts:
+                try:
+                    self.analysis_manager.add_alert(ip, msg, rule_name)
+                except Exception as e:
+                    logging.error(f"Error adding alert to analysis_1.db: {e}")
+                    
             # Clean up old detected sessions (after 4 hours)
             old_sessions = [s for s, t in self.detected_sessions.items() if current_time - t > 14400]
             for session in old_sessions:
@@ -196,6 +230,37 @@ class InteractiveSessionRule(Rule):
             error_msg = f"Error in Interactive Session Detection rule: {str(e)}"
             logging.error(error_msg)
             return [error_msg]
+    
+    def _add_session_data(self, src_ip, dst_ip, dst_port, traffic_ratio=0):
+        """Add interactive session data to analysis_1.db"""
+        try:
+            # For future implementation, we could store this data in a custom table
+            # For now, just store the information as threat intelligence
+            
+            session_type = "SSH" if dst_port == 22 else "Telnet" if dst_port == 23 else "RDP" if dst_port == 3389 else "VNC" if dst_port in [5900, 5901] else "Unknown"
+            
+            # Build threat intelligence data for the session
+            threat_data = {
+                "score": 3.0,  # Low-medium score - interactive sessions aren't inherently malicious
+                "type": "interactive_session",
+                "confidence": 0.7,
+                "source": "Interactive_Session_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "session_type": session_type,
+                    "destination": dst_ip,
+                    "destination_port": dst_port,
+                    "traffic_ratio": traffic_ratio,
+                    "detection_method": "traffic_analysis"
+                }
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            self.analysis_manager.update_threat_intel(src_ip, threat_data)
+            return True
+        except Exception as e:
+            logging.error(f"Error adding interactive session data: {e}")
+            return False
     
     def get_params(self):
         return {

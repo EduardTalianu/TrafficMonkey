@@ -15,12 +15,24 @@ class BeaconingDetectionRule(Rule):
         self.check_interval = 900  # Seconds between checks (15 minutes)
         self.last_check_time = 0
         self.detected_beacons = set()  # Track beacons we've already reported
+        
+        # Store reference to analysis_manager (will be set later when analysis_manager is available)
+        self.analysis_manager = None
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available
+        if not self.analysis_manager:
+            logging.error("Cannot run Beaconing Detection rule: analysis_manager not available")
+            return ["ERROR: Beaconing Detection rule requires analysis_manager"]
+        
         # Local list for returning alerts to UI immediately
         alerts = []
         
-        # List for storing alerts to be queued after analysis is complete
+        # List for storing alerts to be written to analysis_1.db
         pending_alerts = []
         
         current_time = time.time()
@@ -135,8 +147,14 @@ class BeaconingDetectionRule(Rule):
                         # Add to immediate alerts list for UI
                         alerts.append(alert_msg)
                         
-                        # Add to pending alerts for queueing (target IP is the destination)
+                        # Add to pending alerts for writing to analysis_1.db (target IP is the destination)
                         pending_alerts.append((dst_ip, alert_msg, self.name))
+                        
+                        # Add threat intelligence to analysis_1.db
+                        self.analysis_manager.queue_query(
+                            lambda s=src_ip, d=dst_ip, i=avg_interval, v=cv, c=len(timestamps): 
+                            self._add_beaconing_data(s, d, i, v, c)
+                        )
                         
                         # Prevent the detected set from growing too large
                         if len(self.detected_beacons) > 1000:
@@ -148,25 +166,68 @@ class BeaconingDetectionRule(Rule):
                     logging.error(f"Error processing timestamp data: {e}")
                     continue
             
-            # Queue all pending alerts AFTER all database operations are complete
+            # Write all pending alerts to analysis_1.db
             for ip, msg, rule_name in pending_alerts:
                 try:
-                    self.db_manager.queue_alert(ip, msg, rule_name)
+                    self.analysis_manager.add_alert(ip, msg, rule_name)
                 except Exception as e:
                     # Log error but continue processing
-                    logging.error(f"Error queueing alert: {e}")
+                    logging.error(f"Error adding alert to analysis_1.db: {e}")
             
             return alerts
             
         except Exception as e:
             error_msg = f"Error in Beaconing Detection rule: {str(e)}"
             logging.error(error_msg)
-            # Try to queue the error alert
+            # Try to add the error alert to analysis_1.db
             try:
-                self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+                self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
             except:
                 pass
             return [error_msg]
+    
+    def _add_beaconing_data(self, src_ip, dst_ip, interval, variance, connection_count):
+        """Add beaconing detection data to analysis_1.db"""
+        try:
+            # Build threat intelligence data
+            threat_data = {
+                "score": 7.0,  # High score for beaconing (strong C2 indicator)
+                "type": "command_and_control",
+                "confidence": 0.8,
+                "source": "Beaconing_Detection_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "beacon_interval": interval,
+                    "interval_variance": variance,
+                    "destination": dst_ip,
+                    "connection_count": connection_count,
+                    "detection_method": "timing_analysis"
+                }
+            }
+            
+            # Update threat intelligence in analysis_1.db for the source IP
+            self.analysis_manager.update_threat_intel(src_ip, threat_data)
+            
+            # Also add info about the destination as a potential C2 server
+            server_threat_data = {
+                "score": 7.5,  # Slightly higher score for C2 server
+                "type": "command_and_control_server",
+                "confidence": 0.8,
+                "source": "Beaconing_Detection_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "beacon_interval": interval,
+                    "interval_variance": variance,
+                    "client": src_ip,
+                    "detection_method": "timing_analysis"
+                }
+            }
+            self.analysis_manager.update_threat_intel(dst_ip, server_threat_data)
+            
+            return True
+        except Exception as e:
+            logging.error(f"Error adding beaconing data: {e}")
+            return False
             
     def get_params(self):
         return {
