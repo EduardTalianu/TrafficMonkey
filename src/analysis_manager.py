@@ -245,6 +245,7 @@ class AnalysisManager:
                     method TEXT,
                     host TEXT,
                     uri TEXT,
+                    referer TEXT,
                     user_agent TEXT,
                     version TEXT,
                     timestamp REAL NOT NULL
@@ -259,6 +260,8 @@ class AnalysisManager:
                     status_code INTEGER,
                     server TEXT,
                     timestamp REAL NOT NULL,
+                    content_type TEXT,
+                    content_length INTEGER,
                     FOREIGN KEY(request_id) REFERENCES http_requests(id)
                 )
             """)
