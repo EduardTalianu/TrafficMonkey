@@ -544,7 +544,7 @@ class DatabaseManager:
             return False
 
     def sync_databases(self):
-        """Synchronize data from capture DB to analysis DB with improved table detection and creation"""
+        """Synchronize data from capture.db to analysis.db with improved table detection and creation"""
         try:
             with self.sync_lock:
                 current_time = time.time()
@@ -566,8 +566,12 @@ class DatabaseManager:
                 all_tables = [row[0] for row in sync_capture_cursor.fetchall()]
                 logger.info(f"Found {len(all_tables)} tables to synchronize: {', '.join(all_tables)}")
                 
+                # Skip tables that should now be only in analysis_1.db
+                tables_to_skip = ['alerts', 'port_scan_timestamps', 'app_protocols']
+                tables_to_sync = [t for t in all_tables if t not in tables_to_skip]
+                
                 # Sync each table
-                for table_name in all_tables:
+                for table_name in tables_to_sync:
                     try:
                         # Check if table exists in analysis DB - if not, create it
                         if not capture_fields.table_exists(sync_analysis_cursor, table_name):

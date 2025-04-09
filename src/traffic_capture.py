@@ -480,21 +480,21 @@ class TrafficCaptureEngine:
                 if "icmp_type" in layers:
                     self._store_icmp_data(layers, src_ip, dst_ip)
                 
-                # Track ports for port scan detection
-                if dst_port:
-                    self.db_manager.add_port_scan_data(src_ip, dst_ip, dst_port)
+                # Track ports for port scan detection - now forwarded to analysis_manager
+                if dst_port and self.analysis_manager:
+                    self.analysis_manager.add_port_scan_data(src_ip, dst_ip, dst_port)
                 
-                # Store basic protocol info based on port
-                if dst_port:
+                # Store basic protocol info based on port - now forwarded to analysis_manager
+                if dst_port and self.analysis_manager:
                     # Store based on common port numbers - simplified detection
                     if dst_port == 80:
-                        self.db_manager.add_app_protocol(connection_key, "HTTP", detection_method="port-based")
+                        self.analysis_manager.add_app_protocol(connection_key, "HTTP", detection_method="port-based")
                     elif dst_port == 443:
-                        self.db_manager.add_app_protocol(connection_key, "HTTPS", detection_method="port-based")
+                        self.analysis_manager.add_app_protocol(connection_key, "HTTPS", detection_method="port-based")
                     elif dst_port == 53 or src_port == 53:
-                        self.db_manager.add_app_protocol(connection_key, "DNS", detection_method="port-based")
+                        self.analysis_manager.add_app_protocol(connection_key, "DNS", detection_method="port-based")
                     elif dst_port == 445 or src_port == 445:
-                        self.db_manager.add_app_protocol(connection_key, "SMB", detection_method="port-based")
+                        self.analysis_manager.add_app_protocol(connection_key, "SMB", detection_method="port-based")
                 
                 # Store the basic connection in the database with MAC address
                 if src_ip and dst_ip:  # Only add if we have both IPs
@@ -953,8 +953,12 @@ class TrafficCaptureEngine:
             return False
 
     def add_alert(self, ip_address, alert_message, rule_name):
-        """Add an alert through the database manager's queue"""
-        # Store in in-memory collection first
+        """Add an alert through the analysis manager"""
+        # Check if we have an analysis manager
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, rule_name)
+        
+        # Fallback to old method
         if alert_message not in self.alerts_by_ip[ip_address]:
             self.alerts_by_ip[ip_address].add(alert_message)
             

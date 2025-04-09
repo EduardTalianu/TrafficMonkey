@@ -373,7 +373,8 @@ CAPTURE_FIELDS = [
     }
 ]
 
-# Manually add tables that don't directly map to capture fields
+# Updated TABLE_DEFINITIONS for capture.db and analysis.db
+# Removed tables that should be moved to analysis_1.db
 TABLE_DEFINITIONS = {
     "connections": [
         {"name": "connection_key", "type": "TEXT PRIMARY KEY", "required": True},
@@ -385,7 +386,7 @@ TABLE_DEFINITIONS = {
         {"name": "total_bytes", "type": "INTEGER DEFAULT 0", "required": False},
         {"name": "packet_count", "type": "INTEGER DEFAULT 0", "required": False},
         {"name": "timestamp", "type": "REAL", "required": True},
-        {"name": "vt_result", "type": "TEXT DEFAULT 'unknown'", "required": False},
+        # Removed vt_result column - moved to analysis_1.db
         {"name": "is_rdp_client", "type": "BOOLEAN DEFAULT 0", "required": False},
         {"name": "protocol", "type": "TEXT", "required": False},
         {"name": "ttl", "type": "INTEGER", "required": False}
@@ -470,19 +471,6 @@ TABLE_DEFINITIONS = {
         {"name": "certificate_validity_end", "type": "TEXT", "required": False},
         {"name": "certificate_serial", "type": "TEXT", "required": False}
     ],
-    "port_scan_timestamps": [
-        {"name": "src_ip", "type": "TEXT", "required": True},
-        {"name": "dst_ip", "type": "TEXT", "required": True},
-        {"name": "dst_port", "type": "INTEGER", "required": True},
-        {"name": "timestamp", "type": "REAL", "required": True}
-    ],
-    "app_protocols": [
-        {"name": "connection_key", "type": "TEXT PRIMARY KEY", "required": True},
-        {"name": "app_protocol", "type": "TEXT", "required": True},
-        {"name": "protocol_details", "type": "TEXT", "required": False},
-        {"name": "detection_method", "type": "TEXT", "required": False},
-        {"name": "timestamp", "type": "REAL", "required": True}
-    ],
     "arp_data": [
         {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
         {"name": "timestamp", "type": "REAL", "required": True},
@@ -490,18 +478,15 @@ TABLE_DEFINITIONS = {
         {"name": "src_mac", "type": "TEXT", "required": False},
         {"name": "dst_ip", "type": "TEXT", "required": False},
         {"name": "operation", "type": "INTEGER", "required": False}
-    ],
-    "alerts": [
-        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
-        {"name": "ip_address", "type": "TEXT", "required": True},
-        {"name": "alert_message", "type": "TEXT", "required": True},
-        {"name": "rule_name", "type": "TEXT", "required": True},
-        {"name": "timestamp", "type": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "required": True}
     ]
+    # Removed the following tables - moved to analysis_1.db:
+    # - alerts 
+    # - port_scan_timestamps
+    # - app_protocols
 }
 
 # Track schema version for migrations
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3  # Incremented version for the new schema changes
 
 # Database management functions
 def table_exists(cursor, table_name):
@@ -601,23 +586,6 @@ def create_standard_indices(cursor):
             ON connections(total_bytes DESC)
         """)
     
-    # Alerts table indices
-    if 'alerts' in existing_tables:
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_alerts_ip 
-            ON alerts(ip_address)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_alerts_rule
-            ON alerts(rule_name)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_alerts_timestamp 
-            ON alerts(timestamp DESC)
-        """)
-    
     # DNS queries indices
     if 'dns_queries' in existing_tables:
         cursor.execute("""
@@ -692,34 +660,17 @@ def create_standard_indices(cursor):
             ON smb_files(filename)
         """)
     
-    # HTTP headers indices - this is the problematic one
+    # HTTP headers indices
     if 'http_headers' in existing_tables:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_http_headers_conn 
             ON http_headers(connection_key)
         """)
         
-        # This index is causing the error - replace request_id with the correct column name
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_http_headers_req 
             ON http_headers(request_id)
         """)
-
-def create_extended_indices(cursor, extended_tables):
-    """Create indices for extended tables"""
-    if 'ip_geolocation' in extended_tables:
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_geolocation_country ON ip_geolocation(country)")
-    
-    if 'ip_threat_intel' in extended_tables:
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_threat_score ON ip_threat_intel(threat_score DESC)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_threat_type ON ip_threat_intel(threat_type)")
-    
-    if 'traffic_patterns' in extended_tables:
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_pattern_periodic ON traffic_patterns(periodic_score DESC)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_pattern_class ON traffic_patterns(classification)")
-    
-    if 'connection_statistics' in extended_tables:
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_conn_stats_time ON connection_statistics(timestamp)")
 
 def get_integrated_schema(extended_tables=None):
     """
@@ -792,8 +743,7 @@ def get_tables_schema():
             for column in columns:
                 if not any(c["name"] == column["name"] for c in tables[table_name]):
                     tables[table_name].append(column)
-    
-    return tables
+                    return tables
 
 def get_field_by_tshark_name(tshark_field):
     """Get field definition by tshark field name"""

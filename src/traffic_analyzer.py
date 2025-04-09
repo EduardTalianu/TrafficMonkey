@@ -69,6 +69,21 @@ class Rule:
         if self.db_manager:
             return self.db_manager.update_connection_field(connection_key, field, value)
         return False
+        
+    def add_alert(self, ip_address, alert_message):
+        """
+        Add an alert for an IP address
+        This will be stored in analysis_1.db
+        """
+        if self.db_manager and hasattr(self.db_manager, 'analysis_manager'):
+            # Use analysis manager to add alert
+            return self.db_manager.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        
+        # Fallback to old method if analysis_manager not available
+        elif self.db_manager:
+            return self.db_manager.queue_alert(ip_address, alert_message, self.name)
+        
+        return False
 
 class RuleLoader:
     """Handles loading rule modules from the rules directory"""

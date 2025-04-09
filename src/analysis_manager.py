@@ -16,6 +16,28 @@ logger = logging.getLogger('analysis_manager')
 
 # Define extended table definitions specific to analysis_1.db
 EXTENDED_TABLE_DEFINITIONS = {
+    # Tables moved from capture.db to analysis_1.db
+    "x_alerts": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "ip_address", "type": "TEXT", "required": True},
+        {"name": "alert_message", "type": "TEXT", "required": True},
+        {"name": "rule_name", "type": "TEXT", "required": True},
+        {"name": "timestamp", "type": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "required": True}
+    ],
+    "x_port_scans": [
+        {"name": "src_ip", "type": "TEXT", "required": True},
+        {"name": "dst_ip", "type": "TEXT", "required": True},
+        {"name": "dst_port", "type": "INTEGER", "required": True},
+        {"name": "timestamp", "type": "REAL", "required": True}
+    ],
+    "x_app_protocols": [
+        {"name": "connection_key", "type": "TEXT PRIMARY KEY", "required": True},
+        {"name": "app_protocol", "type": "TEXT", "required": True},
+        {"name": "protocol_details", "type": "TEXT", "required": False},
+        {"name": "detection_method", "type": "TEXT", "required": False},
+        {"name": "timestamp", "type": "REAL", "required": True}
+    ],
+    # Original analytics tables
     "x_ip_geolocation": [
         {"name": "ip_address", "type": "TEXT PRIMARY KEY", "required": True},
         {"name": "country", "type": "TEXT", "required": False},
@@ -201,6 +223,16 @@ class AnalysisManager:
     
     def _create_extended_indices(self, cursor):
         """Create indices for extended tables"""
+        # Indices for tables moved from capture.db
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_alerts_ip ON x_alerts(ip_address)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_alerts_rule ON x_alerts(rule_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_alerts_timestamp ON x_alerts(timestamp DESC)")
+        
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_port_scans_src ON x_port_scans(src_ip)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_port_scans_dst ON x_port_scans(dst_ip, dst_port)")
+        
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_app_protocols_protocol ON x_app_protocols(app_protocol)")
+        
         # IP geolocation indices
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_geolocation_country ON x_ip_geolocation(country)")
         
@@ -503,11 +535,11 @@ class AnalysisManager:
         return self.analysis1_conn.cursor()
     
     def add_alert(self, ip_address, alert_message, rule_name):
-        """Add an alert to analysis_1.db"""
+        """Add an alert to analysis_1.db in the x_alerts table"""
         try:
             cursor = self.analysis1_conn.cursor()
             cursor.execute("""
-                INSERT OR IGNORE INTO alerts (ip_address, alert_message, rule_name)
+                INSERT INTO x_alerts (ip_address, alert_message, rule_name)
                 VALUES (?, ?, ?)
             """, (ip_address, alert_message, rule_name))
             self.analysis1_conn.commit()
@@ -515,6 +547,63 @@ class AnalysisManager:
             return True
         except Exception as e:
             logger.error(f"Error adding alert: {e}")
+            return False
+        
+    def add_port_scan_data(self, src_ip, dst_ip, dst_port):
+        """Store port scan detection data in x_port_scans table"""
+        try:
+            cursor = self.analysis1_conn.cursor()
+            current_time = time.time()
+            cursor.execute("""
+                INSERT OR REPLACE INTO x_port_scans
+                (src_ip, dst_ip, dst_port, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (src_ip, dst_ip, dst_port, current_time))
+            self.analysis1_conn.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating port scan data: {e}")
+            return False
+    
+    def add_app_protocol(self, connection_key, app_protocol, protocol_details=None, detection_method=None):
+        """Store application protocol information in x_app_protocols table"""
+        try:
+            cursor = self.analysis1_conn.cursor()
+            current_time = time.time()
+            cursor.execute("""
+                INSERT OR REPLACE INTO x_app_protocols
+                (connection_key, app_protocol, protocol_details, detection_method, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (connection_key, app_protocol, protocol_details, detection_method, current_time))
+            self.analysis1_conn.commit()
+            cursor.close()
+            
+            # Also update the protocol field in connections table for backward compatibility
+            if self.db_manager:
+                self.db_manager.queue_query(
+                    self.db_manager.update_connection_field,
+                    None,
+                    connection_key, 
+                    "protocol", 
+                    app_protocol
+                )
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error storing application protocol: {e}")
+            return False
+        
+    def clear_alerts(self):
+        """Clear all alerts from x_alerts table"""
+        try:
+            cursor = self.analysis1_conn.cursor()
+            cursor.execute("DELETE FROM x_alerts")
+            self.analysis1_conn.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing alerts: {e}")
             return False
     
     def _periodic_analysis(self):
