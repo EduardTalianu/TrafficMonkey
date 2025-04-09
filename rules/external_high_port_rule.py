@@ -2,6 +2,7 @@
 # Note: Rule class is injected into the namespace by the RuleLoader
 import logging
 import ipaddress
+import time
 
 class HighPortConnectionRule(Rule):
     def __init__(self):
@@ -142,30 +143,23 @@ class HighPortConnectionRule(Rule):
                     if dst_port and dst_port > self.port_threshold and not self.is_local_ip(dst_ip):
                         alert_msg = f"External very high destination port connection from {src_ip} to {dst_ip} (port {dst_port}, {total_bytes/1024:.2f} KB)"
                         alerts.append(alert_msg)
-                        pending_alerts.append((src_ip, alert_msg, self.name))
                         
-                        # Write data to analysis_1.db
-                        self.analysis_manager.queue_query(
-                            lambda s=src_ip, d=dst_ip, p=dst_port, b=total_bytes: self._add_high_port_data(s, d, p, b, "destination")
-                        )
+                        # Add the alert to x_alerts table
+                        self.add_alert(src_ip, alert_msg)
+                        
+                        # Add threat intelligence to analysis_1.db
+                        self._add_high_port_data(src_ip, dst_ip, dst_port, total_bytes, packet_count, "destination")
                     
                     # Alert on very high source ports from external sources only
                     elif src_port and src_port > self.port_threshold and not self.is_local_ip(src_ip):
                         alert_msg = f"External very high source port connection from {src_ip} (port {src_port}) to {dst_ip} ({total_bytes/1024:.2f} KB)"
                         alerts.append(alert_msg)
-                        pending_alerts.append((src_ip, alert_msg, self.name))
                         
-                        # Write data to analysis_1.db
-                        self.analysis_manager.queue_query(
-                            lambda s=src_ip, d=dst_ip, p=src_port, b=total_bytes: self._add_high_port_data(s, d, p, b, "source")
-                        )
-                
-                # Write all pending alerts to analysis_1.db
-                for ip, msg, rule_name in pending_alerts:
-                    try:
-                        self.analysis_manager.add_alert(ip, msg, rule_name)
-                    except Exception as e:
-                        logging.error(f"Error adding alert to analysis_1.db: {e}")
+                        # Add the alert to x_alerts table
+                        self.add_alert(src_ip, alert_msg)
+                        
+                        # Add threat intelligence to analysis_1.db
+                        self._add_high_port_data(src_ip, dst_ip, src_port, total_bytes, packet_count, "source")
                 
                 return alerts
             
@@ -209,30 +203,23 @@ class HighPortConnectionRule(Rule):
                 if dst_port > self.port_threshold and not self.is_local_ip(dst_ip):
                     alert_msg = f"External very high destination port connection from {src_ip}:{src_port} to {dst_ip}:{dst_port} ({total_bytes/1024:.2f} KB)"
                     alerts.append(alert_msg)
-                    pending_alerts.append((src_ip, alert_msg, self.name))
                     
-                    # Write data to analysis_1.db
-                    self.analysis_manager.queue_query(
-                        lambda s=src_ip, d=dst_ip, p=dst_port, b=total_bytes: self._add_high_port_data(s, d, p, b, "destination")
-                    )
+                    # Add the alert to x_alerts table
+                    self.add_alert(src_ip, alert_msg)
+                    
+                    # Add threat intelligence to analysis_1.db
+                    self._add_high_port_data(src_ip, dst_ip, dst_port, total_bytes, packet_count, "destination")
                 
                 # Alert on very high source ports from external sources only
                 elif src_port > self.port_threshold and not self.is_local_ip(src_ip):
                     alert_msg = f"External very high source port connection from {src_ip}:{src_port} to {dst_ip}:{dst_port} ({total_bytes/1024:.2f} KB)"
                     alerts.append(alert_msg)
-                    pending_alerts.append((src_ip, alert_msg, self.name))
                     
-                    # Write data to analysis_1.db
-                    self.analysis_manager.queue_query(
-                        lambda s=src_ip, d=dst_ip, p=src_port, b=total_bytes: self._add_high_port_data(s, d, p, b, "source")
-                    )
-            
-            # Write all pending alerts to analysis_1.db
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error adding alert to analysis_1.db: {e}")
+                    # Add the alert to x_alerts table
+                    self.add_alert(src_ip, alert_msg)
+                    
+                    # Add threat intelligence to analysis_1.db
+                    self._add_high_port_data(src_ip, dst_ip, src_port, total_bytes, packet_count, "source")
                     
             return alerts
                 
@@ -241,12 +228,42 @@ class HighPortConnectionRule(Rule):
             logging.error(error_msg)
             return [error_msg]
     
-    def _add_high_port_data(self, src_ip, dst_ip, port, bytes_transferred, port_type):
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_high_port_data(self, src_ip, dst_ip, port, bytes_transferred, packet_count, port_type):
         """Add high port connection data to analysis_1.db"""
         try:
             # Build threat intelligence data
             suspicious_ip = src_ip if port_type == "source" else dst_ip
             other_ip = dst_ip if port_type == "source" else src_ip
+            
+            # Determine protocol based on port
+            protocol = "Unknown"
+            if port in [80, 443, 8080, 8443]:
+                protocol = "HTTP/HTTPS"
+            elif port == 53:
+                protocol = "DNS"
+            elif port == 22:
+                protocol = "SSH"
+            elif port == 25 or port == 587:
+                protocol = "SMTP"
+            else:
+                protocol = "TCP/UDP"
+                
+            # Set proper detection description
+            if port_type == "source":
+                detection_type = "high_source_port"
+                port_description = "Source port"
+            else:
+                detection_type = "high_destination_port"
+                port_description = "Destination port"
+                
+            # Calculate bytes per packet
+            bytes_per_packet = bytes_transferred / max(packet_count, 1)
             
             threat_data = {
                 "score": 4.0,  # Medium score for high port usage
@@ -259,8 +276,18 @@ class HighPortConnectionRule(Rule):
                     "port_type": port_type,
                     "connection_party": other_ip,
                     "bytes_transferred": bytes_transferred,
+                    "packet_count": packet_count,
+                    "bytes_per_packet": bytes_per_packet,
+                    f"{port_type}_port": port,
                     "detection_method": "unusual_port_analysis"
-                }
+                },
+                # Extended columns for easy querying
+                "protocol": protocol,
+                "destination_ip": dst_ip if port_type == "destination" else None,
+                "destination_port": port if port_type == "destination" else None,
+                "bytes_transferred": bytes_transferred,
+                "detection_method": detection_type,
+                "packet_count": packet_count
             }
             
             # Update threat intelligence in analysis_1.db

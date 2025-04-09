@@ -148,7 +148,6 @@ class GeolocationRule(Rule):
             return ["ERROR: Geolocation rule requires analysis_manager"]
         
         alerts = []
-        pending_alerts = []  # For writing to analysis_1.db
         current_time = time.time()
         
         # Only run this rule periodically
@@ -191,43 +190,42 @@ class GeolocationRule(Rule):
                 country_name = geo_data.get("country_name", "Unknown")
                 
                 # Store geolocation data in analysis_1.db regardless of alert status
-                self.analysis_manager.queue_query(
-                    lambda ip=src_ip, cc=country_code, cn=country_name: 
-                    self._store_geolocation_data(ip, cc, cn)
-                )
+                geo_entry = {
+                    'country': country_name,
+                    'region': '',
+                    'city': '',
+                    'latitude': 0,
+                    'longitude': 0,
+                    'asn': '',
+                    'asn_name': ''
+                }
+                self.analysis_manager.store_ip_geolocation(src_ip, geo_entry)
                 
                 # Alert on high-risk countries
                 if country_code in self.high_risk_countries:
                     alert_msg = f"Connection from high-risk country: {src_ip} ({country_name}) to {dst_ip} ({total_bytes/1024:.1f} KB)"
                     alerts.append(alert_msg)
-                    pending_alerts.append((src_ip, alert_msg, self.name))
+                    
+                    # Add alert using the new method
+                    self.add_alert(src_ip, alert_msg)
+                    
                     alerted_ips.add(src_ip)
                     
                     # Add threat intelligence to analysis_1.db
-                    self.analysis_manager.queue_query(
-                        lambda ip=src_ip, d=dst_ip, cc=country_code, cn=country_name, b=total_bytes: 
-                        self._add_high_risk_country_data(ip, d, cc, cn, b)
-                    )
+                    self._add_high_risk_country_data(src_ip, dst_ip, country_code, country_name, total_bytes)
                 
                 # Alert on all foreign countries if enabled
                 elif self.alert_on_all_foreign and country_code != "LOCAL" and country_code != "XX":
                     alert_msg = f"Foreign connection: {src_ip} ({country_name}) to {dst_ip} ({total_bytes/1024:.1f} KB)"
                     alerts.append(alert_msg)
-                    pending_alerts.append((src_ip, alert_msg, self.name))
+                    
+                    # Add alert using the new method
+                    self.add_alert(src_ip, alert_msg)
+                    
                     alerted_ips.add(src_ip)
                     
                     # Add threat intelligence to analysis_1.db
-                    self.analysis_manager.queue_query(
-                        lambda ip=src_ip, d=dst_ip, cc=country_code, cn=country_name, b=total_bytes: 
-                        self._add_foreign_country_data(ip, d, cc, cn, b)
-                    )
-            
-            # Write all pending alerts to analysis_1.db
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error adding alert to analysis_1.db: {e}")
+                    self._add_foreign_country_data(src_ip, dst_ip, country_code, country_name, total_bytes)
             
             return alerts
         except Exception as e:
@@ -235,31 +233,16 @@ class GeolocationRule(Rule):
             logging.error(error_msg)
             # Try to add the error alert to analysis_1.db
             try:
-                self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                self.add_alert("127.0.0.1", error_msg)
             except:
                 pass
             return [error_msg]
     
-    def _store_geolocation_data(self, ip_address, country_code, country_name):
-        """Store basic geolocation data in analysis_1.db"""
-        try:
-            # Store minimal geolocation data in the ip_geolocation table
-            geo_data = {
-                'country': country_name,
-                'region': '',
-                'city': '',
-                'latitude': 0,
-                'longitude': 0,
-                'asn': '',
-                'asn_name': ''
-            }
-            
-            # Use analysis_manager to store geolocation data
-            self.analysis_manager.store_ip_geolocation(ip_address, geo_data)
-            return True
-        except Exception as e:
-            logging.error(f"Error storing geolocation data: {e}")
-            return False
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
     
     def _add_high_risk_country_data(self, src_ip, dst_ip, country_code, country_name, bytes_transferred):
         """Add high-risk country data to analysis_1.db"""
@@ -276,8 +259,14 @@ class GeolocationRule(Rule):
                     "country_name": country_name,
                     "target_ip": dst_ip,
                     "bytes_transferred": bytes_transferred,
-                    "detection_method": "geolocation"
-                }
+                    "detection_method": "geolocation",
+                    "risk_category": "high_risk_country"
+                },
+                # Extended columns for easy querying
+                "protocol": "Unknown",
+                "destination_ip": dst_ip,
+                "bytes_transferred": bytes_transferred,
+                "detection_method": "geolocation_analysis"
             }
             
             # Update threat intelligence in analysis_1.db
@@ -302,8 +291,14 @@ class GeolocationRule(Rule):
                     "country_name": country_name,
                     "target_ip": dst_ip,
                     "bytes_transferred": bytes_transferred,
-                    "detection_method": "geolocation"
-                }
+                    "detection_method": "geolocation",
+                    "risk_category": "foreign_country"
+                },
+                # Extended columns for easy querying
+                "protocol": "Unknown",
+                "destination_ip": dst_ip,
+                "bytes_transferred": bytes_transferred,
+                "detection_method": "geolocation_analysis"
             }
             
             # Update threat intelligence in analysis_1.db

@@ -1,5 +1,6 @@
 # Rule class is injected by the RuleLoader
 import logging
+import time
 
 class SMBAuthScanRule(Rule):
     """Rule that detects SMB/Windows authentication scanning attempts"""
@@ -9,10 +10,19 @@ class SMBAuthScanRule(Rule):
         self.threshold = 5  # Number of different hosts to trigger alert
         self.time_window = 300  # Time window in seconds (5 minutes)
         self.min_bytes = 200  # Minimum bytes to consider a significant connection
+        self.analysis_manager = None  # Will be set by access to db_manager.analysis_manager
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available
+        if not self.analysis_manager:
+            logging.error(f"Cannot run {self.name} rule: analysis_manager not available")
+            return [f"ERROR: {self.name} rule requires analysis_manager"]
+        
         alerts = []
-        pending_alerts = []
         
         try:
             # Find sources connecting to SMB ports on multiple destinations
@@ -49,35 +59,58 @@ class SMBAuthScanRule(Rule):
                 alerts.append(alert_msg)
                 alerts.append(targets_msg)
                 
-                pending_alerts.append((src_ip, alert_msg, self.name))
-                pending_alerts.append((src_ip, targets_msg, self.name))
-            
-            # Queue all pending alerts
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    # Use analysis_manager to add alerts to analysis_1.db
-                    if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
-                        self.db_manager.analysis_manager.add_alert(ip, msg, rule_name)
-                    else:
-                        self.db_manager.queue_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
+                # Add alerts to x_alerts
+                self.add_alert(src_ip, alert_msg)
+                self.add_alert(src_ip, targets_msg)
+                
+                # Add threat intelligence data
+                self._add_threat_intel(src_ip, {
+                    "target_count": target_count,
+                    "target_list": target_list,
+                    "time_window": self.time_window,
+                    "ports": self.smb_ports
+                })
             
             return alerts
             
         except Exception as e:
             error_msg = f"Error in SMB Authentication Scan rule: {str(e)}"
             logging.error(error_msg)
-            # Try to queue the error alert
-            try:
-                # Use analysis_manager to add alerts to analysis_1.db
-                if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
-                    self.db_manager.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
-                else:
-                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
-            except Exception as e:
-                logging.error(f"Failed to queue error alert: {e}")
+            self.add_alert("127.0.0.1", error_msg)
             return [error_msg]
+    
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_threat_intel(self, ip_address, details_dict):
+        """Store threat intelligence data in x_ip_threat_intel"""
+        try:
+            # Create threat intelligence data
+            threat_data = {
+                "score": 7.0,  # Severity score (0-10)
+                "type": "smb_scan", 
+                "confidence": 0.85,  # Confidence level (0-1)
+                "source": self.name,  # Rule name as source
+                "first_seen": time.time(),
+                "details": {
+                    # Detailed JSON information 
+                    "detection_details": details_dict
+                },
+                # Extended columns for easy querying
+                "protocol": "SMB",
+                "destination_port": 445,  # Use primary SMB port for record
+                "detection_method": "auth_scan_detection",
+                "packet_count": details_dict.get("target_count", 0)
+            }
+            
+            # Update threat intelligence in x_ip_threat_intel
+            return self.analysis_manager.update_threat_intel(ip_address, threat_data)
+        except Exception as e:
+            logging.error(f"Error adding threat intelligence data: {e}")
+            return False
     
     def get_params(self):
         return {

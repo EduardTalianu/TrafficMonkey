@@ -175,7 +175,6 @@ class CommandControlDetectionRule(Rule):
             return ["ERROR: Command & Control Detection rule requires analysis_manager"]
             
         alerts = []
-        pending_alerts = []  # Track alerts for writing to analysis_1.db
         current_time = time.time()
         
         # Only run periodically
@@ -208,7 +207,9 @@ class CommandControlDetectionRule(Rule):
                             self.detected_c2[c2_key] = current_time
                             alert_msg = f"Potential C2: {src_ip} queried known C2 domain: {domain}"
                             alerts.append(alert_msg)
-                            pending_alerts.append((src_ip, alert_msg, self.name))
+                            
+                            # Add alert using the new method
+                            self.add_alert(src_ip, alert_msg)
             
             # Check for connections to known C2 IPs
             for c2_ip in self.c2_ips:
@@ -227,7 +228,9 @@ class CommandControlDetectionRule(Rule):
                         self.detected_c2[c2_key] = current_time
                         alert_msg = f"Potential C2: {src_ip} connected to known C2 server: {dst_ip} ({count} connections)"
                         alerts.append(alert_msg)
-                        pending_alerts.append((src_ip, alert_msg, self.name))
+                        
+                        # Add alert using the new method
+                        self.add_alert(src_ip, alert_msg)
             
             # 2. Check for beaconing patterns matching known C2 frameworks
             db_cursor.execute("""
@@ -285,20 +288,13 @@ class CommandControlDetectionRule(Rule):
                             self.detected_c2[c2_key] = current_time
                             alert_msg = f"Potential {c2_type} C2 channel: {src_ip} to {dst_ip}:{dst_port} - {reason}"
                             alerts.append(alert_msg)
-                            pending_alerts.append((src_ip, alert_msg, self.name))
+                            
+                            # Add alert using the new method
+                            self.add_alert(src_ip, alert_msg)
                             
                             # Add threat intelligence to analysis_1.db
-                            self.analysis_manager.queue_query(
-                                lambda ip=src_ip, c2=c2_type: self._add_threat_intel(ip, dst_ip, c2_type)
-                            )
+                            self._add_threat_intel(src_ip, dst_ip, dst_port, c2_type)
                             break
-            
-            # Write all pending alerts to analysis_1.db
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error adding alert to analysis_1.db: {e}")
             
             # Clean up old detections (after 12 hours)
             old_c2 = [k for k, t in self.detected_c2.items() if current_time - t > 43200]
@@ -312,7 +308,13 @@ class CommandControlDetectionRule(Rule):
             logging.error(error_msg)
             return [error_msg]
     
-    def _add_threat_intel(self, src_ip, dst_ip, c2_type):
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_threat_intel(self, src_ip, dst_ip, dst_port, c2_type):
         """Add threat intelligence data to analysis_1.db for C2 detections"""
         try:
             # Build threat intelligence data for the IP
@@ -325,8 +327,14 @@ class CommandControlDetectionRule(Rule):
                 "details": {
                     "c2_type": c2_type,
                     "c2_server": dst_ip,
+                    "c2_port": dst_port,
                     "detection_method": "behavior_analysis"
-                }
+                },
+                # Extended columns for easy querying
+                "protocol": "TCP",
+                "destination_ip": dst_ip,
+                "destination_port": dst_port,
+                "detection_method": "behavior_analysis"
             }
             
             # Update threat intelligence in analysis_1.db
@@ -343,8 +351,13 @@ class CommandControlDetectionRule(Rule):
                     "details": {
                         "c2_type": c2_type,
                         "c2_client": src_ip,
+                        "c2_port": dst_port,
                         "detection_method": "behavior_analysis"
-                    }
+                    },
+                    # Extended columns for easy querying
+                    "protocol": "TCP",
+                    "destination_port": dst_port,
+                    "detection_method": "behavior_analysis"
                 }
                 self.analysis_manager.update_threat_intel(dst_ip, server_threat_data)
                 

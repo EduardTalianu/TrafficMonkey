@@ -12,7 +12,7 @@ class LateralMovementRule(Rule):
         )
         self.check_interval = 600  # Seconds between checks
         self.last_check_time = 0
-        self.analysis_manager = None  # Will be set when db_manager is set
+        self.analysis_manager = None  # Will be set by access to db_manager.analysis_manager
         
         # Administrative/management protocols often used in lateral movement
         self.admin_ports = {
@@ -50,13 +50,16 @@ class LateralMovementRule(Rule):
             return False  # If we can't parse it, assume it's not internal
     
     def analyze(self, db_cursor):
-        # Get reference to analysis_manager if not already set
-        if not hasattr(self, 'analysis_manager') or not self.analysis_manager:
-            if hasattr(self.db_manager, 'analysis_manager'):
-                self.analysis_manager = self.db_manager.analysis_manager
-
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available
+        if not self.analysis_manager:
+            logging.error(f"Cannot run {self.name} rule: analysis_manager not available")
+            return [f"ERROR: {self.name} rule requires analysis_manager"]
+        
         alerts = []
-        pending_alerts = []  # Track alerts for queueing
         current_time = time.time()
         
         # Only run periodically
@@ -133,45 +136,68 @@ class LateralMovementRule(Rule):
                     # Create main alert
                     alert_msg = f"Lateral movement detected: {src_ip} connected to {len(internal_targets)} internal hosts using {admin_protocol_count} administrative protocols"
                     alerts.append(alert_msg)
-                    pending_alerts.append((src_ip, alert_msg, self.name))
+                    self.add_alert(src_ip, alert_msg)
+                    
+                    # Add threat intelligence data
+                    self._add_threat_intel(src_ip, {
+                        "internal_targets": internal_targets,
+                        "admin_protocols": [p for p, t in admin_targets.items() if t],
+                        "total_targets": len(internal_targets),
+                        "admin_protocol_count": admin_protocol_count,
+                        "detection_time": current_time
+                    })
                     
                     # Add details about protocols and targets
                     for protocol_info in protocols_used:
                         detail_msg = f"  - Used {protocol_info}"
                         alerts.append(detail_msg)
-                        pending_alerts.append((src_ip, detail_msg, self.name))
+                        self.add_alert(src_ip, detail_msg)
             
             # Clean up old detections (after 12 hours)
             old_movements = [k for k, t in self.detected_movements.items() if current_time - t > 43200]
             for key in old_movements:
                 self.detected_movements.pop(key, None)
             
-            # Queue all pending alerts to analysis_1.db through analysis_manager if available
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    if self.analysis_manager:
-                        # Write alerts to analysis_1.db
-                        self.analysis_manager.add_alert(ip, msg, rule_name)
-                    else:
-                        # Fallback to db_manager (which writes to capture.db)
-                        self.db_manager.queue_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
-            
             return alerts
             
         except Exception as e:
             error_msg = f"Error in Lateral Movement Detection rule: {str(e)}"
             logging.error(error_msg)
-            # Try to queue the error alert
-            try:
-                if self.analysis_manager:
-                    self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
-                else:
-                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
-            except:
-                pass
+            self.add_alert("127.0.0.1", error_msg)
             return [error_msg]
+    
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_threat_intel(self, ip_address, details_dict):
+        """Store threat intelligence data in x_ip_threat_intel"""
+        try:
+            # Create threat intelligence data
+            threat_data = {
+                "score": 8.0,  # High severity score (0-10)
+                "type": "lateral_movement", 
+                "confidence": 0.85,  # Confidence level (0-1)
+                "source": self.name,  # Rule name as source
+                "first_seen": time.time(),
+                "details": {
+                    # Detailed JSON information 
+                    "detection_details": details_dict
+                },
+                # Extended columns for easy querying
+                "protocol": "MULTIPLE",
+                "detection_method": "lateral_movement_analysis",
+                "destination_ip": details_dict.get("internal_targets", [])[0] if details_dict.get("internal_targets") else None,
+                "alert_count": len(details_dict.get("internal_targets", [])),
+            }
+            
+            # Update threat intelligence in x_ip_threat_intel
+            return self.analysis_manager.update_threat_intel(ip_address, threat_data)
+        except Exception as e:
+            logging.error(f"Error adding threat intelligence data: {e}")
+            return False
     
     def get_params(self):
         return {

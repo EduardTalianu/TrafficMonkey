@@ -11,16 +11,17 @@ class ConnectionAsymmetryRule(Rule):
         self.analysis_manager = None # Will be set when db_manager is set
     
     def analyze(self, db_cursor):
-        # Get reference to analysis_manager if not already set
-        if not hasattr(self, 'analysis_manager') or not self.analysis_manager:
-            if hasattr(self.db_manager, 'analysis_manager'):
-                self.analysis_manager = self.db_manager.analysis_manager
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available
+        if not self.analysis_manager:
+            logging.error(f"Cannot run {self.name} rule: analysis_manager not available")
+            return [f"ERROR: {self.name} rule requires analysis_manager"]
 
         # Local list for returning alerts to UI immediately
         alerts = []
-        
-        # List for storing alerts to be queued after analysis is complete
-        pending_alerts = []
         
         try:
             # This rule requires tracking both directions of a connection
@@ -115,9 +116,16 @@ class ConnectionAsymmetryRule(Rule):
                     # Add to immediate alerts list for UI
                     alerts.append(alert_msg)
                     
-                    # Add to pending alerts for queueing - use the receiving IP as target
-                    # since it's likely the server in an asymmetric connection
-                    pending_alerts.append((ip2, alert_msg, self.name))
+                    # Add alert to x_alerts table
+                    self.add_alert(ip2, alert_msg)
+                    
+                    # Add threat intelligence data
+                    self._add_threat_intel(ip1, ip2, {
+                        "sent_bytes": bytes_ip1_to_ip2,
+                        "received_bytes": bytes_ip2_to_ip1,
+                        "ratio": ratio_1_to_2,
+                        "type": "outbound_asymmetry"
+                    })
                     
                 elif ratio_2_to_1 >= self.asymmetry_ratio:
                     alert_msg = (f"Traffic asymmetry detected: {ip2} sent {bytes_ip2_to_ip1/1024:.1f} KB to {ip1}, "
@@ -125,34 +133,61 @@ class ConnectionAsymmetryRule(Rule):
                     # Add to immediate alerts list for UI
                     alerts.append(alert_msg)
                     
-                    # Add to pending alerts for queueing - use the receiving IP as target
-                    pending_alerts.append((ip1, alert_msg, self.name))
-            
-            # Queue all pending alerts to analysis_1.db through analysis_manager if available
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    if self.analysis_manager:
-                        # Write alerts to analysis_1.db
-                        self.analysis_manager.add_alert(ip, msg, rule_name)
-                    else:
-                        # Fallback to db_manager (which writes to capture.db)
-                        self.db_manager.queue_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
+                    # Add alert to x_alerts table
+                    self.add_alert(ip1, alert_msg)
+                    
+                    # Add threat intelligence data
+                    self._add_threat_intel(ip2, ip1, {
+                        "sent_bytes": bytes_ip2_to_ip1,
+                        "received_bytes": bytes_ip1_to_ip2,
+                        "ratio": ratio_2_to_1,
+                        "type": "outbound_asymmetry"
+                    })
             
             return alerts
         except Exception as e:
             error_msg = f"Error in Connection Asymmetry rule: {str(e)}"
             logging.error(error_msg)
-            # Try to queue the error alert
+            # Try to add the error alert to x_alerts
             try:
-                if self.analysis_manager:
-                    self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
-                else:
-                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+                self.add_alert("127.0.0.1", error_msg)
             except:
                 pass
             return [error_msg]
+    
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_threat_intel(self, src_ip, dst_ip, details_dict):
+        """Store threat intelligence data in x_ip_threat_intel"""
+        try:
+            # Create threat intelligence data
+            threat_data = {
+                "score": 5.0,  # Medium severity score (0-10)
+                "type": "traffic_asymmetry", 
+                "confidence": 0.7,  # Confidence level (0-1)
+                "source": self.name,  # Rule name as source
+                "first_seen": import_time.time(),
+                "details": {
+                    # Detailed JSON information 
+                    "detection_details": details_dict
+                },
+                # Extended columns for easy querying
+                "protocol": "TCP",
+                "destination_ip": dst_ip,
+                "bytes_transferred": details_dict.get("sent_bytes", 0),
+                "detection_method": "traffic_asymmetry_analysis"
+            }
+            
+            # Update threat intelligence in x_ip_threat_intel
+            self.analysis_manager.update_threat_intel(src_ip, threat_data)
+            return True
+        except Exception as e:
+            logging.error(f"Error adding threat intelligence data: {e}")
+            return False
     
     def get_params(self):
         return {
@@ -187,3 +222,6 @@ class ConnectionAsymmetryRule(Rule):
             self.exclude_common = bool(value)
             return True
         return False
+
+# Add missing import
+import time as import_time

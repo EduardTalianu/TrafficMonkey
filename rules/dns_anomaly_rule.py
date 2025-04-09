@@ -96,9 +96,6 @@ class DNSAnomalyRule(Rule):
             return ["ERROR: DNS Anomaly rule requires analysis_manager"]
             
         alerts = []
-        # Add this list to store alerts that will be added to analysis_1.db
-        pending_alerts = []
-        
         current_time = time.time()
         
         # Always check for basic DNS anomalies
@@ -128,8 +125,12 @@ class DNSAnomalyRule(Rule):
             for src_ip, domain, count in long_domains:
                 alert_msg = f"Potential DNS Tunneling: {src_ip} queried unusually long domain: {domain}"
                 alerts.append(alert_msg)
-                # Add the alert to pending_alerts for writing to analysis_1.db
-                pending_alerts.append((src_ip, alert_msg, self.name))
+                
+                # Add alert using the new method
+                self.add_alert(src_ip, alert_msg)
+                
+                # Add threat intel data
+                self._add_dns_tunneling_data(src_ip, domain, count, "long_domain")
             
             # Check for high entropy domain names (potential DGA)
             db_cursor.execute("""
@@ -150,8 +151,12 @@ class DNSAnomalyRule(Rule):
                 if entropy > self.entropy_threshold:
                     alert_msg = f"Potential DGA Domain: {src_ip} queried high-entropy domain: {domain} (entropy: {entropy:.2f})"
                     alerts.append(alert_msg)
-                    # Add the alert to pending_alerts for writing to analysis_1.db
-                    pending_alerts.append((src_ip, alert_msg, self.name))
+                    
+                    # Add alert using the new method
+                    self.add_alert(src_ip, alert_msg)
+                    
+                    # Add threat intel data
+                    self._add_dga_domain_data(src_ip, domain, entropy)
             
             # Check for high query rates (potential DNS flood)
             db_cursor.execute("""
@@ -170,8 +175,12 @@ class DNSAnomalyRule(Rule):
             for src_ip, count in high_rates:
                 alert_msg = f"Potential DNS Flood: {src_ip} made {count} DNS queries in the last minute"
                 alerts.append(alert_msg)
-                # Add the alert to pending_alerts for writing to analysis_1.db
-                pending_alerts.append((src_ip, alert_msg, self.name))
+                
+                # Add alert using the new method
+                self.add_alert(src_ip, alert_msg)
+                
+                # Add threat intel data
+                self._add_dns_flood_data(src_ip, count)
             
             # Perform more detailed DNS tunneling analysis less frequently
             if current_time - self.last_check_time >= self.check_interval:
@@ -250,27 +259,29 @@ class DNSAnomalyRule(Rule):
                                 
                             alert_msg = f"Sustained DNS tunneling activity: {src_ip} made {stats['total_queries']} queries with average length {avg_length:.1f}, entropy {avg_entropy:.2f}, and low length variance ({length_variance:.3f})"
                             alerts.append(alert_msg)
-                            # Add the alert to pending_alerts for writing to analysis_1.db
-                            pending_alerts.append((src_ip, alert_msg, self.name))
+                            
+                            # Add alert using the new method
+                            self.add_alert(src_ip, alert_msg)
                             
                             # Add example domains
-                            if len(stats['domains']) <= 3:
-                                example_msg = f"  Example domains: {', '.join(stats['domains'])}"
-                                alerts.append(example_msg)
-                                # Add as a supplementary alert for the same IP
-                                pending_alerts.append((src_ip, example_msg, self.name))
-                            else:
-                                example_msg = f"  Example domains: {', '.join(stats['domains'][:3])}..."
-                                alerts.append(example_msg)
-                                # Add as a supplementary alert for the same IP
-                                pending_alerts.append((src_ip, example_msg, self.name))
-            
-            # Write all pending alerts to analysis_1.db
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error adding alert to analysis_1.db: {e}")
+                            example_domains = stats['domains'][:3] if len(stats['domains']) > 3 else stats['domains']
+                            example_msg = f"  Example domains: {', '.join(example_domains)}"
+                            if len(stats['domains']) > 3:
+                                example_msg += "..."
+                            alerts.append(example_msg)
+                            
+                            # Add as a supplementary alert
+                            self.add_alert(src_ip, example_msg)
+                            
+                            # Add detailed threat intel
+                            self._add_sustained_dns_tunneling_data(
+                                src_ip, 
+                                stats['domains'], 
+                                stats['total_queries'], 
+                                avg_length,
+                                avg_entropy,
+                                length_variance
+                            )
             
             return alerts
             
@@ -278,6 +289,141 @@ class DNSAnomalyRule(Rule):
             error_msg = f"Error in Enhanced DNS Anomaly rule: {str(e)}"
             logging.error(error_msg)
             return [error_msg]
+    
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_dns_tunneling_data(self, src_ip, domain, query_count, detection_type):
+        """Add DNS tunneling data to x_ip_threat_intel"""
+        try:
+            # Build threat intelligence data
+            threat_data = {
+                "score": 7.0,  # High score for DNS tunneling
+                "type": "dns_tunneling",
+                "confidence": 0.7,
+                "source": "DNS_Anomaly_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "domain": domain,
+                    "query_count": query_count,
+                    "domain_length": len(domain),
+                    "entropy": self.calculate_entropy(domain),
+                    "detection_type": detection_type,
+                    "detection_method": "dns_analysis"
+                },
+                # Extended columns for easy querying
+                "protocol": "DNS",
+                "encoding_type": "domain_name",
+                "detection_method": "dns_tunneling_analysis",
+                "bytes_transferred": len(domain) * query_count,
+                "packet_count": query_count
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            self.analysis_manager.update_threat_intel(src_ip, threat_data)
+            return True
+        except Exception as e:
+            logging.error(f"Error adding DNS tunneling data: {e}")
+            return False
+    
+    def _add_dga_domain_data(self, src_ip, domain, entropy):
+        """Add DGA domain data to x_ip_threat_intel"""
+        try:
+            # Build threat intelligence data
+            threat_data = {
+                "score": 6.0,  # Medium-high score for DGA
+                "type": "dga_domain",
+                "confidence": 0.6,
+                "source": "DNS_Anomaly_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "domain": domain,
+                    "entropy": entropy,
+                    "domain_length": len(domain),
+                    "detection_method": "entropy_analysis"
+                },
+                # Extended columns for easy querying
+                "protocol": "DNS",
+                "detection_method": "dga_detection",
+                "encoding_type": "algorithmic_generation"
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            self.analysis_manager.update_threat_intel(src_ip, threat_data)
+            return True
+        except Exception as e:
+            logging.error(f"Error adding DGA domain data: {e}")
+            return False
+    
+    def _add_dns_flood_data(self, src_ip, query_count):
+        """Add DNS flood data to x_ip_threat_intel"""
+        try:
+            # Build threat intelligence data
+            threat_data = {
+                "score": 5.0,  # Medium score for DNS flood
+                "type": "dns_flood",
+                "confidence": 0.8,
+                "source": "DNS_Anomaly_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "query_count": query_count,
+                    "time_window_seconds": 60,
+                    "queries_per_second": query_count / 60,
+                    "detection_method": "query_rate_analysis"
+                },
+                # Extended columns for easy querying
+                "protocol": "DNS",
+                "detection_method": "traffic_rate_analysis",
+                "packet_count": query_count
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            self.analysis_manager.update_threat_intel(src_ip, threat_data)
+            return True
+        except Exception as e:
+            logging.error(f"Error adding DNS flood data: {e}")
+            return False
+    
+    def _add_sustained_dns_tunneling_data(self, src_ip, domains, query_count, avg_length, avg_entropy, length_variance):
+        """Add sustained DNS tunneling data to x_ip_threat_intel"""
+        try:
+            # Calculate total bytes transferred (approximate)
+            total_bytes = sum(len(d) for d in domains)
+            
+            # Build threat intelligence data
+            threat_data = {
+                "score": 8.0,  # Very high score for sustained tunneling
+                "type": "dns_tunneling",
+                "confidence": 0.9,
+                "source": "DNS_Anomaly_Rule",
+                "first_seen": time.time(),
+                "details": {
+                    "example_domains": domains[:5] if len(domains) > 5 else domains,
+                    "query_count": query_count,
+                    "average_domain_length": avg_length,
+                    "average_entropy": avg_entropy,
+                    "length_variance": length_variance,
+                    "detection_method": "pattern_analysis",
+                    "unique_domains": len(domains)
+                },
+                # Extended columns for easy querying
+                "protocol": "DNS",
+                "detection_method": "pattern_analysis",
+                "encoding_type": "domain_name",
+                "bytes_transferred": total_bytes,
+                "packet_count": query_count,
+                "timing_variance": length_variance
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            self.analysis_manager.update_threat_intel(src_ip, threat_data)
+            return True
+        except Exception as e:
+            logging.error(f"Error adding sustained DNS tunneling data: {e}")
+            return False
     
     def update_param(self, param_name, value):
         """Update a configurable parameter"""

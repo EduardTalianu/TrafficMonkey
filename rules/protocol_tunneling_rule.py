@@ -20,10 +20,9 @@ class ProtocolTunnelingRule(Rule):
     def analyze_http_tunneling(self, db_cursor):
         """Analyze HTTP traffic for tunneling indicators"""
         alerts = []
-        pending_alerts = []  # For writing to analysis_1.db
         
         try:
-            # Check if http_requests table exists (not http_headers)
+            # Check if http_requests table exists
             db_cursor.execute("""
                 SELECT name FROM sqlite_master 
                 WHERE type='table' AND name='http_requests'
@@ -33,7 +32,7 @@ class ProtocolTunnelingRule(Rule):
                 return []  # HTTP requests table doesn't exist, skip this check
             
             # Look for suspicious HTTP traffic that might indicate tunneling
-            # Changed to use the correct table and fields
+            # Using the correct table and fields
             db_cursor.execute("""
                 SELECT r.connection_key, c.src_ip, c.dst_ip, c.dst_port, 
                     r.host, r.uri, r.user_agent, c.total_bytes
@@ -52,7 +51,7 @@ class ProtocolTunnelingRule(Rule):
                 suspicious = False
                 reasons = []
                 
-                # Check 1: Suspicious user
+                # Check 1: Suspicious user agent
                 agent = user_agent.lower() if user_agent else ""
                 for pattern in self.unusual_user_agent_patterns:
                     if pattern.lower() in agent:
@@ -80,24 +79,22 @@ class ProtocolTunnelingRule(Rule):
                 if suspicious:
                     alert_msg = f"Possible HTTP tunneling: {src_ip} to {dst_ip}:{dst_port} ({total_bytes/1024:.1f} KB) - {', '.join(reasons)}"
                     alerts.append(alert_msg)
-                    # Add to pending alerts for writing to analysis_1.db
-                    pending_alerts.append((src_ip, alert_msg, self.name))
                     
-                    # Store threat intelligence in analysis_1.db
-                    self.analysis_manager.queue_query(
-                        lambda s=src_ip, d=dst_ip, p=dst_port, b=total_bytes, r=reasons: 
-                        self._add_http_tunnel_intel(s, d, p, b, r)
-                    )
+                    # Add alert to x_alerts table
+                    self.add_alert(src_ip, alert_msg)
+                    
+                    # Store threat intelligence
+                    self._add_http_tunnel_intel(src_ip, dst_ip, dst_port, total_bytes, reasons)
             
-            return alerts, pending_alerts
+            return alerts
             
         except Exception as e:
             error_msg = f"Error in HTTP tunneling analysis: {str(e)}"
             logging.error(error_msg)
-            return [error_msg], []
+            return [error_msg]
     
     def _add_http_tunnel_intel(self, src_ip, dst_ip, dst_port, bytes_transferred, reasons):
-        """Add HTTP tunneling intelligence data to analysis_1.db"""
+        """Add HTTP tunneling intelligence data to x_ip_threat_intel with extended columns"""
         try:
             # Build threat intelligence data
             threat_data = {
@@ -113,10 +110,16 @@ class ProtocolTunnelingRule(Rule):
                     "bytes_transferred": bytes_transferred,
                     "reasons": reasons,
                     "detection_method": "http_analysis"
-                }
+                },
+                # Extended columns
+                "protocol": "HTTP",
+                "destination_ip": dst_ip,
+                "destination_port": dst_port,
+                "bytes_transferred": bytes_transferred,
+                "detection_method": "http_tunneling_analysis"
             }
             
-            # Update threat intelligence in analysis_1.db
+            # Update threat intelligence in x_ip_threat_intel
             self.analysis_manager.update_threat_intel(src_ip, threat_data)
             return True
         except Exception as e:
@@ -126,7 +129,6 @@ class ProtocolTunnelingRule(Rule):
     def analyze_icmp_tunneling(self, db_cursor):
         """Analyze ICMP traffic for tunneling indicators"""
         alerts = []
-        pending_alerts = []  # For writing to analysis_1.db
         
         try:
             # Check if icmp_packets table exists
@@ -136,7 +138,7 @@ class ProtocolTunnelingRule(Rule):
             """)
             
             if not db_cursor.fetchone():
-                return [], []  # ICMP table doesn't exist, skip this check
+                return []  # ICMP table doesn't exist, skip this check
             
             # Look for unusual ICMP traffic
             db_cursor.execute("""
@@ -177,24 +179,22 @@ class ProtocolTunnelingRule(Rule):
                         if cv < 0.5 and avg_interval < 60:  # Less than 60 seconds between packets
                             alert_msg = f"Possible ICMP tunneling: {src_ip} sent {packet_count} ICMP packets to {dst_ip} with regular timing (variance: {cv:.2f})"
                             alerts.append(alert_msg)
-                            # Add to pending alerts for writing to analysis_1.db
-                            pending_alerts.append((src_ip, alert_msg, self.name))
                             
-                            # Store threat intelligence in analysis_1.db
-                            self.analysis_manager.queue_query(
-                                lambda s=src_ip, d=dst_ip, p=packet_count, c=cv: 
-                                self._add_icmp_tunnel_intel(s, d, p, c)
-                            )
+                            # Add alert to x_alerts table
+                            self.add_alert(src_ip, alert_msg)
+                            
+                            # Store threat intelligence
+                            self._add_icmp_tunnel_intel(src_ip, dst_ip, packet_count, cv)
             
-            return alerts, pending_alerts
+            return alerts
             
         except Exception as e:
             error_msg = f"Error in ICMP tunneling analysis: {str(e)}"
             logging.error(error_msg)
-            return [error_msg], []
+            return [error_msg]
     
     def _add_icmp_tunnel_intel(self, src_ip, dst_ip, packet_count, timing_variance):
-        """Add ICMP tunneling intelligence data to analysis_1.db"""
+        """Add ICMP tunneling intelligence data to x_ip_threat_intel with extended columns"""
         try:
             # Build threat intelligence data
             threat_data = {
@@ -209,10 +209,16 @@ class ProtocolTunnelingRule(Rule):
                     "packet_count": packet_count,
                     "timing_variance": timing_variance,
                     "detection_method": "icmp_timing_analysis"
-                }
+                },
+                # Extended columns
+                "protocol": "ICMP",
+                "destination_ip": dst_ip,
+                "packet_count": packet_count,
+                "timing_variance": timing_variance,
+                "detection_method": "icmp_tunneling_analysis"
             }
             
-            # Update threat intelligence in analysis_1.db
+            # Update threat intelligence in x_ip_threat_intel
             self.analysis_manager.update_threat_intel(src_ip, threat_data)
             return True
         except Exception as e:
@@ -222,7 +228,6 @@ class ProtocolTunnelingRule(Rule):
     def analyze_ssh_tunneling(self, db_cursor):
         """Analyze SSH traffic for tunneling indicators"""
         alerts = []
-        pending_alerts = []  # For writing to analysis_1.db
         
         try:
             # Look for SSH connections with unusual traffic patterns
@@ -248,24 +253,22 @@ class ProtocolTunnelingRule(Rule):
                     if bytes_per_packet > 1000:  # More than 1KB per packet average
                         alert_msg = f"Possible SSH tunneling: {src_ip} to {dst_ip} with {total_bytes/1024:.1f} KB transferred ({bytes_per_packet:.1f} bytes/packet)"
                         alerts.append(alert_msg)
-                        # Add to pending alerts for writing to analysis_1.db
-                        pending_alerts.append((src_ip, alert_msg, self.name))
                         
-                        # Store threat intelligence in analysis_1.db
-                        self.analysis_manager.queue_query(
-                            lambda s=src_ip, d=dst_ip, b=total_bytes, bp=bytes_per_packet: 
-                            self._add_ssh_tunnel_intel(s, d, b, bp)
-                        )
+                        # Add alert to x_alerts table
+                        self.add_alert(src_ip, alert_msg)
+                        
+                        # Store threat intelligence
+                        self._add_ssh_tunnel_intel(src_ip, dst_ip, total_bytes, bytes_per_packet)
             
-            return alerts, pending_alerts
+            return alerts
             
         except Exception as e:
             error_msg = f"Error in SSH tunneling analysis: {str(e)}"
             logging.error(error_msg)
-            return [error_msg], []
+            return [error_msg]
     
     def _add_ssh_tunnel_intel(self, src_ip, dst_ip, total_bytes, bytes_per_packet):
-        """Add SSH tunneling intelligence data to analysis_1.db"""
+        """Add SSH tunneling intelligence data to x_ip_threat_intel with extended columns"""
         try:
             # Build threat intelligence data
             threat_data = {
@@ -280,10 +283,15 @@ class ProtocolTunnelingRule(Rule):
                     "total_bytes": total_bytes,
                     "bytes_per_packet": bytes_per_packet,
                     "detection_method": "ssh_traffic_analysis"
-                }
+                },
+                # Extended columns
+                "protocol": "SSH",
+                "destination_ip": dst_ip,
+                "bytes_transferred": total_bytes,
+                "detection_method": "ssh_tunneling_analysis"
             }
             
-            # Update threat intelligence in analysis_1.db
+            # Update threat intelligence in x_ip_threat_intel
             self.analysis_manager.update_threat_intel(src_ip, threat_data)
             return True
         except Exception as e:
@@ -311,27 +319,14 @@ class ProtocolTunnelingRule(Rule):
         
         try:
             # Run the different protocol tunneling detection methods (excluding DNS)
-            http_alerts, http_pending = self.analyze_http_tunneling(db_cursor)
-            icmp_alerts, icmp_pending = self.analyze_icmp_tunneling(db_cursor)
-            ssh_alerts, ssh_pending = self.analyze_ssh_tunneling(db_cursor)
+            http_alerts = self.analyze_http_tunneling(db_cursor)
+            icmp_alerts = self.analyze_icmp_tunneling(db_cursor)
+            ssh_alerts = self.analyze_ssh_tunneling(db_cursor)
             
             # Combine all alerts
             alerts.extend(http_alerts)
             alerts.extend(icmp_alerts)
             alerts.extend(ssh_alerts)
-            
-            # Combine all pending alerts
-            pending_alerts = []
-            pending_alerts.extend(http_pending)
-            pending_alerts.extend(icmp_pending)
-            pending_alerts.extend(ssh_pending)
-            
-            # Write all pending alerts to analysis_1.db
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error adding alert to analysis_1.db: {e}")
             
             return alerts
         except Exception as e:
@@ -362,4 +357,10 @@ class ProtocolTunnelingRule(Rule):
         elif param_name == "min_http_content_length":
             self.min_http_content_length = int(value)
             return True
+        return False
+        
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
         return False

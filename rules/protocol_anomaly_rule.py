@@ -78,21 +78,18 @@ class ProtocolAnomalyRule(Rule):
         
         # Return early if analysis_manager is not available
         if not self.analysis_manager:
-            logging.error("Cannot run Protocol Anomaly rule: analysis_manager not available")
-            return ["ERROR: Protocol Anomaly rule requires analysis_manager"]
+            logging.error(f"Cannot run {self.name} rule: analysis_manager not available")
+            return [f"ERROR: {self.name} rule requires analysis_manager"]
         
         # Local list for returning alerts to UI immediately
         alerts = []
-        
-        # List for storing alerts to be written to analysis_1.db
-        pending_alerts = []
         
         try:
             # Check if port columns exist
             columns = [row[1] for row in db_cursor.execute("PRAGMA table_info(connections)").fetchall()]
             if "src_port" not in columns or "dst_port" not in columns:
                 error_msg = "Protocol Anomaly rule requires port information to be captured"
-                self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                self.add_alert("127.0.0.1", error_msg)
                 return [error_msg]
             
             # Look for significant connections
@@ -153,14 +150,11 @@ class ProtocolAnomalyRule(Rule):
                         # Add to immediate alerts list for UI
                         alerts.append(alert_msg)
                         
-                        # Add to pending alerts for writing to analysis_1.db - use the destination IP as it's the suspicious service
-                        pending_alerts.append((dst_ip, alert_msg, self.name))
+                        # Add to x_alerts table - use the destination IP as it's the suspicious service
+                        self.add_alert(dst_ip, alert_msg)
                         
-                        # Add threat intelligence to analysis_1.db
-                        self.analysis_manager.queue_query(
-                            lambda s=src_ip, d=dst_ip, p=base_protocol, sp=dst_port, b=total_bytes: 
-                            self._add_protocol_anomaly_data(s, d, p, sp, b, "unusual_port")
-                        )
+                        # Add threat intelligence to x_ip_threat_intel
+                        self._add_protocol_anomaly_data(src_ip, dst_ip, base_protocol, dst_port, total_bytes, "unusual_port")
                         
                         alert_triggered = True
                 
@@ -181,14 +175,11 @@ class ProtocolAnomalyRule(Rule):
                         # Add to immediate alerts list for UI
                         alerts.append(alert_msg)
                         
-                        # Add to pending alerts for writing to analysis_1.db - use the destination IP
-                        pending_alerts.append((dst_ip, alert_msg, self.name))
+                        # Add to x_alerts table
+                        self.add_alert(dst_ip, alert_msg)
                         
-                        # Add threat intelligence to analysis_1.db
-                        self.analysis_manager.queue_query(
-                            lambda s=src_ip, d=dst_ip, p="UNKNOWN", sp=dst_port, b=total_bytes: 
-                            self._add_protocol_anomaly_data(s, d, p, sp, b, "high_volume")
-                        )
+                        # Add threat intelligence to x_ip_threat_intel
+                        self._add_protocol_anomaly_data(src_ip, dst_ip, "UNKNOWN", dst_port, total_bytes, "high_volume")
                         
                         alert_triggered = True
                 
@@ -196,34 +187,33 @@ class ProtocolAnomalyRule(Rule):
                 if alert_triggered:
                     alerted_pairs.add(conn_id)
             
-            # Write all pending alerts to analysis_1.db
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error adding alert to analysis_1.db: {e}")
-            
             return alerts
             
         except Exception as e:
             error_msg = f"Error in Protocol Anomaly rule: {str(e)}"
             logging.error(error_msg)
-            # Try to add the error alert to analysis_1.db
+            # Try to add the error alert to x_alerts
             try:
-                self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                self.add_alert("127.0.0.1", error_msg)
             except:
                 pass
             return [error_msg]
     
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
     def _add_protocol_anomaly_data(self, src_ip, dst_ip, protocol, dst_port, total_bytes, anomaly_type):
-        """Add protocol anomaly data to analysis_1.db"""
+        """Add protocol anomaly data to x_ip_threat_intel"""
         try:
             # Build threat intelligence data
             threat_data = {
                 "score": 5.0,  # Medium score for protocol anomalies
                 "type": "protocol_anomaly",
                 "confidence": 0.7,
-                "source": "Protocol_Anomaly_Rule",
+                "source": self.name,
                 "first_seen": time.time(),
                 "details": {
                     "protocol": protocol,
@@ -232,10 +222,16 @@ class ProtocolAnomalyRule(Rule):
                     "bytes_transferred": total_bytes,
                     "anomaly_type": anomaly_type,
                     "detection_method": "port_protocol_analysis"
-                }
+                },
+                # Extended columns for better queryability
+                "protocol": protocol,
+                "destination_ip": dst_ip,
+                "destination_port": dst_port,
+                "bytes_transferred": total_bytes,
+                "detection_method": "port_protocol_analysis"
             }
             
-            # Update threat intelligence in analysis_1.db
+            # Update threat intelligence in x_ip_threat_intel
             self.analysis_manager.update_threat_intel(src_ip, threat_data)
             return True
         except Exception as e:

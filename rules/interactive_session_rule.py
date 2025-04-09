@@ -68,7 +68,6 @@ class InteractiveSessionRule(Rule):
             return ["ERROR: Interactive Session Detection rule requires analysis_manager"]
             
         alerts = []
-        pending_alerts = []  # For writing to analysis_1.db
         current_time = time.time()
         
         # Only run this rule periodically
@@ -150,12 +149,12 @@ class InteractiveSessionRule(Rule):
                             self.detected_sessions[session_id] = current_time
                             alert_msg = f"Interactive session detected: {src_ip} to {dst_ip}:{dst_port} ({packet_times[-1] - packet_times[0]:.1f} sec duration, traffic ratio: {ratio:.1f}x)"
                             alerts.append(alert_msg)
-                            pending_alerts.append((src_ip, alert_msg, self.name))
+                            
+                            # Add alert using the new method
+                            self.add_alert(src_ip, alert_msg)
                             
                             # Write behavioral data to analysis_1.db
-                            self.analysis_manager.queue_query(
-                                lambda s=src_ip, d=dst_ip, p=dst_port, r=ratio: self._add_session_data(s, d, p, r)
-                            )
+                            self._add_session_data(src_ip, dst_ip, dst_port, ratio, len(packets), inbound, outbound)
                 
                 # Fallback method using just connection data
                 else:
@@ -205,20 +204,17 @@ class InteractiveSessionRule(Rule):
                                     self.detected_sessions[session_id] = current_time
                                     alert_msg = f"Likely interactive session: {src_ip} to {dst_ip}:{dst_port} ({len(transactions)} transactions with human-like timing)"
                                     alerts.append(alert_msg)
-                                    pending_alerts.append((src_ip, alert_msg, self.name))
+                                    
+                                    # Add alert using the new method
+                                    self.add_alert(src_ip, alert_msg)
+                                    
+                                    # Calculate total bytes transferred
+                                    total_bytes = sum(t[0] for t in transactions)
+                                    total_packets = sum(t[1] for t in transactions)
                                     
                                     # Write behavioral data to analysis_1.db
-                                    self.analysis_manager.queue_query(
-                                        lambda s=src_ip, d=dst_ip, p=dst_port: self._add_session_data(s, d, p, 0)
-                                    )
+                                    self._add_session_data(src_ip, dst_ip, dst_port, 0, total_packets, total_bytes/2, total_bytes/2)
             
-            # Write all pending alerts to analysis_1.db
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error adding alert to analysis_1.db: {e}")
-                    
             # Clean up old detected sessions (after 4 hours)
             old_sessions = [s for s, t in self.detected_sessions.items() if current_time - t > 14400]
             for session in old_sessions:
@@ -231,13 +227,34 @@ class InteractiveSessionRule(Rule):
             logging.error(error_msg)
             return [error_msg]
     
-    def _add_session_data(self, src_ip, dst_ip, dst_port, traffic_ratio=0):
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_session_data(self, src_ip, dst_ip, dst_port, traffic_ratio=0, packet_count=0, inbound_bytes=0, outbound_bytes=0):
         """Add interactive session data to analysis_1.db"""
         try:
-            # For future implementation, we could store this data in a custom table
-            # For now, just store the information as threat intelligence
-            
-            session_type = "SSH" if dst_port == 22 else "Telnet" if dst_port == 23 else "RDP" if dst_port == 3389 else "VNC" if dst_port in [5900, 5901] else "Unknown"
+            # Map port to known service/protocol
+            if dst_port == 22:
+                protocol = "SSH"
+                session_type = "SSH"
+            elif dst_port == 23:
+                protocol = "Telnet"
+                session_type = "Telnet"
+            elif dst_port == 3389:
+                protocol = "RDP"
+                session_type = "RDP"
+            elif dst_port in [5900, 5901]:
+                protocol = "VNC"
+                session_type = "VNC"
+            else:
+                protocol = "TCP"
+                session_type = "Unknown"
+                
+            # Calculate total bytes
+            total_bytes = inbound_bytes + outbound_bytes
             
             # Build threat intelligence data for the session
             threat_data = {
@@ -251,8 +268,20 @@ class InteractiveSessionRule(Rule):
                     "destination": dst_ip,
                     "destination_port": dst_port,
                     "traffic_ratio": traffic_ratio,
-                    "detection_method": "traffic_analysis"
-                }
+                    "detection_method": "traffic_analysis",
+                    "inbound_bytes": inbound_bytes,
+                    "outbound_bytes": outbound_bytes,
+                    "session_characteristics": "human typing pattern",
+                    "service": session_type
+                },
+                # Extended columns for easy querying
+                "protocol": protocol,
+                "destination_ip": dst_ip,
+                "destination_port": dst_port,
+                "bytes_transferred": total_bytes,
+                "detection_method": "behavior_analysis",
+                "packet_count": packet_count,
+                "timing_variance": traffic_ratio  # Using ratio as an indicator of timing variance
             }
             
             # Update threat intelligence in analysis_1.db

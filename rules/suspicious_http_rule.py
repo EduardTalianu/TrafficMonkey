@@ -2,6 +2,7 @@
 import re
 import logging
 import json
+import time
 
 class SuspiciousHTTPRule(Rule):
     """Rule that detects suspicious HTTP traffic patterns"""
@@ -19,13 +20,20 @@ class SuspiciousHTTPRule(Rule):
             "/wp-login", "/login", "/jenkins", "/solr", "/jmx-console", "/server-status",
             "/.svn", "/actuator", "/api/v1/pods", "/console"
         ]
+        self.analysis_manager = None  # Will be set by access to db_manager.analysis_manager
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available
+        if not self.analysis_manager:
+            logging.error(f"Cannot run {self.name} rule: analysis_manager not available")
+            return [f"ERROR: {self.name} rule requires analysis_manager"]
+        
         # Local list for returning alerts to UI immediately
         alerts = []
-        
-        # List for storing alerts to be queued after analysis is complete
-        pending_alerts = []
         
         try:
             # Query for HTTP traffic on non-standard ports by joining http_requests with connections
@@ -46,7 +54,18 @@ class SuspiciousHTTPRule(Rule):
                 # Look for suspicious HTTP traffic on non-standard ports
                 alert_msg = f"HTTP traffic on non-standard port: {src_ip}:{src_port} -> {dst_ip}:{dst_port} ({method} {host}{path})"
                 alerts.append(alert_msg)
-                pending_alerts.append((dst_ip, alert_msg, self.name))
+                self.add_alert(dst_ip, alert_msg)
+                
+                # Add threat intelligence
+                self._add_threat_intel(src_ip, {
+                    "dst_ip": dst_ip,
+                    "dst_port": dst_port,
+                    "bytes": total_bytes,
+                    "method": method,
+                    "host": host,
+                    "path": path,
+                    "detection_type": "unusual_port"
+                })
                 
                 # Parse headers if available
                 headers = {}
@@ -63,7 +82,16 @@ class SuspiciousHTTPRule(Rule):
                         if suspicious_ua.lower() in lower_ua:
                             alert_msg = f"Suspicious User-Agent detected: {src_ip} -> {dst_ip} (UA: {user_agent})"
                             alerts.append(alert_msg)
-                            pending_alerts.append((dst_ip, alert_msg, self.name))
+                            self.add_alert(dst_ip, alert_msg)
+                            
+                            # Add specific threat intelligence
+                            self._add_threat_intel(src_ip, {
+                                "dst_ip": dst_ip,
+                                "dst_port": dst_port,
+                                "bytes": total_bytes,
+                                "user_agent": user_agent,
+                                "detection_type": "suspicious_user_agent"
+                            })
                             break
                             
                 # Check for suspicious paths
@@ -73,7 +101,16 @@ class SuspiciousHTTPRule(Rule):
                         if suspicious_path.lower() in lower_path:
                             alert_msg = f"Suspicious HTTP request path: {src_ip} -> {dst_ip} ({method} {host}{path})"
                             alerts.append(alert_msg)
-                            pending_alerts.append((dst_ip, alert_msg, self.name))
+                            self.add_alert(dst_ip, alert_msg)
+                            
+                            # Add specific threat intelligence
+                            self._add_threat_intel(src_ip, {
+                                "dst_ip": dst_ip,
+                                "dst_port": dst_port,
+                                "bytes": total_bytes,
+                                "path": path,
+                                "detection_type": "suspicious_path"
+                            })
                             break
             
             # Query all HTTP requests for check of suspicious content (not just non-standard ports)
@@ -102,7 +139,18 @@ class SuspiciousHTTPRule(Rule):
                         if re.search(pattern, path, re.IGNORECASE):
                             alert_msg = f"Possible SQL injection attempt: {src_ip} -> {dst_ip} ({method} {host}{path})"
                             alerts.append(alert_msg)
-                            pending_alerts.append((dst_ip, alert_msg, self.name))
+                            self.add_alert(dst_ip, alert_msg)
+                            
+                            # Add high-severity threat intelligence
+                            self._add_threat_intel(src_ip, {
+                                "dst_ip": dst_ip,
+                                "dst_port": dst_port,
+                                "bytes": total_bytes,
+                                "path": path,
+                                "method": method,
+                                "detection_type": "sql_injection_attempt",
+                                "severity": "high"
+                            }, score=8.5)
                             break
                 
                 # If user_agent not checked in the first query (for non-standard ports),
@@ -113,34 +161,59 @@ class SuspiciousHTTPRule(Rule):
                         if suspicious_ua.lower() in lower_ua:
                             alert_msg = f"Suspicious User-Agent detected: {src_ip} -> {dst_ip} (UA: {user_agent})"
                             alerts.append(alert_msg)
-                            pending_alerts.append((dst_ip, alert_msg, self.name))
+                            self.add_alert(dst_ip, alert_msg)
+                            
+                            # Add specific threat intelligence
+                            self._add_threat_intel(src_ip, {
+                                "dst_ip": dst_ip,
+                                "dst_port": dst_port,
+                                "bytes": total_bytes,
+                                "user_agent": user_agent,
+                                "detection_type": "suspicious_user_agent"
+                            })
                             break
-            
-            # Queue all pending alerts AFTER all database operations are complete
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    # Use analysis_manager to add alerts to analysis_1.db
-                    if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
-                        self.db_manager.analysis_manager.add_alert(ip, msg, rule_name)
-                    else:
-                        self.db_manager.queue_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
             
             return alerts
         except Exception as e:
             error_msg = f"Error in Suspicious HTTP rule: {str(e)}"
             logging.error(error_msg)
-            # Try to queue the error alert
-            try:
-                # Use analysis_manager to add alerts to analysis_1.db
-                if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
-                    self.db_manager.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
-                else:
-                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
-            except:
-                pass
+            self.add_alert("127.0.0.1", error_msg)
             return [error_msg]
+    
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_threat_intel(self, ip_address, details_dict, score=6.5):
+        """Store threat intelligence data in x_ip_threat_intel"""
+        try:
+            # Create threat intelligence data
+            threat_data = {
+                "score": score,  # Severity score (0-10)
+                "type": "suspicious_http", 
+                "confidence": 0.8,  # Confidence level (0-1)
+                "source": self.name,  # Rule name as source
+                "first_seen": time.time(),
+                "details": {
+                    # Detailed JSON information 
+                    "detection_details": details_dict
+                },
+                # Extended columns for easy querying
+                "protocol": "HTTP",
+                "destination_ip": details_dict.get("dst_ip"),
+                "destination_port": details_dict.get("dst_port"),
+                "bytes_transferred": details_dict.get("bytes"),
+                "detection_method": "http_analysis",
+                "packet_count": details_dict.get("packet_count")
+            }
+            
+            # Update threat intelligence in x_ip_threat_intel
+            return self.analysis_manager.update_threat_intel(ip_address, threat_data)
+        except Exception as e:
+            logging.error(f"Error adding threat intelligence data: {e}")
+            return False
     
     def get_params(self):
         return {

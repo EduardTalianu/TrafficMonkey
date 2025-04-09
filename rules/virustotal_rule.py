@@ -420,56 +420,18 @@ class VirusTotalRule(Rule):
             logging.error(f"Error checking URL {url} with VirusTotal: {e}")
             return None
     
-    def add_connection_update(self, connection_key, field, value):
-        """Add a connection update to the pending list"""
-        self.pending_updates.append((connection_key, field, value))
-    
     def add_pending_alert(self, ip, message, rule_name):
         """Add an alert to the pending list"""
         self.pending_alerts.append((ip, message, rule_name))
     
-    def process_pending_updates(self):
-        """Process all pending connection updates - uses analysis_1.db exclusively"""
-        for connection_key, field, value in self.pending_updates:
-            try:
-                # Use analysis_manager to update the connection in analysis_1.db
-                self.db_manager.analysis_manager.queue_query(
-                    lambda conn_key=connection_key, f=field, v=value: self._update_connection_in_analysis1(conn_key, f, v)
-                )
-            except Exception as e:
-                logging.error(f"Error queueing connection update: {e}")
-        
-        # Clear the list after processing
-        self.pending_updates = []
-    
-    def _update_connection_in_analysis1(self, connection_key, field, value):
-        """Update a connection in analysis_1.db directly"""
-        try:
-            # Get a cursor for analysis_1.db
-            cursor = self.db_manager.analysis_manager.analysis1_conn.cursor()
-            # Update the connection
-            cursor.execute(
-                f"UPDATE connections SET {field} = ? WHERE connection_key = ?",
-                (value, connection_key)
-            )
-            # Commit the changes
-            self.db_manager.analysis_manager.analysis1_conn.commit()
-            # Close the cursor
-            cursor.close()
-            logging.debug(f"Updated connection {connection_key} in analysis_1.db")
-            return True
-        except Exception as e:
-            logging.error(f"Error updating connection in analysis_1.db: {e}")
-            return False
-    
     def process_pending_alerts(self):
-        """Process all pending alerts - uses analysis_1.db exclusively"""
+        """Process all pending alerts using the new x_alerts table"""
         for ip, msg, rule_name in self.pending_alerts:
             try:
-                # Use analysis_manager to add alert to analysis_1.db
+                # Use analysis_manager to add alert to x_alerts table in analysis_1.db
                 self.db_manager.analysis_manager.add_alert(ip, msg, rule_name)
             except Exception as e:
-                logging.error(f"Error adding alert to analysis_1.db: {e}")
+                logging.error(f"Error adding alert to x_alerts table: {e}")
         
         # Clear the list after processing
         self.pending_alerts = []
@@ -479,13 +441,12 @@ class VirusTotalRule(Rule):
         if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
             self.analysis_manager = self.db_manager.analysis_manager
         
-        # Return early if analysis_manager is not available (this shouldn't happen with new architecture)
+        # Return early if analysis_manager is not available
         if not self.analysis_manager:
             logging.error("Cannot run VirusTotal rule: analysis_manager not available")
             return ["ERROR: VirusTotal rule requires analysis_manager"]
         
-        # Clear pending updates/alerts from previous runs
-        self.pending_updates = []
+        # Clear pending alerts from previous runs
         self.pending_alerts = []
         
         # Store alerts to be returned
@@ -495,25 +456,37 @@ class VirusTotalRule(Rule):
         self.false_positives = self.load_false_positives()
         
         try:
-            # First, look for any connections already marked as malicious
-            # Note: db_cursor now points to analysis.db (read-only)
-            db_cursor.execute("SELECT src_ip, dst_ip, connection_key, vt_result FROM connections WHERE vt_result = 'Malicious'")
-            vt_alerts = db_cursor.fetchall()
+            # First, look for any connections already marked as malicious in threat intel table
+            # Get a cursor for analysis_1.db
+            analysis1_cursor = self.analysis_manager.get_cursor()
             
-            for src_ip, dst_ip, connection_key, vt_result in vt_alerts:
-                # Check if destination IP is in false positives list
-                dst_ip_clean = dst_ip.split(':')[0] if ':' in dst_ip else dst_ip
-                
-                if dst_ip_clean in self.false_positives:
-                    # Add to pending updates instead of updating directly
-                    self.add_connection_update(connection_key, "vt_result", 'False Positive')
+            # Query x_ip_threat_intel table for malicious IPs
+            analysis1_cursor.execute("""
+                SELECT ip_address, threat_score, threat_type 
+                FROM x_ip_threat_intel 
+                WHERE threat_type = 'malware' AND source = 'VirusTotal'
+            """)
+            
+            vt_alerts = analysis1_cursor.fetchall()
+            
+            for ip_address, threat_score, threat_type in vt_alerts:
+                # Check if IP is in false positives list
+                if ip_address in self.false_positives:
+                    # Update threat intel in analysis_1.db to mark as false positive
+                    self.analysis_manager.update_threat_intel(ip_address, {
+                        "score": 0,
+                        "type": "clean",
+                        "confidence": 1.0,
+                        "source": "VirusTotal",
+                        "details": {"status": "False Positive"}
+                    })
                     continue  # Skip creating an alert
-                    
-                # Create alert message
-                alert_msg = f"Malicious connection from {src_ip} to {dst_ip} (VirusTotal: {vt_result})"
                 
-                # Add to pending alerts instead of queuing directly
-                self.add_pending_alert(dst_ip_clean, alert_msg, self.name)
+                # Create alert message
+                alert_msg = f"Malicious IP detected: {ip_address} (VirusTotal score: {threat_score})"
+                
+                # Add to pending alerts
+                self.add_pending_alert(ip_address, alert_msg, self.name)
                 
                 # Add to immediate alerts list
                 alerts.append(f"ALERT: {alert_msg}")
@@ -521,23 +494,22 @@ class VirusTotalRule(Rule):
             # Get API key from environment
             api_key = os.getenv("VIRUSTOTAL_API_KEY", "")
             if not api_key:
-                # Add to pending alerts instead of queuing directly
-                default_ip = vt_alerts[0][1] if vt_alerts else "0.0.0.0"
+                # Add a warning alert
+                default_ip = vt_alerts[0][0] if vt_alerts else "0.0.0.0"
                 self.add_pending_alert(default_ip, "No VirusTotal API key set in environment variable VIRUSTOTAL_API_KEY", self.name)
                 alerts.append("WARNING: No VirusTotal API key set in environment variable VIRUSTOTAL_API_KEY")
                 
-                # Process all pending updates and alerts
-                self.process_pending_updates()
+                # Process all pending alerts
                 self.process_pending_alerts()
                 
                 return alerts
             
             # Look for new connections that haven't been checked
+            # Query from analysis.db (read-only)
             db_cursor.execute("""
                 SELECT connection_key, src_ip, dst_ip 
                 FROM connections 
-                WHERE (vt_result IS NULL OR vt_result = 'unknown')
-                AND total_bytes > 1000
+                WHERE total_bytes > 1000
                 LIMIT 100
             """)
             
@@ -546,10 +518,15 @@ class VirusTotalRule(Rule):
             for row in db_cursor.fetchall():
                 unchecked_connections.append(row)
             
+            # Now check if these connections have been analyzed in the threat intel table
+            # Get all IPs that have already been checked
+            analysis1_cursor.execute("SELECT ip_address FROM x_ip_threat_intel WHERE source = 'VirusTotal'")
+            checked_ips = {row[0] for row in analysis1_cursor.fetchall()}
+            
             # Check a limited number of resources per run to respect API limits
             checks_performed = 0
             # Keep track of checked IPs for informational messages
-            checked_ips = set()
+            newly_checked_ips = set()
             
             # Process connections outside of cursor context
             for connection_key, src_ip, dst_ip in unchecked_connections:
@@ -562,9 +539,10 @@ class VirusTotalRule(Rule):
                 
                 # Skip if IP is in false positives list
                 if dst_ip_clean in self.false_positives:
-                    # Add to pending updates instead of updating directly
-                    self.add_connection_update(connection_key, "vt_result", 'False Positive')
-                    logging.info(f"Marked connection {connection_key} as false positive")
+                    continue
+                
+                # Skip if we've already checked this IP
+                if dst_ip_clean in checked_ips:
                     continue
                 
                 # Check if we've reached our limit for this run
@@ -574,22 +552,47 @@ class VirusTotalRule(Rule):
                 # Check the IP
                 result = self.check_ip(dst_ip_clean, api_key)
                 checks_performed += 1
-                checked_ips.add(dst_ip_clean)
+                newly_checked_ips.add(dst_ip_clean)
                 
                 if result:
-                    # Add to pending updates instead of updating directly
-                    self.add_connection_update(connection_key, "vt_result", result['status'])
+                    # Store the result in x_ip_threat_intel table
+                    if result['is_malicious']:
+                        # Create threat intelligence data
+                        threat_data = {
+                            "score": result['total_detections'],
+                            "type": "malware",
+                            "confidence": 0.8,
+                            "source": "VirusTotal",
+                            "first_seen": time.time(),
+                            "details": {
+                                "malicious_count": result['malicious_count'],
+                                "suspicious_count": result['suspicious_count'],
+                                "status": result['status']
+                            }
+                        }
+                    else:
+                        # Create clean intel data
+                        threat_data = {
+                            "score": 0,
+                            "type": "clean",
+                            "confidence": 0.8,
+                            "source": "VirusTotal",
+                            "first_seen": time.time(),
+                            "details": {
+                                "malicious_count": result['malicious_count'],
+                                "suspicious_count": result['suspicious_count'],
+                                "status": result['status']
+                            }
+                        }
+                    
+                    # Store in x_ip_threat_intel table
+                    self.analysis_manager.update_threat_intel(dst_ip_clean, threat_data)
                     
                     if result['is_malicious']:
                         # Create alert message
                         alert_msg = f"Malicious IP detected in connection from {src_ip} to {dst_ip} (VirusTotal detections: {result['total_detections']})"
                         
-                        # Store threat intelligence in analysis_1.db
-                        self.analysis_manager.queue_query(
-                            lambda ip=dst_ip_clean, r=result: self._add_threat_intel(ip, r)
-                        )
-                        
-                        # Add to pending alerts instead of queuing directly
+                        # Add to pending alerts
                         self.add_pending_alert(dst_ip_clean, alert_msg, self.name)
                         
                         # Add to immediate alerts list
@@ -614,10 +617,28 @@ class VirusTotalRule(Rule):
                         checks_performed += 1
                         
                         if url_result and url_result['is_malicious']:
+                            # Store URL threat intel
+                            threat_data = {
+                                "score": url_result['total_detections'],
+                                "type": "malicious_url",
+                                "confidence": 0.8,
+                                "source": "VirusTotal",
+                                "first_seen": time.time(),
+                                "details": {
+                                    "malicious_count": url_result['malicious_count'],
+                                    "suspicious_count": url_result['suspicious_count'],
+                                    "status": url_result['status'],
+                                    "url": potential_url
+                                }
+                            }
+                            
+                            # We'll use the domain/hostname as the key in threat intel
+                            self.analysis_manager.update_threat_intel(potential_url, threat_data)
+                            
                             # Create alert message
                             alert_msg = f"Malicious URL detected in connection from {src_ip} to {potential_url} (VirusTotal detections: {url_result['total_detections']})"
                             
-                            # Add to pending alerts instead of queuing directly
+                            # Add to pending alerts
                             self.add_pending_alert(potential_url, alert_msg, self.name)
                             
                             # Add to immediate alerts list
@@ -625,7 +646,7 @@ class VirusTotalRule(Rule):
             
             if checks_performed > 0:
                 # Use the most recently checked IP for info messages
-                info_ip = next(iter(checked_ips)) if checked_ips else "127.0.0.1"
+                info_ip = next(iter(newly_checked_ips)) if newly_checked_ips else "127.0.0.1"
                 
                 info_msg = f"Checked {checks_performed} resources with VirusTotal API"
                 alerts.append(f"INFO: {info_msg}")
@@ -650,46 +671,10 @@ class VirusTotalRule(Rule):
             alerts.append(f"ERROR: VirusTotal rule error: {e}")
         
         finally:
-            # Process all pending updates and alerts at the very end
-            # Separate these with a short delay to ensure database operations don't overlap
-            def process_with_delay():
-                # Process updates first
-                self.process_pending_updates()
-                # Wait a moment before processing alerts
-                time.sleep(0.1)
-                # Then process alerts
-                self.process_pending_alerts()
-            
-            # Start in a separate thread to avoid blocking
-            threading.Thread(target=process_with_delay, daemon=True).start()
+            # Process all pending alerts
+            self.process_pending_alerts()
             
         return alerts
-    
-    def _add_threat_intel(self, ip_address, result):
-        """Add threat intelligence data to analysis_1.db"""
-        if not self.analysis_manager:
-            return False
-            
-        try:
-            # Create threat intelligence data
-            threat_data = {
-                "score": result.get('total_detections', 0),
-                "type": "malware" if result.get('is_malicious', False) else "clean",
-                "confidence": 0.8 if result.get('is_malicious', False) else 0.5,
-                "source": "VirusTotal",
-                "first_seen": time.time(),
-                "details": {
-                    "malicious_count": result.get('malicious_count', 0),
-                    "suspicious_count": result.get('suspicious_count', 0),
-                    "status": result.get('status', 'Unknown')
-                }
-            }
-            
-            # Update threat intelligence in analysis_1.db
-            return self.analysis_manager.update_threat_intel(ip_address, threat_data)
-        except Exception as e:
-            logging.error(f"Error adding threat intelligence data: {e}")
-            return False
     
     def update_param(self, param_name, value):
         """Update a configurable parameter"""
@@ -720,12 +705,44 @@ class VirusTotalRule(Rule):
         """Get configurable parameters"""
         return self.configurable_params
     
-    def update_connection(self, connection_key, field, value):
-        """
-        Override the parent class method to use the queue system instead
-        of direct database access to prevent recursive cursor use.
-        Now supports writing to analysis_1.db
-        """
-        # Instead of directly queueing, add to pending updates
-        self.add_connection_update(connection_key, field, value)
-        return True
+    def add_alert(self, ip_address, alert_message):
+        """Use the analysis_manager to add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        else:
+            # Fall back to pending alerts if analysis_manager not available
+            self.add_pending_alert(ip_address, alert_message, self.name)
+            return True
+        
+    def _add_threat_intel(self, ip_address, result):
+        """Add threat intelligence data to analysis_1.db with extended columns"""
+        if not self.analysis_manager:
+            return False
+            
+        try:
+            # Determine if URL or IP detection
+            is_url = 'url' in str(result.get('status', '')).lower() or len(ip_address.split('.')) != 4
+            
+            # Create threat intelligence data
+            threat_data = {
+                "score": result.get('total_detections', 0),
+                "type": "malware" if result.get('is_malicious', False) else "clean",
+                "confidence": 0.8 if result.get('is_malicious', False) else 0.5,
+                "source": "VirusTotal",
+                "first_seen": time.time(),
+                "details": {
+                    "malicious_count": result.get('malicious_count', 0),
+                    "suspicious_count": result.get('suspicious_count', 0),
+                    "status": result.get('status', 'Unknown')
+                },
+                # Extended columns
+                "protocol": "HTTP" if is_url else "IP",
+                "detection_method": "virustotal_api",
+                "encoding_type": None
+            }
+            
+            # Update threat intelligence in analysis_1.db
+            return self.analysis_manager.update_threat_intel(ip_address, threat_data)
+        except Exception as e:
+            logging.error(f"Error adding threat intelligence data: {e}")
+            return False

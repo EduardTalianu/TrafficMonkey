@@ -62,7 +62,6 @@ class MaliciousFileTransferRule(Rule):
     def detect_dns_file_transfer(self, db_cursor):
         """Detect files being transferred via DNS tunneling"""
         alerts = []
-        pending_alerts = []  # To be written to analysis_1.db
         
         try:
             # Check if dns_queries table exists
@@ -164,12 +163,19 @@ class MaliciousFileTransferRule(Rule):
                                    f"(long: {long_pct:.1f}%, high entropy: {entropy_pct:.1f}%)"
                         
                         alerts.append(alert_msg)
-                        pending_alerts.append((src_ip, alert_msg, self.name))
-            
-            # Add alerts to analysis_1.db
-            if self.analysis_manager and pending_alerts:
-                for ip, msg, rule_name in pending_alerts:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
+                        
+                        # Add alert to x_alerts table
+                        self.add_alert(src_ip, alert_msg)
+                        
+                        # Store threat intelligence in x_ip_threat_intel
+                        self._add_file_transfer_intel(src_ip, "DNS", {
+                            "encoding": encoding,
+                            "query_count": query_count,
+                            "long_domains_pct": long_pct,
+                            "entropy_pct": entropy_pct,
+                            "base64_pct": base64_pct,
+                            "hex_pct": hex_pct
+                        })
             
             return alerts
         except Exception as e:
@@ -179,7 +185,6 @@ class MaliciousFileTransferRule(Rule):
     def detect_http_file_transfer(self, db_cursor):
         """Detect unusual HTTP file transfers"""
         alerts = []
-        pending_alerts = []  # Track alerts for writing to analysis_1.db
         
         try:
             # Check if http_requests table exists
@@ -252,12 +257,19 @@ class MaliciousFileTransferRule(Rule):
                         self.detected_transfers[alert_key] = time.time()
                         alert_msg = f"Suspicious HTTP file transfer: {src_ip} to {dst_ip} - {', '.join(reasons)}"
                         alerts.append(alert_msg)
-                        pending_alerts.append((src_ip, alert_msg, self.name))
-            
-            # Write alerts to analysis_1.db
-            if self.analysis_manager and pending_alerts:
-                for ip, msg, rule_name in pending_alerts:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
+                        
+                        # Add alert to x_alerts table
+                        self.add_alert(src_ip, alert_msg)
+                        
+                        # Store threat intelligence in x_ip_threat_intel
+                        self._add_file_transfer_intel(src_ip, "HTTP", {
+                            "destination": dst_ip,
+                            "method": method,
+                            "content_type": content_type,
+                            "suspicion_level": suspicion_level,
+                            "reasons": reasons,
+                            "connection_key": conn_key
+                        })
             
             return alerts
         except Exception as e:
@@ -267,7 +279,6 @@ class MaliciousFileTransferRule(Rule):
     def detect_icmp_file_transfer(self, db_cursor):
         """Detect files being transferred via ICMP tunneling"""
         alerts = []
-        pending_alerts = []
         
         try:
             # Check if icmp_packets table exists
@@ -295,24 +306,61 @@ class MaliciousFileTransferRule(Rule):
                     self.detected_transfers[alert_key] = time.time()
                     alert_msg = f"Potential ICMP tunneling: {src_ip} sent {packet_count} ICMP packets to {dst_ip} in the last 30 minutes"
                     alerts.append(alert_msg)
-                    pending_alerts.append((src_ip, alert_msg, self.name))
-            
-            # Write alerts to analysis_1.db
-            if self.analysis_manager and pending_alerts:
-                for ip, msg, rule_name in pending_alerts:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
+                    
+                    # Add alert to x_alerts table
+                    self.add_alert(src_ip, alert_msg)
+                    
+                    # Store threat intelligence in x_ip_threat_intel
+                    self._add_file_transfer_intel(src_ip, "ICMP", {
+                        "destination": dst_ip,
+                        "packet_count": packet_count,
+                        "timeframe": "30 minutes"
+                    })
             
             return alerts
         except Exception as e:
             logging.error(f"Error analyzing ICMP for file transfers: {e}")
             return []
     
+    def _add_file_transfer_intel(self, ip_address, protocol, details):
+        """Add file transfer intelligence data to x_ip_threat_intel with extended columns"""
+        if not self.analysis_manager:
+            return False
+            
+        try:
+            # Create threat intelligence data
+            threat_data = {
+                "score": 7.5,  # High score for covert file transfers
+                "type": "covert_file_transfer",
+                "confidence": 0.75,
+                "source": "MaliciousFileTransferRule",
+                "first_seen": time.time(),
+                "details": {
+                    "protocol": protocol,
+                    "detection_type": "covert_file_transfer",
+                    **details  # Include all the protocol-specific details
+                },
+                # Extended columns
+                "protocol": protocol,
+                "destination_ip": details.get("destination"),
+                "bytes_transferred": details.get("content_length") or details.get("total_bytes"),
+                "detection_method": f"{protocol.lower()}_file_transfer_detection",
+                "encoding_type": details.get("encoding"),
+                "packet_count": details.get("packet_count") or details.get("query_count")
+            }
+            
+            # Update threat intelligence in x_ip_threat_intel
+            return self.analysis_manager.update_threat_intel(ip_address, threat_data)
+        except Exception as e:
+            logging.error(f"Error adding file transfer intelligence data: {e}")
+            return False
+    
     def analyze(self, db_cursor):
         # Ensure analysis_manager is linked
         if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
             self.analysis_manager = self.db_manager.analysis_manager
         
-        # Return early if analysis_manager is not available (this shouldn't happen with new architecture)
+        # Return early if analysis_manager is not available
         if not self.analysis_manager:
             logging.error("Cannot run Malicious File Transfer rule: analysis_manager not available")
             return ["ERROR: Malicious File Transfer rule requires analysis_manager"]
@@ -381,3 +429,11 @@ class MaliciousFileTransferRule(Rule):
             self.http_min_content_length = int(value)
             return True
         return False
+        
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    

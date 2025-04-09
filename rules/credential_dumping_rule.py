@@ -92,7 +92,7 @@ class CredentialDumpingRule(Rule):
                                 self.detected_dumps[alert_key] = time.time()
                                 alert_msg = f"Credential dumping tool signature in User-Agent: {src_ip} using {tool} to access {dst_ip}"
                                 alerts.append(alert_msg)
-                                pending_alerts.append((src_ip, alert_msg, self.name))
+                                pending_alerts.append((src_ip, alert_msg))
                 
                 # Check for sensitive path access in URI
                 lower_uri = uri.lower().replace('/', '\\')
@@ -103,7 +103,7 @@ class CredentialDumpingRule(Rule):
                             self.detected_dumps[alert_key] = time.time()
                             alert_msg = f"HTTP access to sensitive Windows credential file: {src_ip} accessing {sensitive_path} on {dst_ip}"
                             alerts.append(alert_msg)
-                            pending_alerts.append((src_ip, alert_msg, self.name))
+                            pending_alerts.append((src_ip, alert_msg))
                 
                 for sensitive_path in self.sensitive_unix_paths:
                     if sensitive_path.lower() in lower_uri.replace('\\', '/'):
@@ -112,7 +112,7 @@ class CredentialDumpingRule(Rule):
                             self.detected_dumps[alert_key] = time.time()
                             alert_msg = f"HTTP access to sensitive Unix credential file: {src_ip} accessing {sensitive_path} on {dst_ip}"
                             alerts.append(alert_msg)
-                            pending_alerts.append((src_ip, alert_msg, self.name))
+                            pending_alerts.append((src_ip, alert_msg))
             
             return alerts, pending_alerts
         except Exception as e:
@@ -151,7 +151,15 @@ class CredentialDumpingRule(Rule):
                     
                     alert_msg = f"Potential credential extraction: {src_ip} transferred {total_bytes/1024:.1f} KB from {dst_ip} via {service} (port {dst_port})"
                     alerts.append(alert_msg)
-                    pending_alerts.append((src_ip, alert_msg, self.name))
+                    pending_alerts.append((src_ip, alert_msg))
+                    
+                    # Add threat intelligence data for this detection
+                    self._add_threat_intel(src_ip, {
+                        "dst_ip": dst_ip,
+                        "dst_port": dst_port,
+                        "bytes": total_bytes,
+                        "service": service
+                    })
             
             return alerts, pending_alerts
         except Exception as e:
@@ -159,13 +167,16 @@ class CredentialDumpingRule(Rule):
             return [], []
     
     def analyze(self, db_cursor):
-        # Get reference to analysis_manager if not already set
-        if not hasattr(self, 'analysis_manager') or not self.analysis_manager:
-            if hasattr(self.db_manager, 'analysis_manager'):
-                self.analysis_manager = self.db_manager.analysis_manager
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
+        # Return early if analysis_manager is not available
+        if not self.analysis_manager:
+            logging.error(f"Cannot run {self.name} rule: analysis_manager not available")
+            return [f"ERROR: {self.name} rule requires analysis_manager"]
 
         all_alerts = []
-        all_pending_alerts = []
         current_time = time.time()
         
         # Only run periodically
@@ -182,40 +193,61 @@ class CredentialDumpingRule(Rule):
             all_alerts.extend(http_alerts)
             all_alerts.extend(smb_alerts)
             
-            all_pending_alerts.extend(http_pending)
-            all_pending_alerts.extend(smb_pending)
+            # Process pending alerts for x_alerts table
+            for ip, msg in http_pending + smb_pending:
+                self.add_alert(ip, msg)
             
             # Clean up old detections (after 12 hours)
             old_detections = [k for k, t in self.detected_dumps.items() if current_time - t > 43200]
             for key in old_detections:
                 self.detected_dumps.pop(key, None)
             
-            # Queue all pending alerts to analysis_1.db through analysis_manager if available
-            for ip, msg, rule_name in all_pending_alerts:
-                try:
-                    if self.analysis_manager:
-                        # Write alerts to analysis_1.db
-                        self.analysis_manager.add_alert(ip, msg, rule_name)
-                    else:
-                        # Fallback to db_manager (which writes to capture.db)
-                        self.db_manager.queue_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
-            
             return all_alerts
             
         except Exception as e:
             error_msg = f"Error in Credential Dumping Detection rule: {str(e)}"
             logging.error(error_msg)
-            # Try to queue the error alert
+            # Try to add the error alert to x_alerts
             try:
-                if self.analysis_manager:
-                    self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
-                else:
-                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+                self.add_alert("127.0.0.1", error_msg)
             except:
                 pass
             return [error_msg]
+    
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_threat_intel(self, ip_address, details_dict):
+        """Store threat intelligence data in x_ip_threat_intel"""
+        try:
+            # Create threat intelligence data
+            threat_data = {
+                "score": 8.0,  # High severity score (0-10)
+                "type": "credential_theft", 
+                "confidence": 0.75,  # Confidence level (0-1)
+                "source": self.name,  # Rule name as source
+                "first_seen": time.time(),
+                "details": {
+                    # Detailed JSON information 
+                    "detection_details": details_dict
+                },
+                # Extended columns for easy querying
+                "protocol": details_dict.get("service", "SMB"),
+                "destination_ip": details_dict.get("dst_ip"),
+                "destination_port": details_dict.get("dst_port"),
+                "bytes_transferred": details_dict.get("bytes"),
+                "detection_method": "credential_theft_detection",
+                "packet_count": details_dict.get("packet_count")
+            }
+            
+            # Update threat intelligence in x_ip_threat_intel
+            return self.analysis_manager.update_threat_intel(ip_address, threat_data)
+        except Exception as e:
+            logging.error(f"Error adding threat intelligence data: {e}")
+            return False
     
     def get_params(self):
         return {

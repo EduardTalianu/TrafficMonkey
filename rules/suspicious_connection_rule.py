@@ -174,9 +174,6 @@ class SuspiciousConnectionRule(Rule):
         # Local list for returning alerts to UI immediately
         alerts = []
         
-        # List for storing alerts to be written to analysis_1.db
-        pending_alerts = []
-        
         try:
             # Make sure threat intel is loaded
             if not self.lists_updated:
@@ -200,33 +197,24 @@ class SuspiciousConnectionRule(Rule):
                     category = self.get_threat_category(src_ip)
                     alert_msg = f"ALERT: Connection from suspicious IP {src_ip} to {dst_ip} ({total_bytes/1024:.2f} KB) - Category: {category}"
                     alerts.append(alert_msg)
-                    pending_alerts.append((src_ip, alert_msg, self.name))
+                    
+                    # Add alert using the new method
+                    self.add_alert(src_ip, alert_msg)
                     
                     # Add threat intelligence to analysis_1.db
-                    self.analysis_manager.queue_query(
-                        lambda s=src_ip, d=dst_ip, b=total_bytes, c=category: 
-                        self._add_threat_intel_data(s, d, b, c, "source")
-                    )
+                    self._add_threat_intel_data(src_ip, dst_ip, total_bytes, packet_count, category, "source")
                 
                 # Check destination IP
                 if self.is_suspicious_ip(dst_ip):
                     category = self.get_threat_category(dst_ip)
                     alert_msg = f"ALERT: Connection to suspicious IP {dst_ip} from {src_ip} ({total_bytes/1024:.2f} KB) - Category: {category}"
                     alerts.append(alert_msg)
-                    pending_alerts.append((dst_ip, alert_msg, self.name))
+                    
+                    # Add alert using the new method
+                    self.add_alert(dst_ip, alert_msg)
                     
                     # Add threat intelligence to analysis_1.db
-                    self.analysis_manager.queue_query(
-                        lambda s=src_ip, d=dst_ip, b=total_bytes, c=category: 
-                        self._add_threat_intel_data(s, d, b, c, "destination")
-                    )
-            
-            # Write all pending alerts to analysis_1.db
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error adding alert to analysis_1.db: {e}")
+                    self._add_threat_intel_data(src_ip, dst_ip, total_bytes, packet_count, category, "destination")
             
             return alerts
         except Exception as e:
@@ -234,22 +222,35 @@ class SuspiciousConnectionRule(Rule):
             logging.error(error_msg)
             # Try to add the error alert to analysis_1.db
             try:
-                self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                self.add_alert("127.0.0.1", error_msg)
             except:
                 pass
             return [error_msg]
     
-    def _add_threat_intel_data(self, src_ip, dst_ip, bytes_transferred, category, flagged_end):
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_threat_intel_data(self, src_ip, dst_ip, bytes_transferred, packet_count, category, flagged_end):
         """Add threat intelligence data to analysis_1.db"""
         try:
             # Determine the suspicious IP and the other party in the connection
             suspicious_ip = src_ip if flagged_end == "source" else dst_ip
             other_ip = dst_ip if flagged_end == "source" else src_ip
             
+            # Determine the normalized threat type and score
+            threat_type = self._normalize_category(category)
+            threat_score = self._get_threat_score(category)
+            
+            # Determine protocol based on connection (simplified)
+            protocol = "Unknown"
+            
             # Build threat intelligence data
             threat_data = {
-                "score": self._get_threat_score(category),
-                "type": self._normalize_category(category),
+                "score": threat_score,
+                "type": threat_type,
                 "confidence": 0.9,  # High confidence since it's from local intel
                 "source": "Local_Threat_Intel",
                 "first_seen": time.time(),
@@ -257,8 +258,17 @@ class SuspiciousConnectionRule(Rule):
                     "category": category,
                     "connection_party": other_ip,
                     "bytes_transferred": bytes_transferred,
-                    "detection_method": "local_threat_intel_match"
-                }
+                    "packet_count": packet_count,
+                    "detection_method": "local_threat_intel_match",
+                    "threat_list": "custom_blocklist",
+                    "flagged_endpoint": flagged_end
+                },
+                # Extended columns for easy querying
+                "protocol": protocol,
+                "destination_ip": dst_ip if flagged_end == "source" else None,
+                "bytes_transferred": bytes_transferred,
+                "detection_method": "blocklist_match",
+                "packet_count": packet_count
             }
             
             # Update threat intelligence in analysis_1.db

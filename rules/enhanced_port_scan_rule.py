@@ -46,19 +46,19 @@ class EnhancedPortScanRule(Rule):
         self.last_check_time = current_time
         
         try:
-            # Check if port_scan_timestamps table exists
+            # Check if x_port_scans table exists
             db_cursor.execute("""
                 SELECT name FROM sqlite_master 
-                WHERE type='table' AND name='port_scan_timestamps'
+                WHERE type='table' AND name='x_port_scans'
             """)
             
             if not db_cursor.fetchone():
-                return ["Port Scan rule requires port_scan_timestamps table which doesn't exist"]
+                return ["Port Scan rule requires x_port_scans table which doesn't exist"]
                 
             # Detection 1: Vertical scan (sequential ports on same host)
             db_cursor.execute("""
                 SELECT src_ip, dst_ip, GROUP_CONCAT(dst_port) as ports
-                FROM port_scan_timestamps
+                FROM x_port_scans
                 WHERE timestamp > ?
                 GROUP BY src_ip, dst_ip
             """, (current_time - self.time_window,))
@@ -97,19 +97,17 @@ class EnhancedPortScanRule(Rule):
                     self.last_alert_time[ip_pair] = current_time
                     alert_msg = f"Vertical port scan detected: {src_ip} scanned {len(ports)} ports on {dst_ip} with {max_sequential} sequential ports"
                     alerts.append(alert_msg)
-                    # Add the alert to pending_alerts for writing to analysis_1.db - use source IP
-                    pending_alerts.append((src_ip, alert_msg, self.name))
                     
                     # Add threat intelligence to analysis_1.db
-                    self.analysis_manager.queue_query(
-                        lambda s=src_ip, d=dst_ip, p=ports, ms=max_sequential: 
-                        self._add_vertical_scan_data(s, d, p, ms)
-                    )
+                    self._add_vertical_scan_data(src_ip, dst_ip, ports, max_sequential)
+                    
+                    # Add alert using the new method
+                    self.add_alert(src_ip, alert_msg)
             
             # Detection 2: Horizontal scan (same port across multiple hosts)
             db_cursor.execute("""
                 SELECT src_ip, dst_port, COUNT(DISTINCT dst_ip) as host_count
-                FROM port_scan_timestamps
+                FROM x_port_scans
                 WHERE timestamp > ?
                 GROUP BY src_ip, dst_port
                 HAVING host_count >= ?
@@ -123,7 +121,7 @@ class EnhancedPortScanRule(Rule):
                 # Get the list of scanned hosts
                 db_cursor.execute("""
                     SELECT dst_ip
-                    FROM port_scan_timestamps
+                    FROM x_port_scans
                     WHERE src_ip = ? AND dst_port = ? AND timestamp > ?
                     GROUP BY dst_ip
                 """, (src_ip, dst_port, current_time - self.time_window))
@@ -136,31 +134,29 @@ class EnhancedPortScanRule(Rule):
                 self.last_alert_time[src_ip] = current_time
                 alert_msg = f"Horizontal scan detected: {src_ip} scanned port {dst_port} on {host_count} hosts"
                 alerts.append(alert_msg)
-                # Add the alert to pending_alerts for writing to analysis_1.db - use source IP
-                pending_alerts.append((src_ip, alert_msg, self.name))
+                
+                # Add alert using the new method
+                self.add_alert(src_ip, alert_msg)
                 
                 # Add threat intelligence to analysis_1.db
-                self.analysis_manager.queue_query(
-                    lambda s=src_ip, p=dst_port, h=hosts: 
-                    self._add_horizontal_scan_data(s, p, h)
-                )
+                self._add_horizontal_scan_data(src_ip, dst_port, hosts)
                 
                 # List sample hosts
                 if len(hosts) <= 5:
                     host_msg = f"  Hosts: {', '.join(hosts)}"
                     alerts.append(host_msg)
                     # Add as a supplementary alert for the same IP
-                    pending_alerts.append((src_ip, host_msg, self.name))
+                    self.add_alert(src_ip, host_msg)
                 else:
                     host_msg = f"  Sample hosts: {', '.join(hosts[:5])}..."
                     alerts.append(host_msg)
                     # Add as a supplementary alert for the same IP
-                    pending_alerts.append((src_ip, host_msg, self.name))
+                    self.add_alert(src_ip, host_msg)
             
             # Detection 3: Rapid scanning (many ports in short time)
             db_cursor.execute("""
                 SELECT src_ip, dst_ip, COUNT(DISTINCT dst_port) as port_count
-                FROM port_scan_timestamps
+                FROM x_port_scans
                 WHERE timestamp > ?
                 GROUP BY src_ip, dst_ip
                 HAVING port_count >= ?
@@ -174,7 +170,7 @@ class EnhancedPortScanRule(Rule):
                 # Get timestamps for rapid scanning detection
                 db_cursor.execute("""
                     SELECT timestamp
-                    FROM port_scan_timestamps
+                    FROM x_port_scans
                     WHERE src_ip = ? AND dst_ip = ?
                     ORDER BY timestamp DESC
                     LIMIT ?
@@ -193,21 +189,12 @@ class EnhancedPortScanRule(Rule):
                         self.last_alert_time[ip_pair] = current_time
                         alert_msg = f"Rapid port scan: {src_ip} scanned {port_count} ports on {dst_ip} in {time_span:.2f} seconds"
                         alerts.append(alert_msg)
-                        # Add the alert to pending_alerts for writing to analysis_1.db - use source IP
-                        pending_alerts.append((src_ip, alert_msg, self.name))
+                        
+                        # Add alert using the new method
+                        self.add_alert(src_ip, alert_msg)
                         
                         # Add threat intelligence to analysis_1.db
-                        self.analysis_manager.queue_query(
-                            lambda s=src_ip, d=dst_ip, p=port_count, t=time_span: 
-                            self._add_rapid_scan_data(s, d, p, t)
-                        )
-            
-            # Write all pending alerts to analysis_1.db
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error adding alert to analysis_1.db: {e}")
+                        self._add_rapid_scan_data(src_ip, dst_ip, port_count, time_span)
             
             return alerts
             
@@ -215,6 +202,12 @@ class EnhancedPortScanRule(Rule):
             error_msg = f"Error in Enhanced Port Scan rule: {str(e)}"
             logging.error(error_msg)
             return [error_msg]
+    
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
     
     def _add_vertical_scan_data(self, src_ip, dst_ip, ports, max_sequential):
         """Add vertical port scan data to analysis_1.db"""
@@ -232,7 +225,12 @@ class EnhancedPortScanRule(Rule):
                     "ports_scanned": len(ports),
                     "max_sequential_ports": max_sequential,
                     "detection_method": "sequential_port_analysis"
-                }
+                },
+                # Extended columns for easy querying
+                "protocol": "TCP",
+                "destination_ip": dst_ip,
+                "detection_method": "sequential_port_analysis",
+                "packet_count": len(ports)
             }
             
             # Update threat intelligence in analysis_1.db
@@ -258,7 +256,12 @@ class EnhancedPortScanRule(Rule):
                     "hosts_scanned": len(hosts),
                     "target_sample": hosts[:5] if len(hosts) > 5 else hosts,
                     "detection_method": "multiple_host_analysis"
-                }
+                },
+                # Extended columns for easy querying
+                "protocol": "TCP",
+                "destination_port": dst_port,
+                "detection_method": "multiple_host_analysis",
+                "packet_count": len(hosts)
             }
             
             # Update threat intelligence in analysis_1.db
@@ -285,7 +288,13 @@ class EnhancedPortScanRule(Rule):
                     "time_span_seconds": time_span,
                     "scan_rate": port_count / time_span if time_span > 0 else 0,
                     "detection_method": "timing_analysis"
-                }
+                },
+                # Extended columns for easy querying
+                "protocol": "TCP",
+                "destination_ip": dst_ip,
+                "detection_method": "timing_analysis",
+                "packet_count": port_count,
+                "timing_variance": time_span
             }
             
             # Update threat intelligence in analysis_1.db

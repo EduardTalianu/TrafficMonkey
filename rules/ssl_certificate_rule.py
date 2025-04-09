@@ -30,7 +30,6 @@ class SSLCertificateRule(Rule):
             return ["ERROR: SSL Certificate Validation rule requires analysis_manager"]
         
         alerts = []
-        pending_alerts = []  # For writing to analysis_1.db
         current_time = time.time()
         
         # Only run this rule periodically
@@ -88,8 +87,10 @@ class SSLCertificateRule(Rule):
                         if is_self_signed and self.alert_on_self_signed:
                             alert_msg = f"Self-signed certificate detected: {src_ip} -> {dst_ip}:{dst_port} (Subject: {subject})"
                             alerts.append(alert_msg)
-                            # Add to pending alerts - use destination IP as the target
-                            pending_alerts.append((dst_ip, alert_msg, self.name))
+                            
+                            # Add alert using the new method
+                            self.add_alert(dst_ip, alert_msg)
+                            
                             issues.append("self_signed")
                         
                         # Check for expired certificates
@@ -100,8 +101,10 @@ class SSLCertificateRule(Rule):
                                 if expiry_date < datetime.now():
                                     alert_msg = f"Expired certificate detected: {src_ip} -> {dst_ip}:{dst_port} (Expired: {not_after})"
                                     alerts.append(alert_msg)
-                                    # Add to pending alerts - use destination IP as the target
-                                    pending_alerts.append((dst_ip, alert_msg, self.name))
+                                    
+                                    # Add alert using the new method
+                                    self.add_alert(dst_ip, alert_msg)
+                                    
                                     issues.append("expired")
                             except ValueError:
                                 # If date parsing fails, skip the expiry check
@@ -114,8 +117,10 @@ class SSLCertificateRule(Rule):
                                 if weak_algo.lower() in signature_algorithm.lower():
                                     alert_msg = f"Weak certificate signature algorithm detected: {src_ip} -> {dst_ip}:{dst_port} ({signature_algorithm})"
                                     alerts.append(alert_msg)
-                                    # Add to pending alerts - use destination IP as the target
-                                    pending_alerts.append((dst_ip, alert_msg, self.name))
+                                    
+                                    # Add alert using the new method
+                                    self.add_alert(dst_ip, alert_msg)
+                                    
                                     issues.append("weak_algorithm")
                                     break
                         
@@ -124,17 +129,16 @@ class SSLCertificateRule(Rule):
                             if '*.' in subject_alt_names or '*.' in subject:
                                 alert_msg = f"Wildcard certificate detected: {src_ip} -> {dst_ip}:{dst_port} (Subject: {subject})"
                                 alerts.append(alert_msg)
-                                # Add to pending alerts - use destination IP as the target
-                                pending_alerts.append((dst_ip, alert_msg, self.name))
+                                
+                                # Add alert using the new method
+                                self.add_alert(dst_ip, alert_msg)
+                                
                                 issues.append("wildcard")
                         
                         # Add certificate data to analysis_1.db if there were issues
                         if issues:
-                            self.analysis_manager.queue_query(
-                                lambda s=src_ip, d=dst_ip, su=subject, i=issuer, nb=not_before, na=not_after, 
-                                      ss=is_self_signed, sa=signature_algorithm, san=subject_alt_names, iss=issues: 
-                                self._add_certificate_data(s, d, su, i, nb, na, ss, sa, san, iss)
-                            )
+                            self._add_certificate_data(src_ip, dst_ip, dst_port, subject, issuer, not_before, 
+                                  not_after, is_self_signed, signature_algorithm, subject_alt_names, issues)
                         
                         # Cache this certificate
                         self.certificate_cache[connection_key] = {
@@ -159,25 +163,24 @@ class SSLCertificateRule(Rule):
                 for key in old_entries:
                     self.certificate_cache.pop(key, None)
             
-            # Write all pending alerts to analysis_1.db
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    self.analysis_manager.add_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error adding alert to analysis_1.db: {e}")
-            
             return alerts
         except Exception as e:
             error_msg = f"Error in SSL Certificate rule: {str(e)}"
             logging.error(error_msg)
             # Try to add the error alert to analysis_1.db
             try:
-                self.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
+                self.add_alert("127.0.0.1", error_msg)
             except Exception as e:
                 logging.error(f"Error adding alert to analysis_1.db: {e}")
             return [error_msg]
     
-    def _add_certificate_data(self, src_ip, dst_ip, subject, issuer, not_before, not_after, 
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_certificate_data(self, src_ip, dst_ip, dst_port, subject, issuer, not_before, not_after, 
                              is_self_signed, signature_algorithm, subject_alt_names, issues):
         """Add certificate data to analysis_1.db"""
         try:
@@ -195,6 +198,15 @@ class SSLCertificateRule(Rule):
             # Normalize to 1-10 scale with minimum of 4 (medium-low severity)
             normalized_score = min(10, max(4, score))
             
+            # Determine the service type based on port
+            service_type = "HTTPS"
+            if dst_port == 465:
+                service_type = "SMTPS"
+            elif dst_port == 993:
+                service_type = "IMAPS"
+            elif dst_port == 995:
+                service_type = "POP3S"
+            
             # Build threat intelligence data
             threat_data = {
                 "score": normalized_score,
@@ -211,8 +223,15 @@ class SSLCertificateRule(Rule):
                     "signature_algorithm": signature_algorithm,
                     "subject_alt_names": subject_alt_names,
                     "issues": issues,
+                    "service_port": dst_port,
+                    "service_type": service_type,
+                    "client_ip": src_ip,
                     "detection_method": "certificate_validation"
-                }
+                },
+                # Extended columns for easy querying
+                "protocol": "TLS",
+                "destination_port": dst_port,
+                "detection_method": "certificate_analysis"
             }
             
             # Update threat intelligence in analysis_1.db for the server (dst_ip)

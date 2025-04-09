@@ -16,6 +16,7 @@ class TimeBasedAccessRule(Rule):
         self.last_check_time = 0
         self.whitelist = []         # IPs allowed to connect any time
         self.min_bytes = 1000       # Minimum bytes to consider a significant connection
+        self.analysis_manager = None  # Will be set when db_manager is set
     
     def is_work_hours(self, timestamp):
         """Check if a timestamp falls within defined work hours"""
@@ -36,11 +37,12 @@ class TimeBasedAccessRule(Rule):
             return True
     
     def analyze(self, db_cursor):
+        # Ensure analysis_manager is linked
+        if not self.analysis_manager and hasattr(self.db_manager, 'analysis_manager'):
+            self.analysis_manager = self.db_manager.analysis_manager
+        
         # Local list for returning alerts to UI immediately
         alerts = []
-        
-        # List for storing alerts to be queued after analysis is complete
-        pending_alerts = []
         
         current_time = time.time()
         
@@ -121,7 +123,16 @@ class TimeBasedAccessRule(Rule):
                 if len(connections) >= self.alert_threshold:
                     alert_msg = f"Out-of-hours access: {src_ip} made {len(connections)} connections outside of normal business hours"
                     alerts.append(alert_msg)
-                    pending_alerts.append((src_ip, alert_msg, self.name))
+                    
+                    # Add alert to x_alerts table
+                    self.add_alert(src_ip, alert_msg)
+                    
+                    # Add threat intelligence for the source IP
+                    self._add_threat_intel(src_ip, {
+                        "connections_count": len(connections),
+                        "recent_targets": [conn[2] for conn in connections[:5]],
+                        "timestamps": [float(conn[6]) for conn in connections[:5]]
+                    })
                     
                     # Add details for the most recent connections
                     details = []
@@ -143,30 +154,54 @@ class TimeBasedAccessRule(Rule):
                         more_msg = f"  ... and {len(connections) - 5} more"
                         alerts.append(more_msg)
             
-            # Queue all pending alerts AFTER all database operations are complete
-            for ip, msg, rule_name in pending_alerts:
-                try:
-                    # Use analysis_manager to add alerts to analysis_1.db
-                    if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
-                        self.db_manager.analysis_manager.add_alert(ip, msg, rule_name)
-                    else:
-                        self.db_manager.queue_alert(ip, msg, rule_name)
-                except Exception as e:
-                    logging.error(f"Error queueing alert: {e}")
-            
             return alerts
         except Exception as e:
             error_msg = f"Error in Time-Based Access rule: {str(e)}"
             logging.error(error_msg)
-            # Try to queue the error alert
+            # Try to add the error alert
             try:
-                if hasattr(self.db_manager, 'analysis_manager') and self.db_manager.analysis_manager:
-                    self.db_manager.analysis_manager.add_alert("127.0.0.1", error_msg, self.name)
-                else:
-                    self.db_manager.queue_alert("127.0.0.1", error_msg, self.name)
+                self.add_alert("127.0.0.1", error_msg)
             except Exception as e:
-                logging.error(f"Failed to queue error alert: {e}")
+                logging.error(f"Failed to add error alert: {e}")
             return [error_msg]
+    
+    def add_alert(self, ip_address, alert_message):
+        """Add an alert to the x_alerts table"""
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        elif hasattr(self.db_manager, 'queue_alert'):
+            # Fallback to old method
+            return self.db_manager.queue_alert(ip_address, alert_message, self.name)
+        return False
+    
+    def _add_threat_intel(self, ip_address, details_dict):
+        """Store threat intelligence data in x_ip_threat_intel"""
+        try:
+            if not self.analysis_manager:
+                return False
+                
+            # Create threat intelligence data
+            threat_data = {
+                "score": 5.0,  # Medium severity score (0-10)
+                "type": "time_based_anomaly", 
+                "confidence": 0.7,  # Confidence level (0-1)
+                "source": self.name,  # Rule name as source
+                "first_seen": time.time(),
+                "details": {
+                    # Detailed JSON information 
+                    "detection_details": details_dict
+                },
+                # Extended columns for easy querying
+                "protocol": "Multiple",
+                "detection_method": "time_based_analysis",
+                "alert_count": details_dict.get("connections_count", 0)
+            }
+            
+            # Update threat intelligence in x_ip_threat_intel
+            return self.analysis_manager.update_threat_intel(ip_address, threat_data)
+        except Exception as e:
+            logging.error(f"Error adding threat intelligence data: {e}")
+            return False
     
     def get_params(self):
         return {
