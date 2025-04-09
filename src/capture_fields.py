@@ -1,4 +1,8 @@
 # capture_fields.py
+import logging
+
+# Configure logging
+logger = logging.getLogger('capture_fields')
 
 CAPTURE_FIELDS = [
     # Basic fields
@@ -371,13 +375,30 @@ CAPTURE_FIELDS = [
 
 # Manually add tables that don't directly map to capture fields
 TABLE_DEFINITIONS = {
+    "connections": [
+        {"name": "connection_key", "type": "TEXT PRIMARY KEY", "required": True},
+        {"name": "src_ip", "type": "TEXT", "required": True},
+        {"name": "dst_ip", "type": "TEXT", "required": True},
+        {"name": "src_port", "type": "INTEGER", "required": False},
+        {"name": "dst_port", "type": "INTEGER", "required": False},
+        {"name": "src_mac", "type": "TEXT", "required": False},
+        {"name": "total_bytes", "type": "INTEGER DEFAULT 0", "required": False},
+        {"name": "packet_count", "type": "INTEGER DEFAULT 0", "required": False},
+        {"name": "timestamp", "type": "REAL", "required": True},
+        {"name": "vt_result", "type": "TEXT DEFAULT 'unknown'", "required": False},
+        {"name": "is_rdp_client", "type": "BOOLEAN DEFAULT 0", "required": False},
+        {"name": "protocol", "type": "TEXT", "required": False},
+        {"name": "ttl", "type": "INTEGER", "required": False}
+    ],
     "icmp_packets": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
         {"name": "src_ip", "type": "TEXT", "required": True},
         {"name": "dst_ip", "type": "TEXT", "required": True},
         {"name": "icmp_type", "type": "INTEGER", "required": True},
         {"name": "timestamp", "type": "REAL", "required": True}
     ],
     "dns_queries": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
         {"name": "timestamp", "type": "REAL", "required": True},
         {"name": "src_ip", "type": "TEXT", "required": True},
         {"name": "query_domain", "type": "TEXT", "required": True},
@@ -397,21 +418,6 @@ TABLE_DEFINITIONS = {
         {"name": "filename", "type": "TEXT", "required": True},
         {"name": "operation", "type": "TEXT", "required": False},
         {"name": "size", "type": "INTEGER", "required": False}
-    ],
-    "connections": [
-        {"name": "connection_key", "type": "TEXT PRIMARY KEY", "required": True},
-        {"name": "src_ip", "type": "TEXT", "required": True},
-        {"name": "dst_ip", "type": "TEXT", "required": True},
-        {"name": "src_port", "type": "INTEGER", "required": False},
-        {"name": "dst_port", "type": "INTEGER", "required": False},
-        {"name": "src_mac", "type": "TEXT", "required": False},
-        {"name": "total_bytes", "type": "INTEGER DEFAULT 0", "required": False},
-        {"name": "packet_count", "type": "INTEGER DEFAULT 0", "required": False},
-        {"name": "timestamp", "type": "REAL", "required": True},
-        {"name": "vt_result", "type": "TEXT DEFAULT 'unknown'", "required": False},
-        {"name": "is_rdp_client", "type": "BOOLEAN DEFAULT 0", "required": False},
-        {"name": "protocol", "type": "TEXT", "required": False},
-        {"name": "ttl", "type": "INTEGER", "required": False}
     ],
     "http_requests": [
         {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
@@ -484,12 +490,266 @@ TABLE_DEFINITIONS = {
         {"name": "src_mac", "type": "TEXT", "required": False},
         {"name": "dst_ip", "type": "TEXT", "required": False},
         {"name": "operation", "type": "INTEGER", "required": False}
+    ],
+    "alerts": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "ip_address", "type": "TEXT", "required": True},
+        {"name": "alert_message", "type": "TEXT", "required": True},
+        {"name": "rule_name", "type": "TEXT", "required": True},
+        {"name": "timestamp", "type": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "required": True}
     ]
-
 }
 
 # Track schema version for migrations
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Database management functions
+def table_exists(cursor, table_name):
+    """Check if a table exists in the database"""
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,)
+    )
+    return cursor.fetchone() is not None
+
+def get_table_columns(cursor, table_name):
+    """Get column information for a table"""
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    return cursor.fetchall()
+
+def create_database_schema(cursor, include_tables=None, exclude_tables=None):
+    """
+    Create database schema based on TABLE_DEFINITIONS
+    
+    Parameters:
+    - cursor: SQLite cursor to use for operations
+    - include_tables: List of table names to include (None means include all)
+    - exclude_tables: List of table names to exclude
+    
+    Returns:
+    - List of tables created
+    """
+    include_tables = include_tables or list(TABLE_DEFINITIONS.keys())
+    exclude_tables = exclude_tables or []
+    
+    tables_created = []
+    
+    # Process each table in the definitions
+    for table_name, columns in TABLE_DEFINITIONS.items():
+        # Skip if table is excluded or not in included list
+        if table_name in exclude_tables or table_name not in include_tables:
+            continue
+            
+        # Prepare column definitions
+        column_defs = []
+        
+        # Add primary key if it's not defined and table needs one
+        if not any(col["name"] == "id" for col in columns if "PRIMARY KEY" in col.get("type", "")):
+            has_pk = any("PRIMARY KEY" in col.get("type", "") for col in columns)
+            if not has_pk:
+                column_defs.append("id INTEGER PRIMARY KEY AUTOINCREMENT")
+        
+        # Add each column
+        for column in columns:
+            # Skip if already added (e.g., id column)
+            if column["name"] == "id" and "id INTEGER PRIMARY KEY AUTOINCREMENT" in column_defs:
+                continue
+                
+            nullable = "" if column.get("required", False) else " DEFAULT NULL"
+            column_defs.append(f"{column['name']} {column['type']}{nullable}")
+        
+        # Add timestamp if not already included
+        if not any(col["name"] == "timestamp" for col in columns):
+            column_defs.append("timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        
+        # Create the table
+        create_table_sql = f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                {', '.join(column_defs)}
+            )
+        """
+        cursor.execute(create_table_sql)
+        tables_created.append(table_name)
+        
+    return tables_created
+
+def create_standard_indices(cursor):
+    """Create standard indices for the database tables"""
+    
+    # First check which tables exist
+    existing_tables = set()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    for row in cursor.fetchall():
+        existing_tables.add(row[0])
+    
+    # Only create indices for tables that exist
+    
+    # Connections table indices
+    if 'connections' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_connections_ips 
+            ON connections(src_ip, dst_ip)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_connections_ports 
+            ON connections(src_port, dst_port)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_connections_bytes 
+            ON connections(total_bytes DESC)
+        """)
+    
+    # Alerts table indices
+    if 'alerts' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_alerts_ip 
+            ON alerts(ip_address)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_alerts_rule
+            ON alerts(rule_name)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_alerts_timestamp 
+            ON alerts(timestamp DESC)
+        """)
+    
+    # DNS queries indices
+    if 'dns_queries' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dns_queries_domain 
+            ON dns_queries(query_domain)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dns_queries_src 
+            ON dns_queries(src_ip)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dns_queries_time 
+            ON dns_queries(timestamp)
+        """)
+    
+    # HTTP requests indices
+    if 'http_requests' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_requests_conn 
+            ON http_requests(connection_key)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_requests_host 
+            ON http_requests(host)
+        """)
+    
+    # HTTP responses index
+    if 'http_responses' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_responses_req 
+            ON http_responses(http_request_id)
+        """)
+    
+    # TLS connections indices
+    if 'tls_connections' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tls_connections_conn 
+            ON tls_connections(connection_key)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tls_connections_server 
+            ON tls_connections(server_name)
+        """)
+    
+    # ICMP packets index
+    if 'icmp_packets' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_icmp_packets_src_dst 
+            ON icmp_packets(src_ip, dst_ip)
+        """)
+    
+    # ARP data index
+    if 'arp_data' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_arp_data_src_dst 
+            ON arp_data(src_ip, dst_ip)
+        """)
+    
+    # SMB files indices
+    if 'smb_files' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_smb_files_conn 
+            ON smb_files(connection_key)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_smb_files_filename 
+            ON smb_files(filename)
+        """)
+    
+    # HTTP headers indices - this is the problematic one
+    if 'http_headers' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_headers_conn 
+            ON http_headers(connection_key)
+        """)
+        
+        # This index is causing the error - replace request_id with the correct column name
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_headers_req 
+            ON http_headers(request_id)
+        """)
+
+def create_extended_indices(cursor, extended_tables):
+    """Create indices for extended tables"""
+    if 'ip_geolocation' in extended_tables:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_geolocation_country ON ip_geolocation(country)")
+    
+    if 'ip_threat_intel' in extended_tables:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_threat_score ON ip_threat_intel(threat_score DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_threat_type ON ip_threat_intel(threat_type)")
+    
+    if 'traffic_patterns' in extended_tables:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_pattern_periodic ON traffic_patterns(periodic_score DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_pattern_class ON traffic_patterns(classification)")
+    
+    if 'connection_statistics' in extended_tables:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_conn_stats_time ON connection_statistics(timestamp)")
+
+def get_integrated_schema(extended_tables=None):
+    """
+    Get a complete schema including core and optionally extended tables
+    
+    Parameters:
+    - extended_tables: Dictionary of extended table definitions
+    
+    Returns:
+    - Merged schema dictionary
+    """
+    schema = dict(TABLE_DEFINITIONS)
+    
+    if extended_tables:
+        # Merge extended tables, flagging any conflicts
+        for table_name, columns in extended_tables.items():
+            if table_name in schema:
+                # Table exists in core schema - log potential conflict
+                logger.warning(f"Table {table_name} exists in both core and extended schema")
+                
+                # Merge columns from both definitions, core schema takes precedence
+                existing_columns = {col["name"]: col for col in schema[table_name]}
+                for col in columns:
+                    if col["name"] not in existing_columns:
+                        schema[table_name].append(col)
+            else:
+                # New table, just add it
+                schema[table_name] = columns
+    
+    return schema
 
 # Helper functions
 def get_tshark_fields():

@@ -9,9 +9,61 @@ import json
 import importlib
 import sys
 from collections import defaultdict, Counter
+import capture_fields  # Import the centralized schema
 
 # Configure logging
 logger = logging.getLogger('analysis_manager')
+
+# Define extended table definitions specific to analysis_1.db
+EXTENDED_TABLE_DEFINITIONS = {
+    "ip_geolocation": [
+        {"name": "ip_address", "type": "TEXT PRIMARY KEY", "required": True},
+        {"name": "country", "type": "TEXT", "required": False},
+        {"name": "region", "type": "TEXT", "required": False},
+        {"name": "city", "type": "TEXT", "required": False},
+        {"name": "latitude", "type": "REAL", "required": False},
+        {"name": "longitude", "type": "REAL", "required": False},
+        {"name": "asn", "type": "TEXT", "required": False},
+        {"name": "asn_name", "type": "TEXT", "required": False},
+        {"name": "last_updated", "type": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "required": True}
+    ],
+    "ip_threat_intel": [
+        {"name": "ip_address", "type": "TEXT PRIMARY KEY", "required": True},
+        {"name": "threat_score", "type": "REAL DEFAULT 0", "required": False},
+        {"name": "threat_type", "type": "TEXT", "required": False},
+        {"name": "confidence", "type": "REAL DEFAULT 0", "required": False},
+        {"name": "source", "type": "TEXT", "required": False},
+        {"name": "first_seen", "type": "TIMESTAMP", "required": False},
+        {"name": "last_seen", "type": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "required": True},
+        {"name": "details", "type": "TEXT", "required": False}
+    ],
+    "traffic_patterns": [
+        {"name": "connection_key", "type": "TEXT PRIMARY KEY", "required": True},
+        {"name": "avg_packet_size", "type": "REAL", "required": False},
+        {"name": "std_dev_packet_size", "type": "REAL", "required": False},
+        {"name": "packet_size_distribution", "type": "TEXT", "required": False},
+        {"name": "periodic_score", "type": "REAL DEFAULT 0", "required": False},
+        {"name": "burst_score", "type": "REAL DEFAULT 0", "required": False},
+        {"name": "direction_ratio", "type": "REAL", "required": False},
+        {"name": "session_count", "type": "INTEGER DEFAULT 1", "required": False},
+        {"name": "first_seen", "type": "TIMESTAMP", "required": False},
+        {"name": "last_seen", "type": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "required": True},
+        {"name": "classification", "type": "TEXT", "required": False}
+    ],
+    "connection_statistics": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "timestamp", "type": "REAL", "required": True},
+        {"name": "total_connections", "type": "INTEGER", "required": False},
+        {"name": "active_connections", "type": "INTEGER", "required": False},
+        {"name": "total_bytes", "type": "REAL", "required": False},
+        {"name": "unique_src_ips", "type": "INTEGER", "required": False},
+        {"name": "unique_dst_ips", "type": "INTEGER", "required": False},
+        {"name": "rdp_connections", "type": "INTEGER", "required": False},
+        {"name": "http_connections", "type": "INTEGER", "required": False},
+        {"name": "https_connections", "type": "INTEGER", "required": False},
+        {"name": "dns_queries", "type": "INTEGER", "required": False}
+    ]
+}
 
 class AnalysisBase:
     """Base class for all analysis plugins"""
@@ -87,6 +139,81 @@ class AnalysisManager:
             self.sync_thread.start()
             
         logger.info(f"Analysis manager initialized with {len(self.analysis_plugins)} plugins")
+    
+    def _setup_analysis1_db(self):
+        """Set up analysis_1 database tables with centralized and extended schema"""
+        cursor = self.analysis1_conn.cursor()
+        try:
+            # Configure for performance
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA cache_size=10000")
+            
+            # Get integrated schema merging core and extended tables
+            integrated_schema = capture_fields.get_integrated_schema(EXTENDED_TABLE_DEFINITIONS)
+            
+            # Create all tables from the integrated schema
+            tables_created = []
+            for table_name, columns in integrated_schema.items():
+                # Prepare column definitions
+                column_defs = []
+                
+                # Add primary key if it's not defined
+                if not any(col["name"] == "id" for col in columns if "PRIMARY KEY" in col.get("type", "")):
+                    has_pk = any("PRIMARY KEY" in col.get("type", "") for col in columns)
+                    if not has_pk:
+                        column_defs.append("id INTEGER PRIMARY KEY AUTOINCREMENT")
+                
+                # Add each column
+                for column in columns:
+                    # Skip if already added (e.g., id column)
+                    if column["name"] == "id" and "id INTEGER PRIMARY KEY AUTOINCREMENT" in column_defs:
+                        continue
+                        
+                    nullable = "" if column.get("required", False) else " DEFAULT NULL"
+                    column_defs.append(f"{column['name']} {column['type']}{nullable}")
+                
+                # Add timestamp if not already included
+                if not any(col["name"] == "timestamp" for col in columns):
+                    column_defs.append("timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+                
+                # Create the table
+                create_table_sql = f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        {', '.join(column_defs)}
+                    )
+                """
+                cursor.execute(create_table_sql)
+                tables_created.append(table_name)
+            
+            logger.info(f"Created {len(tables_created)} tables in analysis_1.db")
+            
+            # Create standard indices for core tables
+            capture_fields.create_standard_indices(cursor)
+            
+            # Create additional indices for extended tables
+            self._create_extended_indices(cursor)
+            
+            self.analysis1_conn.commit()
+            logger.info("Analysis_1 database tables initialized with integrated schema")
+        finally:
+            cursor.close()
+    
+    def _create_extended_indices(self, cursor):
+        """Create indices for extended tables"""
+        # IP geolocation indices
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_geolocation_country ON ip_geolocation(country)")
+        
+        # Threat intelligence indices
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_threat_score ON ip_threat_intel(threat_score DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_threat_type ON ip_threat_intel(threat_type)")
+        
+        # Traffic patterns indices
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_pattern_periodic ON traffic_patterns(periodic_score DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_pattern_class ON traffic_patterns(classification)")
+        
+        # Connection statistics indices
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_conn_stats_time ON connection_statistics(timestamp)")
     
     def load_analysis_plugins(self):
         """Load analysis plugins from the analysis directory"""
@@ -169,246 +296,6 @@ class AnalysisManager:
         if not self.analysis_plugins:
             logger.warning("No analysis plugins were loaded! Advanced analysis will be disabled.")
     
-    def _setup_analysis1_db(self):
-        """Set up analysis_1 database tables with support for new fields"""
-        cursor = self.analysis1_conn.cursor()
-        try:
-            # Configure for performance
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.execute("PRAGMA cache_size=10000")
-            
-            # IP geolocation table (existing)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS ip_geolocation (
-                    ip_address TEXT PRIMARY KEY,
-                    country TEXT,
-                    region TEXT,
-                    city TEXT,
-                    latitude REAL,
-                    longitude REAL,
-                    asn TEXT,
-                    asn_name TEXT,
-                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Threat intelligence data (existing)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS ip_threat_intel (
-                    ip_address TEXT PRIMARY KEY,
-                    threat_score REAL DEFAULT 0,
-                    threat_type TEXT,
-                    confidence REAL DEFAULT 0,
-                    source TEXT,
-                    first_seen TIMESTAMP,
-                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    details TEXT
-                )
-            """)
-            
-            # Traffic patterns table (existing)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS traffic_patterns (
-                    connection_key TEXT PRIMARY KEY,
-                    avg_packet_size REAL,
-                    std_dev_packet_size REAL,
-                    packet_size_distribution TEXT,
-                    periodic_score REAL DEFAULT 0,
-                    burst_score REAL DEFAULT 0,
-                    direction_ratio REAL,
-                    session_count INTEGER DEFAULT 1,
-                    first_seen TIMESTAMP,
-                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    classification TEXT
-                )
-            """)
-            
-            # DNS queries table (updated with new fields)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS dns_queries (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    src_ip TEXT NOT NULL,
-                    query_domain TEXT NOT NULL,
-                    query_type TEXT,
-                    response_domain TEXT,  
-                    response_type TEXT,
-                    ttl INTEGER,
-                    cname_record TEXT,
-                    ns_record TEXT,
-                    a_record TEXT,
-                    aaaa_record TEXT,
-                    timestamp REAL NOT NULL
-                )
-            """)
-            
-            # HTTP requests table (updated with X-Forwarded-For)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS http_requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    connection_key TEXT NOT NULL,
-                    method TEXT,
-                    host TEXT,
-                    uri TEXT,
-                    referer TEXT,
-                    request_headers TEXT,
-                    request_size INTEGER,
-                    content_type TEXT,
-                    user_agent TEXT,
-                    x_forwarded_for TEXT,
-                    version TEXT,
-                    timestamp REAL NOT NULL
-                )
-            """)
-            
-            # HTTP responses table (existing)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS http_responses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    request_id INTEGER,
-                    http_request_id INTEGER,
-                    status_code INTEGER,
-                    response_headers TEXT,
-                    server TEXT,
-                    timestamp REAL NOT NULL,
-                    content_type TEXT,
-                    content_length INTEGER,
-                    FOREIGN KEY(request_id) REFERENCES http_requests(id)
-                )
-            """)
-            
-            # TLS connections table (updated with new fields)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS tls_connections (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    connection_key TEXT NOT NULL,
-                    tls_version TEXT,
-                    cipher_suite TEXT,
-                    server_name TEXT,
-                    ja3_fingerprint TEXT,
-                    ja3s_fingerprint TEXT,
-                    record_content_type INTEGER,
-                    session_id TEXT,
-                    certificate_issuer TEXT,
-                    certificate_subject TEXT,
-                    certificate_validity_start TEXT,
-                    certificate_validity_end TEXT,
-                    certificate_serial TEXT,
-                    timestamp REAL NOT NULL
-                )
-            """)
-            
-            # ICMP packets table (existing)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS icmp_packets (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    src_ip TEXT NOT NULL,
-                    dst_ip TEXT NOT NULL,
-                    icmp_type INTEGER,
-                    timestamp REAL NOT NULL
-                )
-            """)
-            
-            # ARP data table (updated with MAC address)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS arp_data (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    src_ip TEXT NOT NULL,
-                    dst_ip TEXT NOT NULL,
-                    src_mac TEXT,
-                    operation INTEGER,
-                    timestamp REAL NOT NULL
-                )
-            """)
-            
-            # SMB files table (new)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS smb_files (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    connection_key TEXT NOT NULL,
-                    filename TEXT,
-                    operation TEXT,
-                    size INTEGER DEFAULT 0,
-                    timestamp REAL NOT NULL
-                )
-            """)
-            
-            # Create alerts table (existing)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS alerts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ip_address TEXT,
-                    alert_message TEXT,
-                    rule_name TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(ip_address, alert_message)
-                )
-            """)
-            
-            # Connection statistics table (existing)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS connection_statistics (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp REAL,
-                    total_connections INTEGER,
-                    active_connections INTEGER,
-                    total_bytes REAL,
-                    unique_src_ips INTEGER,
-                    unique_dst_ips INTEGER,
-                    rdp_connections INTEGER,
-                    http_connections INTEGER,
-                    https_connections INTEGER,
-                    dns_queries INTEGER
-                )
-            """)
-            
-            # Create indices for the tables
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_geolocation_country ON ip_geolocation(country)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_threat_score ON ip_threat_intel(threat_score DESC)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_ip ON alerts(ip_address)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_rule ON alerts(rule_name)")
-            
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dns_queries_domain ON dns_queries(query_domain)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dns_queries_src ON dns_queries(src_ip)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dns_queries_time ON dns_queries(timestamp)")
-            
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_requests_conn ON http_requests(connection_key)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_requests_host ON http_requests(host)")
-            
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_responses_req ON http_responses(request_id)")
-            
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_connections_conn ON tls_connections(connection_key)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_connections_server ON tls_connections(server_name)")
-            
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_packets_src_dst ON icmp_packets(src_ip, dst_ip)")
-            
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_data_src_dst ON arp_data(src_ip, dst_ip)")
-            
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_conn_stats_time ON connection_statistics(timestamp)")
-            
-            # New indices for SMB files
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_smb_files_conn ON smb_files(connection_key)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_smb_files_filename ON smb_files(filename)")
-            
-            self.analysis1_conn.commit()
-            logger.info("Analysis_1 database tables initialized")
-        finally:
-            cursor.close()
-    
-    def _sync_thread(self):
-        """Thread that periodically synchronizes with analysis.db"""
-        logger.info("Analysis sync thread started")
-        while self.queue_running:
-            try:
-                current_time = time.time()
-                if current_time - self.last_sync_time >= self.sync_interval:
-                    self.sync_from_analysis_db()
-                
-                # Sleep for a short time before checking again
-                time.sleep(1)
-            except Exception as e:
-                logger.error(f"Error in sync thread: {e}")
-    
     def _process_queue(self):
         """Process database query queue in a separate thread"""
         logger.info("Analysis query processing thread started")
@@ -440,6 +327,20 @@ class AnalysisManager:
         """Add a query to the processing queue"""
         self.query_queue.put((query_func, args, kwargs, callback))
         logger.debug("Analysis query added to processing queue")
+    
+    def _sync_thread(self):
+        """Thread that periodically synchronizes with analysis.db"""
+        logger.info("Analysis sync thread started")
+        while self.queue_running:
+            try:
+                current_time = time.time()
+                if current_time - self.last_sync_time >= self.sync_interval:
+                    self.sync_from_analysis_db()
+                
+                # Sleep for a short time before checking again
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Error in sync thread: {e}")
     
     def sync_from_analysis_db(self):
         """Synchronize data from analysis.db to analysis_1.db with support for all relevant tables"""
@@ -475,69 +376,60 @@ class AnalysisManager:
                 for table in tables:
                     try:
                         # Check if table exists in source database
-                        analysis_cursor = analysis_conn.cursor()
-                        analysis_cursor.execute(
-                            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                            (table,)
-                        )
-                        
-                        if analysis_cursor.fetchone() is None:
+                        if not capture_fields.table_exists(analysis_conn.cursor(), table):
                             logger.info(f"Table {table} not found in analysis.db, skipping")
-                            analysis_cursor.close()
                             continue
                         
                         # Check if table exists in destination database
-                        analysis1_cursor = analysis1_conn.cursor()
-                        analysis1_cursor.execute(
-                            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                            (table,)
-                        )
-                        
-                        if analysis1_cursor.fetchone() is None:
+                        if not capture_fields.table_exists(analysis1_conn.cursor(), table):
                             # Create table in destination if it doesn't exist
                             logger.info(f"Table {table} not found in analysis_1.db, creating it")
                             
                             # Get schema from source
-                            analysis_cursor.execute(
+                            source_cursor = analysis_conn.cursor()
+                            source_cursor.execute(
                                 "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
                                 (table,)
                             )
-                            create_table_sql = analysis_cursor.fetchone()
+                            create_table_sql = source_cursor.fetchone()
                             
                             if create_table_sql and create_table_sql[0]:
-                                analysis1_cursor.execute(create_table_sql[0])
+                                dest_cursor = analysis1_conn.cursor()
+                                dest_cursor.execute(create_table_sql[0])
                                 logger.info(f"Created table {table} in analysis_1.db")
                         
                         # Get sync identifier column (prefer 'id' or 'timestamp')
                         sync_column = 'id'  # Default
                         
                         # Check if 'id' column exists
-                        analysis_cursor.execute(f"PRAGMA table_info({table})")
-                        columns = analysis_cursor.fetchall()
+                        columns = capture_fields.get_table_columns(analysis_conn.cursor(), table)
                         column_names = [col[1] for col in columns]  # Column name is at index 1
                         
                         if 'id' not in column_names and 'timestamp' in column_names:
                             sync_column = 'timestamp'
                         
                         # Get last synced value
+                        source_cursor = analysis_conn.cursor()
+                        dest_cursor = analysis1_conn.cursor()
+                        
                         if sync_column == 'id':
-                            analysis1_cursor.execute(f"SELECT MAX({sync_column}) FROM {table}")
-                            last_value = analysis1_cursor.fetchone()[0] or 0
+                            dest_cursor.execute(f"SELECT MAX({sync_column}) FROM {table}")
+                            last_value = dest_cursor.fetchone()[0] or 0
                             
                             # Get new records from analysis.db
-                            analysis_cursor.execute(f"SELECT * FROM {table} WHERE {sync_column} > ?", (last_value,))
+                            source_cursor.execute(f"SELECT * FROM {table} WHERE {sync_column} > ?", (last_value,))
                         else:  # timestamp-based sync
-                            analysis1_cursor.execute(f"SELECT MAX({sync_column}) FROM {table}")
-                            last_timestamp = analysis1_cursor.fetchone()[0] or 0
+                            dest_cursor.execute(f"SELECT MAX({sync_column}) FROM {table}")
+                            last_timestamp = dest_cursor.fetchone()[0] or 0
                             
                             # Get new records from analysis.db
-                            analysis_cursor.execute(f"SELECT * FROM {table} WHERE {sync_column} > ?", (last_timestamp,))
+                            source_cursor.execute(f"SELECT * FROM {table} WHERE {sync_column} > ?", (last_timestamp,))
                         
                         # Get column names from source database
-                        columns = [desc[0] for desc in analysis_cursor.description]
+                        columns = [desc[0] for desc in source_cursor.description]
                         
                         # Process rows
-                        rows = analysis_cursor.fetchall()
+                        rows = source_cursor.fetchall()
                         if rows:
                             # Prepare SQL for insertion
                             columns_str = ', '.join(columns)
@@ -546,7 +438,7 @@ class AnalysisManager:
                             # Insert rows into destination
                             for row in rows:
                                 try:
-                                    analysis1_cursor.execute(
+                                    dest_cursor.execute(
                                         f"INSERT OR IGNORE INTO {table} ({columns_str}) VALUES ({placeholders})",
                                         row
                                     )
@@ -555,10 +447,6 @@ class AnalysisManager:
                                     logger.error(f"Error inserting row into {table}: {e}")
                             
                             logger.info(f"Synchronized {len(rows)} records from {table}")
-                        
-                        # Close cursors
-                        analysis_cursor.close()
-                        analysis1_cursor.close()
                         
                     except Exception as e:
                         logger.error(f"Error syncing table {table}: {e}")

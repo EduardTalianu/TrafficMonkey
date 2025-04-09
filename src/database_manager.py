@@ -5,7 +5,7 @@ import threading
 import logging
 import queue
 import json
-import capture_fields  # Import the field definitions
+import capture_fields  # Import the centralized field definitions
 
 # Configure logging
 logger = logging.getLogger('database_manager')
@@ -24,7 +24,7 @@ class DatabaseManager:
         self.analysis_db_path = os.path.join(self.db_dir, "analysis.db")
         self.analysis_conn = sqlite3.connect(self.analysis_db_path, check_same_thread=False)
         
-        # Setup databases
+        # Setup databases using centralized schema
         self._setup_capture_db()
         self._setup_analysis_db()
         
@@ -66,10 +66,19 @@ class DatabaseManager:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
             
-            # Create tables for capture
-            self._create_tables(cursor)
+            # First create tables using centralized schema definition
+            tables_created = capture_fields.create_database_schema(cursor)
+            
+            # Commit the tables first
             self.capture_conn.commit()
-            logger.info("Capture database initialized for write operations")
+            
+            # Then create standard indices for the capture database
+            capture_fields.create_standard_indices(cursor)
+            
+            # Commit again after creating indices
+            self.capture_conn.commit()
+            
+            logger.info(f"Capture database initialized with {len(tables_created)} tables")
         finally:
             cursor.close()
     
@@ -82,14 +91,17 @@ class DatabaseManager:
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA cache_size=10000")
             
-            # Create the same tables
-            self._create_tables(cursor)
+            # Create tables using centralized schema definition
+            tables_created = capture_fields.create_database_schema(cursor)
+            
+            # Create standard indices for the analysis database
+            capture_fields.create_standard_indices(cursor)
             
             # Add additional indices for query performance
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_connections_bytes ON connections(total_bytes DESC)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_connections_ttl ON connections(ttl)")
+            
             self.analysis_conn.commit()
-            logger.info("Analysis database initialized for read operations")
+            logger.info(f"Analysis database initialized with {len(tables_created)} tables optimized for reading")
         finally:
             cursor.close()
     
@@ -125,153 +137,6 @@ class DatabaseManager:
             analysis_cursor.close()
         except Exception as e:
             logger.error(f"Error checking schema version: {e}")
-    
-    def _create_tables(self, cursor):
-        """Create tables based on field definitions from capture_fields.py with updated schema"""
-        # Get table schemas from field definitions
-        table_schemas = capture_fields.get_tables_schema()
-        
-        # Always create the core connections table with src_mac field
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS connections (
-                connection_key TEXT PRIMARY KEY,
-                src_ip TEXT,
-                dst_ip TEXT,
-                src_port INTEGER DEFAULT NULL,
-                dst_port INTEGER DEFAULT NULL,
-                src_mac TEXT DEFAULT NULL,
-                total_bytes INTEGER DEFAULT 0,
-                packet_count INTEGER DEFAULT 0,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                vt_result TEXT DEFAULT 'unknown',
-                is_rdp_client BOOLEAN DEFAULT 0,
-                protocol TEXT DEFAULT NULL,
-                ttl INTEGER DEFAULT NULL
-            )
-        """)
-        
-        # Create SMB files table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS smb_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                connection_key TEXT,
-                filename TEXT,
-                operation TEXT,
-                size INTEGER DEFAULT 0,
-                timestamp REAL
-            )
-        """)
-        
-        # Create standard indices for the connections table
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_connections_ips 
-            ON connections(src_ip, dst_ip)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_connections_ports 
-            ON connections(src_port, dst_port)
-        """)
-        
-        # Create alerts table (standard table not derived from field definitions)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ip_address TEXT,
-                alert_message TEXT,
-                rule_name TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_alerts_ip 
-            ON alerts(ip_address)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_alerts_rule
-            ON alerts(rule_name)
-        """)
-        
-        # Create tables dynamically based on field definitions
-        for table_name, columns in table_schemas.items():
-            # Skip connections and alerts tables that were already created
-            if table_name in ('connections', 'alerts', 'app_protocols'):
-                continue
-                
-            # Prepare column definitions
-            column_defs = []
-            
-            # Add primary key if it's not defined
-            if not any(col["name"] == "id" for col in columns):
-                column_defs.append("id INTEGER PRIMARY KEY AUTOINCREMENT")
-            
-            # Add each column
-            for column in columns:
-                nullable = "" if column["required"] else " DEFAULT NULL"
-                column_defs.append(f"{column['name']} {column['type']}{nullable}")
-            
-            # Add timestamp if not already included
-            if not any(col["name"] == "timestamp" for col in columns):
-                column_defs.append("timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-            
-            # Create the table
-            create_table_sql = f"""
-                CREATE TABLE IF NOT EXISTS {table_name} (
-                    {', '.join(column_defs)}
-                )
-            """
-            cursor.execute(create_table_sql)
-            
-            # Create index on timestamp for most tables
-            cursor.execute(f"""
-                CREATE INDEX IF NOT EXISTS idx_{table_name}_timestamp 
-                ON {table_name}(timestamp)
-            """)
-        
-        # Create port scan tracking table (this is essential for the application)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS port_scan_timestamps (
-                src_ip TEXT,
-                dst_ip TEXT,
-                dst_port INTEGER,
-                timestamp REAL,
-                PRIMARY KEY (src_ip, dst_ip, dst_port)
-            )
-        """)
-        
-        # Create application protocols table (essential for protocol detection)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS app_protocols (
-                connection_key TEXT PRIMARY KEY,
-                app_protocol TEXT,
-                protocol_details TEXT,
-                detection_method TEXT,
-                timestamp REAL,
-                FOREIGN KEY (connection_key) REFERENCES connections (connection_key)
-            )
-        """)
-
-    def add_http_headers(self, request_id, connection_key, headers_json, is_request=True):
-        """Parses headers JSON and adds individual headers to the http_headers table"""
-        try:
-            cursor = self.capture_conn.cursor()
-            current_time = time.time()
-            if headers_json:
-                headers = json.loads(headers_json)
-                for name, value in headers.items():
-                    cursor.execute("""
-                        INSERT INTO http_headers
-                        (connection_key, request_id, header_name, header_value, is_request, timestamp)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (connection_key, request_id, name, value, is_request, current_time))
-            self.capture_conn.commit()
-            cursor.close()
-            return True
-        except Exception as e:
-            logger.error(f"Error adding HTTP headers: {e}")
-            return False
     
     def _sync_thread(self):
         """Thread that periodically synchronizes databases"""
@@ -331,17 +196,7 @@ class DatabaseManager:
     
     def get_table_columns(self, conn, table_name):
         """Helper function to get column names and types for a table."""
-        cursor = conn.cursor()
-        try:
-            cursor.execute(f"PRAGMA table_info({table_name})")
-            columns_info = cursor.fetchall()
-            # Returns list of tuples: (cid, name, type, notnull, default_value, pk)
-            return columns_info
-        except Exception as e:
-            logger.error(f"Error getting columns for table {table_name}: {e}")
-            return []
-        finally:
-            cursor.close()
+        return capture_fields.get_table_columns(conn.cursor(), table_name)
     
     def _process_queue(self):
         """Process database query queue in a separate thread"""
@@ -512,6 +367,26 @@ class DatabaseManager:
             logger.error(f"Error storing HTTP request: {e}")
             return None
 
+    def add_http_headers(self, request_id, connection_key, headers_json, is_request=True):
+        """Parses headers JSON and adds individual headers to the http_headers table"""
+        try:
+            cursor = self.capture_conn.cursor()
+            current_time = time.time()
+            if headers_json:
+                headers = json.loads(headers_json)
+                for name, value in headers.items():
+                    cursor.execute("""
+                        INSERT INTO http_headers
+                        (connection_key, request_id, header_name, header_value, is_request, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (connection_key, request_id, name, value, is_request, current_time))
+            self.capture_conn.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.error(f"Error adding HTTP headers: {e}")
+            return False
+
     def add_http_response(self, http_request_id, status_code, content_type, content_length, server, headers_json):
         """Store HTTP response information"""
         try:
@@ -668,45 +543,6 @@ class DatabaseManager:
             logger.error(f"Error storing application protocol: {e}")
             return False
 
-    def create_connection_key(src_ip, dst_ip, src_port, dst_port):
-        """Create a standardized connection key that handles both IPv4 and IPv6"""
-        # For IPv6, wrap the address in square brackets to distinguish from port separator
-        src_part = f"[{src_ip}]:{src_port}" if ':' in src_ip else f"{src_ip}:{src_port}"
-        dst_part = f"[{dst_ip}]:{dst_port}" if ':' in dst_ip else f"{dst_ip}:{dst_port}"
-        return f"{src_part}->{dst_part}"
-    
-    def parse_connection_key(connection_key):
-        """Parse a connection key into its components, handling IPv4 and IPv6"""
-        try:
-            src_part, dst_part = connection_key.split('->')
-            
-            # Extract source IP and port
-            if '[' in src_part and ']' in src_part:  # IPv6
-                src_ip = src_part[src_part.find('[')+1:src_part.find(']')]
-                src_port_str = src_part[src_part.find(']')+2:]  # +2 to skip ]:
-            else:  # IPv4
-                src_ip, src_port_str = src_part.rsplit(':', 1)
-                
-            # Extract destination IP and port
-            if '[' in dst_part and ']' in dst_part:  # IPv6
-                dst_ip = dst_part[dst_part.find('[')+1:dst_part.find(']')]
-                dst_port_str = dst_part[dst_part.find(']')+2:]  # +2 to skip ]:
-            else:  # IPv4
-                dst_ip, dst_port_str = dst_part.rsplit(':', 1)
-                
-            # Convert ports to integers
-            try:
-                src_port = int(src_port_str)
-                dst_port = int(dst_port_str)
-            except ValueError:
-                src_port = 0
-                dst_port = 0
-                
-            return src_ip, dst_ip, src_port, dst_port
-        except Exception as e:
-            logger.error(f"Failed to parse connection key {connection_key}: {e}")
-            return None, None, None, None
-
     def sync_databases(self):
         """Synchronize data from capture DB to analysis DB with improved table detection and creation"""
         try:
@@ -734,13 +570,7 @@ class DatabaseManager:
                 for table_name in all_tables:
                     try:
                         # Check if table exists in analysis DB - if not, create it
-                        sync_analysis_cursor.execute(
-                            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                            (table_name,)
-                        )
-                        table_exists = sync_analysis_cursor.fetchone() is not None
-                        
-                        if not table_exists:
+                        if not capture_fields.table_exists(sync_analysis_cursor, table_name):
                             logger.info(f"Table {table_name} missing in analysis DB - creating it")
                             
                             # Get table creation SQL from capture DB
@@ -774,13 +604,13 @@ class DatabaseManager:
                             sync_capture_cursor.execute("SELECT * FROM arp_data")
                             
                             # Delete existing records in analysis DB
-                            if table_exists:
+                            if capture_fields.table_exists(sync_analysis_cursor, table_name):
                                 sync_analysis_cursor.execute("DELETE FROM arp_data")
                                 logger.info("Cleared existing ARP data in analysis DB")
                         else:
                             # For other tables, use timestamp-based sync
                             # Get column info for the current table
-                            columns_info = self.get_table_columns(self.capture_conn, table_name)
+                            columns_info = capture_fields.get_table_columns(sync_analysis_cursor, table_name)
                             if not columns_info:
                                 logger.warning(f"Could not get column info for table {table_name}. Skipping.")
                                 continue
@@ -789,7 +619,7 @@ class DatabaseManager:
                             column_types = {col[1]: col[2] for col in columns_info}
                             
                             # Determine sync strategy based on table structure
-                            if 'timestamp' in column_names and table_exists:
+                            if 'timestamp' in column_names:
                                 # For timestamp-based tables, use incremental sync
                                 if column_types.get('timestamp', '').upper() in ['REAL', 'INTEGER', 'NUMERIC', 'NUMBER']:
                                     # Numeric timestamp (epoch)
