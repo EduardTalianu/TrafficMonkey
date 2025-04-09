@@ -57,7 +57,17 @@ EXTENDED_TABLE_DEFINITIONS = {
         {"name": "source", "type": "TEXT", "required": False},
         {"name": "first_seen", "type": "TIMESTAMP", "required": False},
         {"name": "last_seen", "type": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "required": True},
-        {"name": "details", "type": "TEXT", "required": False}
+        {"name": "details", "type": "TEXT", "required": False},
+        # Extended columns for better queryability
+        {"name": "protocol", "type": "TEXT", "required": False},
+        {"name": "destination_ip", "type": "TEXT", "required": False},
+        {"name": "destination_port", "type": "INTEGER", "required": False},
+        {"name": "bytes_transferred", "type": "INTEGER", "required": False},
+        {"name": "detection_method", "type": "TEXT", "required": False},
+        {"name": "encoding_type", "type": "TEXT", "required": False},
+        {"name": "packet_count", "type": "INTEGER", "required": False},
+        {"name": "timing_variance", "type": "REAL", "required": False},
+        {"name": "alert_count", "type": "INTEGER DEFAULT 1", "required": False}
     ],
     "x_traffic_patterns": [
         {"name": "connection_key", "type": "TEXT PRIMARY KEY", "required": True},
@@ -737,25 +747,53 @@ class AnalysisManager:
             return False
         
     def update_threat_intel(self, ip_address, threat_data):
-        """Update threat intelligence data for an IP (compatibility method)"""
+        """Update threat intelligence data for an IP with extended column support"""
         try:
             cursor = self.analysis1_conn.cursor()
+            
+            # Extract the basic threat intel data
+            score = threat_data.get('score', 0)
+            threat_type = threat_data.get('type')
+            confidence = threat_data.get('confidence', 0)
+            source = threat_data.get('source')
+            first_seen = threat_data.get('first_seen') or time.time()
+            details = json.dumps(threat_data.get('details', {}))
+            
+            # Extract extended columns if present
+            protocol = threat_data.get('protocol')
+            destination_ip = threat_data.get('destination_ip')
+            destination_port = threat_data.get('destination_port')
+            bytes_transferred = threat_data.get('bytes_transferred')
+            detection_method = threat_data.get('detection_method')
+            encoding_type = threat_data.get('encoding_type')
+            packet_count = threat_data.get('packet_count')
+            timing_variance = threat_data.get('timing_variance')
+            
+            # Update existing record or insert new one with all fields
             cursor.execute("""
                 INSERT OR REPLACE INTO x_ip_threat_intel
-                (ip_address, threat_score, threat_type, confidence, source, first_seen, last_seen, details)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                (ip_address, threat_score, threat_type, confidence, source, first_seen, 
+                last_seen, details, protocol, destination_ip, destination_port, 
+                bytes_transferred, detection_method, encoding_type, packet_count, 
+                timing_variance)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                ip_address,
-                threat_data.get('score', 0),
-                threat_data.get('type'),
-                threat_data.get('confidence', 0),
-                threat_data.get('source'),
-                threat_data.get('first_seen') or time.time(),
-                json.dumps(threat_data.get('details', {}))
+                ip_address, score, threat_type, confidence, source, first_seen, 
+                details, protocol, destination_ip, destination_port, 
+                bytes_transferred, detection_method, encoding_type, packet_count, 
+                timing_variance
             ))
+            
+            # If this is an existing record, increment the alert count
+            cursor.execute("""
+                UPDATE x_ip_threat_intel 
+                SET alert_count = alert_count + 1
+                WHERE ip_address = ? AND alert_count IS NOT NULL
+            """, (ip_address,))
+            
             self.analysis1_conn.commit()
             cursor.close()
-            logger.info(f"Updated threat intel for {ip_address} (compatibility method)")
+            logger.info(f"Updated threat intel for {ip_address} with extended data")
             return True
         except Exception as e:
             logger.error(f"Error updating threat intel: {e}")
