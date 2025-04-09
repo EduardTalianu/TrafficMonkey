@@ -1,7 +1,10 @@
 # SubtabBase class is injected by the Loader
 import time
 import datetime
+import json
 from collections import defaultdict
+import tkinter as tk
+from tkinter import ttk
 
 class AlertTimelineSubtab(SubtabBase):
     """Subtab that visualizes alerts over time to identify patterns and trends"""
@@ -205,10 +208,10 @@ class AlertTimelineSubtab(SubtabBase):
             start_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
             end_str = datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
             
-            # Create SQL query
+            # Create SQL query - Updated to use x_alerts table instead of alerts
             sql = """
                 SELECT timestamp, rule_name, ip_address, alert_message
-                FROM alerts
+                FROM x_alerts
                 WHERE timestamp BETWEEN ? AND ?
             """
             
@@ -270,7 +273,8 @@ class AlertTimelineSubtab(SubtabBase):
         """Get alert types from analysis_1.db"""
         try:
             cursor = gui.analysis_manager.get_cursor()
-            rule_types = cursor.execute("SELECT DISTINCT rule_name FROM alerts ORDER BY rule_name").fetchall()
+            # Updated to use x_alerts table
+            rule_types = cursor.execute("SELECT DISTINCT rule_name FROM x_alerts ORDER BY rule_name").fetchall()
             cursor.close()
             return rule_types
         except Exception as e:
@@ -356,7 +360,8 @@ class AlertTimelineSubtab(SubtabBase):
         """Get earliest alert time from analysis_1.db"""
         try:
             cursor = gui.analysis_manager.get_cursor()
-            earliest = cursor.execute("SELECT MIN(timestamp) FROM alerts").fetchone()[0]
+            # Updated to use x_alerts table
+            earliest = cursor.execute("SELECT MIN(timestamp) FROM x_alerts").fetchone()[0]
             cursor.close()
             
             now = time.time()
@@ -396,7 +401,7 @@ class AlertTimelineSubtab(SubtabBase):
         try:
             cursor = gui.analysis_manager.get_cursor()
             
-            # Construct SQL query
+            # Construct SQL query - Updated to use x_alerts table
             sql = """
                 SELECT 
                     strftime('%Y-%m-%d %H:%M:%S', 
@@ -406,7 +411,7 @@ class AlertTimelineSubtab(SubtabBase):
                         strftime('%S', timestamp, 'localtime')) / ? * ?) || ' seconds')) as time_slot,
                     rule_name,
                     COUNT(*) as alert_count
-                FROM alerts
+                FROM x_alerts
                 WHERE timestamp >= ?
             """
             
@@ -650,9 +655,10 @@ class AlertTimelineSubtab(SubtabBase):
             cursor = gui.analysis_manager.get_cursor()
             
             start_time_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
+            # Updated to use x_alerts table
             sql = """
                 SELECT ip_address, COUNT(*) as count
-                FROM alerts
+                FROM x_alerts
                 WHERE timestamp >= ?
             """
             

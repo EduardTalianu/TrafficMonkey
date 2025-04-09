@@ -1,4 +1,5 @@
 # SubtabBase class is injected by the Loader
+import time
 
 class AlertTypeSubtab(SubtabBase):
     """Subtab that displays alerts grouped by alert type"""
@@ -75,9 +76,10 @@ class AlertTypeSubtab(SubtabBase):
             # Otherwise implement directly
             cursor = gui.analysis_manager.get_cursor()
             
+            # Updated to use x_alerts table instead of alerts
             cursor.execute("""
                 SELECT rule_name, COUNT(*) as alert_count, MAX(timestamp) as last_seen
-                FROM alerts
+                FROM x_alerts
                 GROUP BY rule_name
                 ORDER BY alert_count DESC, last_seen DESC
             """)
@@ -155,9 +157,10 @@ class AlertTypeSubtab(SubtabBase):
         try:
             cursor = gui.analysis_manager.get_cursor()
             
+            # Updated to use x_alerts table instead of alerts
             cursor.execute("""
                 SELECT ip_address, alert_message, timestamp
-                FROM alerts
+                FROM x_alerts
                 WHERE rule_name = ?
                 ORDER BY timestamp DESC
             """, (rule_name,))
@@ -215,9 +218,10 @@ class AlertTypeSubtab(SubtabBase):
             cursor = gui.analysis_manager.get_cursor()
             
             filter_pattern = f"%{rule_filter}%"
+            # Updated to use x_alerts table instead of alerts
             cursor.execute("""
                 SELECT rule_name, COUNT(*) as alert_count, MAX(timestamp) as last_seen
-                FROM alerts 
+                FROM x_alerts 
                 WHERE rule_name LIKE ?
                 GROUP BY rule_name
                 ORDER BY last_seen DESC
