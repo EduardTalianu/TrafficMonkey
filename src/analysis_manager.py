@@ -16,7 +16,7 @@ logger = logging.getLogger('analysis_manager')
 
 # Define extended table definitions specific to analysis_1.db
 EXTENDED_TABLE_DEFINITIONS = {
-    "ip_geolocation": [
+    "x_ip_geolocation": [
         {"name": "ip_address", "type": "TEXT PRIMARY KEY", "required": True},
         {"name": "country", "type": "TEXT", "required": False},
         {"name": "region", "type": "TEXT", "required": False},
@@ -27,7 +27,7 @@ EXTENDED_TABLE_DEFINITIONS = {
         {"name": "asn_name", "type": "TEXT", "required": False},
         {"name": "last_updated", "type": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "required": True}
     ],
-    "ip_threat_intel": [
+    "x_ip_threat_intel": [
         {"name": "ip_address", "type": "TEXT PRIMARY KEY", "required": True},
         {"name": "threat_score", "type": "REAL DEFAULT 0", "required": False},
         {"name": "threat_type", "type": "TEXT", "required": False},
@@ -37,7 +37,7 @@ EXTENDED_TABLE_DEFINITIONS = {
         {"name": "last_seen", "type": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "required": True},
         {"name": "details", "type": "TEXT", "required": False}
     ],
-    "traffic_patterns": [
+    "x_traffic_patterns": [
         {"name": "connection_key", "type": "TEXT PRIMARY KEY", "required": True},
         {"name": "avg_packet_size", "type": "REAL", "required": False},
         {"name": "std_dev_packet_size", "type": "REAL", "required": False},
@@ -50,7 +50,7 @@ EXTENDED_TABLE_DEFINITIONS = {
         {"name": "last_seen", "type": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP", "required": True},
         {"name": "classification", "type": "TEXT", "required": False}
     ],
-    "connection_statistics": [
+    "x_connection_statistics": [
         {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
         {"name": "timestamp", "type": "REAL", "required": True},
         {"name": "total_connections", "type": "INTEGER", "required": False},
@@ -202,18 +202,18 @@ class AnalysisManager:
     def _create_extended_indices(self, cursor):
         """Create indices for extended tables"""
         # IP geolocation indices
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_geolocation_country ON ip_geolocation(country)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_geolocation_country ON x_ip_geolocation(country)")
         
         # Threat intelligence indices
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_threat_score ON ip_threat_intel(threat_score DESC)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_threat_type ON ip_threat_intel(threat_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_threat_score ON x_ip_threat_intel(threat_score DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_threat_type ON x_ip_threat_intel(threat_type)")
         
         # Traffic patterns indices
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_pattern_periodic ON traffic_patterns(periodic_score DESC)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_pattern_class ON traffic_patterns(classification)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_traffic_pattern_periodic ON x_traffic_patterns(periodic_score DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_traffic_pattern_class ON x_traffic_patterns(classification)")
         
         # Connection statistics indices
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_conn_stats_time ON connection_statistics(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_conn_stats_time ON x_connection_statistics(timestamp)")
     
     def load_analysis_plugins(self):
         """Load analysis plugins from the analysis directory"""
@@ -363,7 +363,11 @@ class AnalysisManager:
                     'tls_connections', 
                     'icmp_packets', 
                     'arp_data',
-                    'connections'  # Include base connections table
+                    'connections',
+                    'app_protocols',    # Added this table
+                    'http_headers',     # Added this table
+                    'port_scan_timestamps',
+                    'smb_files'
                 ]
                 
                 # Use dedicated connections for sync
@@ -648,7 +652,7 @@ class AnalysisManager:
         try:
             cursor = self.analysis1_conn.cursor()
             cursor.execute("""
-                INSERT OR REPLACE INTO ip_threat_intel
+                INSERT OR REPLACE INTO x_ip_threat_intel
                 (ip_address, threat_score, threat_type, confidence, source, first_seen, last_seen, details)
                 VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
             """, (
@@ -673,7 +677,7 @@ class AnalysisManager:
         try:
             cursor = self.analysis1_conn.cursor()
             cursor.execute("""
-                INSERT OR REPLACE INTO ip_geolocation
+                INSERT OR REPLACE INTO x_ip_geolocation
                 (ip_address, country, region, city, latitude, longitude, asn, asn_name, last_updated)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """, (

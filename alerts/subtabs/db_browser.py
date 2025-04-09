@@ -36,6 +36,11 @@ class DatabaseBrowserSubtab(SubtabBase):
         self.browser_notebook.add(self.query_tab, text="Custom Query")
         self.create_query_tab()
         
+        # Database Structure tab
+        self.structure_tab = ttk.Frame(self.browser_notebook)
+        self.browser_notebook.add(self.structure_tab, text="Database Structure")
+        self.create_structure_tab()
+        
         # Status bar
         status_frame = ttk.Frame(self.tab_frame)
         status_frame.pack(fill="x", side="bottom")
@@ -141,6 +146,319 @@ class DatabaseBrowserSubtab(SubtabBase):
         self.query_results_container = ttk.Frame(query_results_frame)
         self.query_results_container.pack(fill="both", expand=True)
         
+    def create_structure_tab(self):
+        """Create the database structure view UI"""
+        # Control panel
+        control_frame = ttk.Frame(self.structure_tab)
+        control_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Database selection
+        ttk.Label(control_frame, text="Database:").pack(side="left", padx=5)
+        structure_db_combobox = ttk.Combobox(control_frame, textvariable=self.db_var, 
+                                           values=["capture", "analysis", "analysis_1"], width=10, state="readonly")
+        structure_db_combobox.pack(side="left", padx=5)
+        
+        # Refresh button
+        ttk.Button(control_frame, text="Refresh Structure", 
+                  command=self.refresh_db_structure).pack(side="right", padx=5)
+        
+        # Structure tree frame
+        self.structure_frame = ttk.Frame(self.structure_tab)
+        self.structure_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        # Create structure treeview
+        self.create_structure_tree()
+        
+        # Details frame
+        self.details_frame = ttk.LabelFrame(self.structure_tab, text="Details")
+        self.details_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.details_text = tk.Text(self.details_frame, height=6, wrap=tk.WORD)
+        self.details_text.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Initialize structure view
+        structure_db_combobox.bind("<<ComboboxSelected>>", lambda e: self.refresh_db_structure())
+        
+    def create_structure_tree(self):
+        """Create the database structure treeview"""
+        # Clear existing widgets
+        for widget in self.structure_frame.winfo_children():
+            widget.destroy()
+            
+        # Create a frame for the tree and scrollbar
+        frame = ttk.Frame(self.structure_frame)
+        frame.pack(fill="both", expand=True)
+        
+        # Create vertical scrollbar
+        vsb = ttk.Scrollbar(frame, orient="vertical")
+        vsb.pack(side="right", fill="y")
+        
+        # Create horizontal scrollbar
+        hsb = ttk.Scrollbar(frame, orient="horizontal")
+        hsb.pack(side="bottom", fill="x")
+        
+        # Create structure tree
+        self.structure_tree = ttk.Treeview(frame, show="tree headings", 
+                                          yscrollcommand=vsb.set,
+                                          xscrollcommand=hsb.set)
+        
+        # Configure scrollbars
+        vsb.config(command=self.structure_tree.yview)
+        hsb.config(command=self.structure_tree.xview)
+        
+        # Configure column
+        self.structure_tree["columns"] = ("type", "details")
+        self.structure_tree.column("#0", width=200, stretch=tk.YES)
+        self.structure_tree.column("type", width=100, stretch=tk.NO)
+        self.structure_tree.column("details", width=300, stretch=tk.YES)
+        
+        self.structure_tree.heading("#0", text="Name")
+        self.structure_tree.heading("type", text="Type")
+        self.structure_tree.heading("details", text="Details")
+        
+        self.structure_tree.pack(fill="both", expand=True)
+        
+        # Bind selection event
+        self.structure_tree.bind("<<TreeviewSelect>>", self.on_structure_select)
+        
+        # Load initial structure
+        self.refresh_db_structure()
+        
+    def refresh_db_structure(self):
+        """Refresh the database structure view"""
+        try:
+            # Get database connection
+            db_conn = self.get_db_connection()
+            
+            # Clear existing items
+            self.structure_tree.delete(*self.structure_tree.get_children())
+            
+            # Get all tables
+            cursor = db_conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            tables = cursor.fetchall()
+            
+            # Get all indices
+            cursor.execute("SELECT name, tbl_name FROM sqlite_master WHERE type='index' ORDER BY tbl_name, name")
+            indices = cursor.fetchall()
+            
+            # Add tables to tree
+            for table in tables:
+                table_name = table[0]
+                
+                # Count rows in table
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+                    row_count = cursor.fetchone()[0]
+                except:
+                    row_count = "N/A"
+                    
+                # Get table schema
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                columns = cursor.fetchall()
+                column_count = len(columns)
+                
+                # Add table to tree
+                table_id = self.structure_tree.insert("", "end", text=table_name, 
+                                                    values=("Table", f"{column_count} columns, {row_count} rows"))
+                
+                # Add columns to tree
+                for col in columns:
+                    col_id, col_name, col_type, not_null, default_val, primary_key = col
+                    
+                    constraints = []
+                    if primary_key == 1:
+                        constraints.append("PRIMARY KEY")
+                    if not_null == 1:
+                        constraints.append("NOT NULL")
+                    if default_val is not None:
+                        constraints.append(f"DEFAULT {default_val}")
+                        
+                    constraints_str = ", ".join(constraints)
+                    
+                    self.structure_tree.insert(table_id, "end", text=col_name, 
+                                              values=("Column", f"{col_type} {constraints_str}"))
+                
+            # Add indices node
+            indices_id = self.structure_tree.insert("", "end", text="Indices", 
+                                                  values=("Category", f"{len(indices)} indices"))
+            
+            # Group indices by table
+            index_groups = {}
+            for index in indices:
+                index_name, table_name = index
+                if table_name not in index_groups:
+                    index_groups[table_name] = []
+                index_groups[table_name].append(index_name)
+                
+            # Add indices to tree
+            for table_name, index_list in index_groups.items():
+                table_indices_id = self.structure_tree.insert(indices_id, "end", text=table_name, 
+                                                           values=("Table", f"{len(index_list)} indices"))
+                
+                for index_name in index_list:
+                    # Get index info
+                    cursor.execute(f"PRAGMA index_info({index_name})")
+                    index_columns = cursor.fetchall()
+                    
+                    # Get column names
+                    column_names = []
+                    for idx_col in index_columns:
+                        col_id = idx_col[2]
+                        cursor.execute(f"PRAGMA table_info({table_name})")
+                        table_cols = cursor.fetchall()
+                        column_names.append(table_cols[col_id][1])
+                        
+                    self.structure_tree.insert(table_indices_id, "end", text=index_name, 
+                                             values=("Index", f"Columns: {', '.join(column_names)}"))
+            
+            self.status_var.set(f"Loaded structure for {self.db_var.get()} database")
+            self.update_output(f"Browsing structure of {self.db_var.get()} database")
+            
+        except Exception as e:
+            self.status_var.set(f"Error: {e}")
+            self.update_output(f"Error loading database structure: {e}")
+    
+    def on_structure_select(self, event):
+        """Handle selection in the structure tree"""
+        selected_item = self.structure_tree.selection()
+        if not selected_item:
+            return
+            
+        item_id = selected_item[0]
+        item_text = self.structure_tree.item(item_id, "text")
+        item_type = self.structure_tree.item(item_id, "values")[0]
+        
+        # Clear details text
+        self.details_text.delete("1.0", tk.END)
+        
+        try:
+            # Get database connection
+            db_conn = self.get_db_connection()
+            cursor = db_conn.cursor()
+            
+            if item_type == "Table":
+                # Get table info
+                cursor.execute(f"PRAGMA table_info({item_text})")
+                columns = cursor.fetchall()
+                
+                # Count rows
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {item_text}")
+                    row_count = cursor.fetchone()[0]
+                except:
+                    row_count = "N/A"
+                    
+                # Show details
+                details = f"Table: {item_text}\n"
+                details += f"Total Rows: {row_count}\n"
+                details += f"Total Columns: {len(columns)}\n\n"
+                details += "Columns:\n"
+                
+                for col in columns:
+                    col_id, col_name, col_type, not_null, default_val, primary_key = col
+                    primary = " (PRIMARY KEY)" if primary_key == 1 else ""
+                    not_null_str = " NOT NULL" if not_null == 1 else ""
+                    default = f" DEFAULT {default_val}" if default_val is not None else ""
+                    details += f"  {col_name} ({col_type}{not_null_str}{default}{primary})\n"
+                    
+                # Get indices for this table
+                cursor.execute(f"SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='{item_text}'")
+                indices = cursor.fetchall()
+                
+                if indices:
+                    details += "\nIndices:\n"
+                    for idx in indices:
+                        details += f"  {idx[0]}\n"
+                
+                self.details_text.insert(tk.END, details)
+                
+            elif item_type == "Column":
+                # Get parent (table) info
+                parent_id = self.structure_tree.parent(item_id)
+                table_name = self.structure_tree.item(parent_id, "text")
+                
+                # Get column info
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                columns = cursor.fetchall()
+                
+                column_info = None
+                for col in columns:
+                    if col[1] == item_text:
+                        column_info = col
+                        break
+                        
+                if column_info:
+                    col_id, col_name, col_type, not_null, default_val, primary_key = column_info
+                    
+                    details = f"Column: {col_name}\n"
+                    details += f"Table: {table_name}\n"
+                    details += f"Type: {col_type}\n"
+                    details += f"Position: {col_id}\n"
+                    details += f"NOT NULL: {'Yes' if not_null == 1 else 'No'}\n"
+                    details += f"DEFAULT: {default_val if default_val is not None else 'None'}\n"
+                    details += f"PRIMARY KEY: {'Yes' if primary_key == 1 else 'No'}\n"
+                    
+                    # Check if this column is indexed
+                    cursor.execute(f"SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='{table_name}'")
+                    indices = cursor.fetchall()
+                    
+                    indexed = []
+                    for idx in indices:
+                        index_name = idx[0]
+                        cursor.execute(f"PRAGMA index_info({index_name})")
+                        index_columns = cursor.fetchall()
+                        
+                        for idx_col in index_columns:
+                            if idx_col[2] == col_id:
+                                indexed.append(index_name)
+                                break
+                                
+                    if indexed:
+                        details += f"\nIndices using this column:\n"
+                        for idx in indexed:
+                            details += f"  {idx}\n"
+                    
+                    self.details_text.insert(tk.END, details)
+                
+            elif item_type == "Index":
+                # Get parent (table) info
+                parent_id = self.structure_tree.parent(item_id)
+                table_name = self.structure_tree.item(parent_id, "text")
+                
+                # Get index info
+                cursor.execute(f"PRAGMA index_info({item_text})")
+                index_columns = cursor.fetchall()
+                
+                details = f"Index: {item_text}\n"
+                details += f"Table: {table_name}\n"
+                
+                if index_columns:
+                    details += f"Columns:\n"
+                    
+                    # Get table columns
+                    cursor.execute(f"PRAGMA table_info({table_name})")
+                    table_cols = cursor.fetchall()
+                    
+                    for idx_col in index_columns:
+                        seq = idx_col[0]
+                        col_id = idx_col[2]
+                        col_name = table_cols[col_id][1]
+                        details += f"  {seq}: {col_name}\n"
+                
+                # Check if unique
+                cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='index' AND name='{item_text}'")
+                sql = cursor.fetchone()
+                if sql and "UNIQUE" in sql[0].upper():
+                    details += "\nType: UNIQUE INDEX\n"
+                else:
+                    details += "\nType: INDEX\n"
+                    
+                self.details_text.insert(tk.END, details)
+        
+        except Exception as e:
+            self.details_text.insert(tk.END, f"Error retrieving details: {str(e)}")
+    
     def refresh_tables(self):
         """Refresh the list of tables in the selected database"""
         try:
@@ -192,19 +510,23 @@ class DatabaseBrowserSubtab(SubtabBase):
             cursor.execute(f"PRAGMA table_info({table_name})")
             schema = cursor.fetchall()
             
+            # Get total row count
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            total_rows = cursor.fetchone()[0]
+            
             # Get table data
             cursor.execute(f"SELECT * FROM {table_name} LIMIT {limit}")
             data = cursor.fetchall()
             self.column_names = [col[1] for col in schema]  # Store column names
             
             # Update table info
-            self.update_table_info(table_name, schema, len(data), limit)
+            self.update_table_info(table_name, schema, len(data), limit, total_rows)
             
             # Create or update results tree
             self.create_or_update_results_tree(self.results_container, self.column_names, data)
             
-            self.status_var.set(f"Loaded {len(data)} rows from {table_name}")
-            self.update_output(f"Browsing table {table_name} with {len(data)} rows")
+            self.status_var.set(f"Loaded {len(data)} rows from {table_name} (total: {total_rows} rows)")
+            self.update_output(f"Browsing table {table_name} with {len(data)} rows shown of {total_rows} total")
             
         except Exception as e:
             self.status_var.set(f"Error: {e}")
@@ -353,13 +675,15 @@ class DatabaseBrowserSubtab(SubtabBase):
             # Default to analysis
             return self.gui.db_manager.analysis_conn
     
-    def update_table_info(self, table_name, schema, row_count, limit):
+    def update_table_info(self, table_name, schema, row_count, limit, total_rows):
         """Update the table information text"""
         self.table_info_text.delete("1.0", tk.END)
         
         info = f"Table: {table_name}\n"
-        info += f"Rows: {row_count}"
-        if row_count == limit:
+        info += f"Total Rows: {total_rows}\n"
+        info += f"Total Columns: {len(schema)}\n"
+        info += f"Displaying: {row_count}"
+        if row_count == limit and total_rows > limit:
             info += f" (limited to {limit})\n"
         else:
             info += "\n"
@@ -423,5 +747,7 @@ class DatabaseBrowserSubtab(SubtabBase):
         
         if current_tab == 0:  # Table Browser tab
             self.refresh_table_data()
-        else:  # Custom Query tab
-            self.run_custom_query()
+        elif current_tab == 1:  # Custom Query tab
+            pass  # Custom queries are refreshed manually
+        elif current_tab == 2:  # Database Structure tab
+            self.refresh_db_structure()
