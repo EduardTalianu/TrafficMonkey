@@ -115,6 +115,46 @@ CAPTURE_FIELDS = [
         "required": False,
         "description": "DNS response type"
     },
+    {
+        "tshark_field": "dns.resp.ttl",
+        "category": "dns",
+        "db_mapping": {"table": "dns_queries", "column": "ttl"},
+        "data_type": "INTEGER",
+        "required": False,
+        "description": "DNS response time-to-live value"
+    },
+    {
+        "tshark_field": "dns.cname",
+        "category": "dns",
+        "db_mapping": {"table": "dns_queries", "column": "cname_record"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "DNS CNAME record"
+    },
+    {
+        "tshark_field": "dns.ns",
+        "category": "dns",
+        "db_mapping": {"table": "dns_queries", "column": "ns_record"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "DNS NS record"
+    },
+    {
+        "tshark_field": "dns.a",
+        "category": "dns",
+        "db_mapping": {"table": "dns_queries", "column": "a_record"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "DNS A record (IPv4 address)"
+    },
+    {
+        "tshark_field": "dns.aaaa",
+        "category": "dns",
+        "db_mapping": {"table": "dns_queries", "column": "aaaa_record"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "DNS AAAA record (IPv6 address)"
+    },
     # ICMP fields
     {
         "tshark_field": "icmp.type",
@@ -189,6 +229,22 @@ CAPTURE_FIELDS = [
         "required": False,
         "description": "HTTP Content-Length header"
     },
+    {
+        "tshark_field": "http.referer",
+        "category": "http",
+        "db_mapping": {"table": "http_requests", "column": "referer"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "HTTP Referer header"
+    },
+    {
+        "tshark_field": "http.x_forwarded_for",
+        "category": "http",
+        "db_mapping": {"table": "http_requests", "column": "x_forwarded_for"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "HTTP X-Forwarded-For header"
+    },
     # TLS fields
     {
         "tshark_field": "tls.handshake.type",
@@ -221,6 +277,22 @@ CAPTURE_FIELDS = [
         "data_type": "TEXT",
         "required": False,
         "description": "TLS Server Name Indication (SNI)"
+    },
+    {
+        "tshark_field": "tls.record.content_type",
+        "category": "tls",
+        "db_mapping": {"table": "tls_connections", "column": "record_content_type"},
+        "data_type": "INTEGER",
+        "required": False,
+        "description": "TLS record content type"
+    },
+    {
+        "tshark_field": "ssl.handshake.session_id",
+        "category": "tls",
+        "db_mapping": {"table": "tls_connections", "column": "session_id"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "SSL/TLS session ID"
     },
     {
         "tshark_field": "ip.ttl",
@@ -256,12 +328,44 @@ CAPTURE_FIELDS = [
         "description": "ARP target IP address"
     },
     {
+        "tshark_field": "arp.src.hw_mac",
+        "category": "arp",
+        "db_mapping": {"table": "arp_data", "column": "src_mac"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "ARP source MAC address"
+    },
+    {
         "tshark_field": "arp.opcode",
         "category": "arp",
         "db_mapping": {"table": "arp_data", "column": "operation"},
         "data_type": "INTEGER",
         "required": False,
         "description": "ARP operation (1=request, 2=reply)"
+    },
+    {
+        "tshark_field": "eth.src",
+        "category": "ethernet",
+        "db_mapping": {"table": "connections", "column": "src_mac"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "Ethernet source MAC address"
+    },
+    {
+        "tshark_field": "smb2.filename",
+        "category": "smb",
+        "db_mapping": {"table": "smb_files", "column": "filename"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "SMB2 accessed filename"
+    },
+    {
+        "tshark_field": "data.data",
+        "category": "data",
+        "db_mapping": {"table": None, "column": None},  
+        "data_type": None,
+        "required": False,
+        "description": "Raw data content"
     }
 ]
 
@@ -279,7 +383,35 @@ TABLE_DEFINITIONS = {
         {"name": "query_domain", "type": "TEXT", "required": True},
         {"name": "query_type", "type": "TEXT", "required": False},
         {"name": "response_domain", "type": "TEXT", "required": False},
-        {"name": "response_type", "type": "TEXT", "required": False}
+        {"name": "response_type", "type": "TEXT", "required": False},
+        {"name": "ttl", "type": "INTEGER", "required": False},
+        {"name": "cname_record", "type": "TEXT", "required": False},
+        {"name": "ns_record", "type": "TEXT", "required": False},
+        {"name": "a_record", "type": "TEXT", "required": False},
+        {"name": "aaaa_record", "type": "TEXT", "required": False}
+    ],
+    "smb_files": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "connection_key", "type": "TEXT", "required": True},
+        {"name": "timestamp", "type": "REAL", "required": True},
+        {"name": "filename", "type": "TEXT", "required": True},
+        {"name": "operation", "type": "TEXT", "required": False},
+        {"name": "size", "type": "INTEGER", "required": False}
+    ],
+    "connections": [
+        {"name": "connection_key", "type": "TEXT PRIMARY KEY", "required": True},
+        {"name": "src_ip", "type": "TEXT", "required": True},
+        {"name": "dst_ip", "type": "TEXT", "required": True},
+        {"name": "src_port", "type": "INTEGER", "required": False},
+        {"name": "dst_port", "type": "INTEGER", "required": False},
+        {"name": "src_mac", "type": "TEXT", "required": False},
+        {"name": "total_bytes", "type": "INTEGER DEFAULT 0", "required": False},
+        {"name": "packet_count", "type": "INTEGER DEFAULT 0", "required": False},
+        {"name": "timestamp", "type": "REAL", "required": True},
+        {"name": "vt_result", "type": "TEXT DEFAULT 'unknown'", "required": False},
+        {"name": "is_rdp_client", "type": "BOOLEAN DEFAULT 0", "required": False},
+        {"name": "protocol", "type": "TEXT", "required": False},
+        {"name": "ttl", "type": "INTEGER", "required": False}
     ],
     "http_requests": [
         {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
@@ -291,6 +423,7 @@ TABLE_DEFINITIONS = {
         {"name": "version", "type": "TEXT", "required": False},
         {"name": "user_agent", "type": "TEXT", "required": False},
         {"name": "referer", "type": "TEXT", "required": False},
+        {"name": "x_forwarded_for", "type": "TEXT", "required": False},
         {"name": "content_type", "type": "TEXT", "required": False},
         {"name": "request_headers", "type": "TEXT", "required": False},
         {"name": "request_size", "type": "INTEGER DEFAULT 0", "required": False}
@@ -323,6 +456,8 @@ TABLE_DEFINITIONS = {
         {"name": "server_name", "type": "TEXT", "required": False},
         {"name": "ja3_fingerprint", "type": "TEXT", "required": False},
         {"name": "ja3s_fingerprint", "type": "TEXT", "required": False},
+        {"name": "record_content_type", "type": "INTEGER", "required": False},
+        {"name": "session_id", "type": "TEXT", "required": False},
         {"name": "certificate_issuer", "type": "TEXT", "required": False},
         {"name": "certificate_subject", "type": "TEXT", "required": False},
         {"name": "certificate_validity_start", "type": "TEXT", "required": False},

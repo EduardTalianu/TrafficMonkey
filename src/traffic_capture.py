@@ -397,11 +397,26 @@ class TrafficCaptureEngine:
                     layer_name = dst_ipv6_field["tshark_field"].replace(".", "_")
                     dst_ip = self.get_layer_value(layers, layer_name)
             
+            # Extract MAC address from ethernet frame if available
+            src_mac = None
+            eth_src_field = capture_fields.get_field_by_tshark_name("eth.src")
+            if eth_src_field:
+                layer_name = eth_src_field["tshark_field"].replace(".", "_")
+                src_mac = self.get_layer_value(layers, layer_name)
+            
             # Check for ARP data - check if any ARP field is present
             if "arp_src_proto_ipv4" in layers or "arp_dst_proto_ipv4" in layers or "arp_opcode" in layers:
                 # Process ARP packet using dedicated method - this stores data in capture.db
                 self._process_arp_packet_ek(layers)
                 # Still continue processing as a normal packet if IP fields are present
+
+            # Check for SMB data
+            smb_filename = None
+            if "smb_filename" in layers:
+                smb_filename = self.get_layer_value(layers, "smb_filename")
+                if smb_filename:
+                    # Store SMB file access
+                    self._store_smb_data(layers, src_ip, dst_ip, src_port, dst_port, connection_key)
 
             # Basic data validation for IP-based packets
             # For ARP packets, we may not have both IPs, so don't return early
@@ -478,11 +493,13 @@ class TrafficCaptureEngine:
                         self.db_manager.add_app_protocol(connection_key, "HTTPS", detection_method="port-based")
                     elif dst_port == 53 or src_port == 53:
                         self.db_manager.add_app_protocol(connection_key, "DNS", detection_method="port-based")
+                    elif dst_port == 445 or src_port == 445:
+                        self.db_manager.add_app_protocol(connection_key, "SMB", detection_method="port-based")
                 
-                # Store the basic connection in the database
+                # Store the basic connection in the database with MAC address
                 if src_ip and dst_ip:  # Only add if we have both IPs
                     return self.db_manager.add_packet(
-                        connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp
+                        connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp, src_mac
                     )
                     
             return True  # Return True for successful processing
@@ -492,6 +509,7 @@ class TrafficCaptureEngine:
             import traceback
             traceback.print_exc()
             return False
+
     
     def _has_http_data(self, layers):
         """Check if layers contain HTTP data"""
@@ -567,7 +585,7 @@ class TrafficCaptureEngine:
         return length
 
     def _store_dns_data(self, layers, src_ip):
-        """Extract all DNS data and store to capture.db"""
+        """Extract all DNS data and store to capture.db with additional fields"""
         try:
             # Extract query name and type
             query_name = self.get_layer_value(layers, "dns_qry_name")
@@ -580,14 +598,33 @@ class TrafficCaptureEngine:
             resp_name = self.get_layer_value(layers, "dns_resp_name")
             resp_type = self.get_layer_value(layers, "dns_resp_type")
             
-            # Store DNS query in database with response fields if available
-            # We need to modify the database_manager.add_dns_query method to accept these fields
+            # Extract new fields
+            ttl = self.get_layer_value(layers, "dns_ttl")
+            cname = self.get_layer_value(layers, "dns_cname")
+            ns = self.get_layer_value(layers, "dns_ns")
+            a_record = self.get_layer_value(layers, "dns_a")
+            aaaa_record = self.get_layer_value(layers, "dns_aaaa")
+            
+            # Convert TTL to integer if present
+            ttl_int = None
+            if ttl:
+                try:
+                    ttl_int = int(ttl)
+                except (ValueError, TypeError):
+                    ttl_int = None
+            
+            # Store DNS query in database with all fields
             return self.db_manager.add_dns_query(
                 src_ip, 
                 query_name, 
                 query_type,
-                resp_name,  # This will need to be added to the method
-                resp_type   # This will need to be added to the method
+                resp_name,
+                resp_type,
+                ttl_int,
+                cname,
+                ns,
+                a_record,
+                aaaa_record
             )
         except Exception as e:
             self.gui.update_output(f"Error storing DNS data: {e}")
@@ -596,11 +633,13 @@ class TrafficCaptureEngine:
     def _store_http_data(self, layers, src_ip, dst_ip, src_port, dst_port, connection_key):
         """Extract HTTP data and store to capture.db including individual headers"""
         try:
-            # Extract HTTP fields
+            # Extract HTTP fields (including new ones)
             method = self.get_layer_value(layers, "http_request_method")
             uri = self.get_layer_value(layers, "http_request_uri")
             host = self.get_layer_value(layers, "http_host")
             user_agent = self.get_layer_value(layers, "http_user_agent")
+            referer = self.get_layer_value(layers, "http_referer")  # New field
+            x_forwarded_for = self.get_layer_value(layers, "http_x_forwarded_for")  # New field
             status_code_raw = self.get_layer_value(layers, "http_response_code")
             server = self.get_layer_value(layers, "http_server")
             content_type = self.get_layer_value(layers, "http_content_type")
@@ -620,10 +659,14 @@ class TrafficCaptureEngine:
             # Store HTTP request if present
             request_id = None
             if is_request:
-                # Create headers dictionary
+                # Create headers dictionary with new fields
                 headers = {"Host": host or dst_ip}
                 if user_agent:
                     headers["User-Agent"] = user_agent
+                if referer:
+                    headers["Referer"] = referer
+                if x_forwarded_for:
+                    headers["X-Forwarded-For"] = x_forwarded_for
                 if content_type:
                     headers["Content-Type"] = content_type
                 if content_length > 0:
@@ -632,7 +675,7 @@ class TrafficCaptureEngine:
                 # Convert headers to JSON
                 headers_json = json.dumps(headers)
                 
-                # Store HTTP request
+                # Store HTTP request with new fields
                 request_id = self.db_manager.add_http_request(
                     connection_key,
                     method or "GET",  # Default method
@@ -640,10 +683,11 @@ class TrafficCaptureEngine:
                     uri or "/",       # Default URI
                     "HTTP/1.1",       # Assumed version
                     user_agent or "",
-                    "",               # No referer
+                    referer or "",    # New field
                     content_type or "",
                     headers_json,
-                    content_length
+                    content_length,
+                    x_forwarded_for or ""  # New field
                 )
                 
                 # Store individual headers in http_headers table
@@ -685,6 +729,29 @@ class TrafficCaptureEngine:
             return True
         except Exception as e:
             self.gui.update_output(f"Error storing HTTP data: {e}")
+            return False
+        
+    def _store_smb_data(self, layers, src_ip, dst_ip, src_port, dst_port, connection_key):
+        """Store SMB file access information"""
+        try:
+            filename = self.get_layer_value(layers, "smb_filename")
+            if not filename:
+                return False
+            
+            # Store SMB file access in database
+            current_time = time.time()
+            operation = "access"  # Default operation
+            size = 0  # Default size
+            
+            return self.db_manager.add_smb_file(
+                connection_key,
+                filename,
+                operation,
+                size,
+                current_time
+            )
+        except Exception as e:
+            self.gui.update_output(f"Error storing SMB data: {e}")
             return False
         
     def _detect_application_protocol(self, src_ip, dst_ip, src_port, dst_port, layers, connection_key):
@@ -754,12 +821,22 @@ class TrafficCaptureEngine:
             return False
 
     def _store_tls_data(self, layers, connection_key):
-        """Extract basic TLS data and store to capture.db"""
+        """Extract TLS data and store to capture.db with new fields"""
         try:
-            # Extract TLS fields
+            # Extract TLS fields including new ones
             tls_version = self.get_layer_value(layers, "tls_handshake_version")
             cipher_suite = self.get_layer_value(layers, "tls_handshake_ciphersuite")
             server_name = self.get_layer_value(layers, "tls_handshake_extensions_server_name")
+            record_content_type = self.get_layer_value(layers, "tls_record_content_type")  # New field
+            session_id = self.get_layer_value(layers, "ssl_handshake_session_id")  # New field
+            
+            # Convert record_content_type to integer if present
+            content_type_int = None
+            if record_content_type:
+                try:
+                    content_type_int = int(record_content_type)
+                except (ValueError, TypeError):
+                    content_type_int = None
             
             # Set default values if needed
             if not tls_version:
@@ -779,7 +856,7 @@ class TrafficCaptureEngine:
             if not server_name and dst_ip:
                 server_name = dst_ip
             
-            # Store in database (without JA3 fingerprinting, which would be in analysis_manager)
+            # Store in database with new fields
             ja3_fingerprint = ""
             ja3s_fingerprint = ""
             cert_issuer = ""
@@ -790,14 +867,24 @@ class TrafficCaptureEngine:
             
             # Store TLS connection info
             return self.db_manager.add_tls_connection(
-                connection_key, tls_version, cipher_suite, server_name, 
-                ja3_fingerprint, ja3s_fingerprint, cert_issuer, cert_subject,
-                cert_valid_from, cert_valid_to, cert_serial
+                connection_key, 
+                tls_version, 
+                cipher_suite, 
+                server_name, 
+                ja3_fingerprint, 
+                ja3s_fingerprint, 
+                cert_issuer, 
+                cert_subject,
+                cert_valid_from, 
+                cert_valid_to, 
+                cert_serial,
+                content_type_int,  # New field
+                session_id         # New field
             )
         except Exception as e:
             self.gui.update_output(f"Error storing TLS data: {e}")
             return False
-
+    
     def _store_icmp_data(self, layers, src_ip, dst_ip):
         """Extract basic ICMP data and store to capture.db"""
         try:
@@ -818,7 +905,7 @@ class TrafficCaptureEngine:
             return False
 
     def _process_arp_packet_ek(self, layers):
-        """Extract and store ARP packet information"""
+        """Extract and store ARP packet information with MAC address"""
         try:
             # Extract ARP source and destination IPs
             arp_src_ip = self.get_layer_value(layers, "arp_src_proto_ipv4")
@@ -833,22 +920,29 @@ class TrafficCaptureEngine:
                 except (ValueError, TypeError):
                     operation = 0
             
+            # Extract MAC address (new field)
+            src_mac = self.get_layer_value(layers, "arp_src_hw_mac")
+            
             # At least one IP should be present for ARP
             if arp_src_ip or arp_dst_ip:
-                # Store ARP data
+                # Store ARP data with MAC address
                 current_time = time.time()
                 success = self.db_manager.add_arp_data(
                     arp_src_ip or "Unknown",  # Use "Unknown" if source IP is not available
                     arp_dst_ip or "Unknown",  # Use "Unknown" if destination IP is not available
                     operation,
-                    current_time
+                    current_time,
+                    src_mac  # New field
                 )
                 
                 # Occasionally log ARP packets for debugging
                 if success and random.random() < 0.1:  # Log ~10% of ARP packets
                     op_type = "request" if operation == 1 else "reply" if operation == 2 else f"unknown({operation})"
-                    self.gui.update_output(f"ARP {op_type}: {arp_src_ip or 'Unknown'} -> {arp_dst_ip or 'Unknown'}")
-                    
+                    if src_mac:
+                        self.gui.update_output(f"ARP {op_type}: {arp_src_ip or 'Unknown'} ({src_mac}) -> {arp_dst_ip or 'Unknown'}")
+                    else:
+                        self.gui.update_output(f"ARP {op_type}: {arp_src_ip or 'Unknown'} -> {arp_dst_ip or 'Unknown'}")
+                        
                 return success
             
             return False

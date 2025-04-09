@@ -127,11 +127,11 @@ class DatabaseManager:
             logger.error(f"Error checking schema version: {e}")
     
     def _create_tables(self, cursor):
-        """Create tables based on field definitions from capture_fields.py only"""
+        """Create tables based on field definitions from capture_fields.py with updated schema"""
         # Get table schemas from field definitions
         table_schemas = capture_fields.get_tables_schema()
         
-        # Always create the core connections table
+        # Always create the core connections table with src_mac field
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS connections (
                 connection_key TEXT PRIMARY KEY,
@@ -139,6 +139,7 @@ class DatabaseManager:
                 dst_ip TEXT,
                 src_port INTEGER DEFAULT NULL,
                 dst_port INTEGER DEFAULT NULL,
+                src_mac TEXT DEFAULT NULL,
                 total_bytes INTEGER DEFAULT 0,
                 packet_count INTEGER DEFAULT 0,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -146,6 +147,18 @@ class DatabaseManager:
                 is_rdp_client BOOLEAN DEFAULT 0,
                 protocol TEXT DEFAULT NULL,
                 ttl INTEGER DEFAULT NULL
+            )
+        """)
+        
+        # Create SMB files table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS smb_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                connection_key TEXT,
+                filename TEXT,
+                operation TEXT,
+                size INTEGER DEFAULT 0,
+                timestamp REAL
             )
         """)
         
@@ -371,8 +384,8 @@ class DatabaseManager:
             logger.error(f"Error queuing alert: {e}")
             return False
     
-    def add_packet(self, connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp=0):
-        """Add packet to the capture database (write-only operation)"""
+    def add_packet(self, connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp=0, src_mac=None):
+        """Add packet to the capture database with MAC address"""
         try:
             cursor = self.capture_conn.cursor()
             cursor.execute("""
@@ -386,9 +399,17 @@ class DatabaseManager:
             if cursor.rowcount == 0:
                 cursor.execute("""
                     INSERT INTO connections 
-                    (connection_key, src_ip, dst_ip, src_port, dst_port, total_bytes, packet_count, is_rdp_client)
-                    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-                """, (connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp))
+                    (connection_key, src_ip, dst_ip, src_port, dst_port, total_bytes, packet_count, is_rdp_client, src_mac)
+                    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """, (connection_key, src_ip, dst_ip, src_port, dst_port, length, is_rdp, src_mac))
+            else:
+                # Update src_mac if it's now available but wasn't before
+                if src_mac:
+                    cursor.execute("""
+                        UPDATE connections
+                        SET src_mac = ?
+                        WHERE connection_key = ? AND (src_mac IS NULL OR src_mac = '')
+                    """, (src_mac, connection_key))
             
             self.capture_conn.commit()
             cursor.close()
@@ -414,17 +435,20 @@ class DatabaseManager:
             logger.error(f"Error updating port scan data: {e}")
             return False
     
-    def add_dns_query(self, src_ip, query_domain, query_type, response_domain=None, response_type=None):
-        """Store DNS query information with optional response fields"""
+    def add_dns_query(self, src_ip, query_domain, query_type, response_domain=None, response_type=None, 
+                    ttl=None, cname=None, ns=None, a_record=None, aaaa_record=None):
+        """Store DNS query information with all fields"""
         try:
             current_time = time.time()
             # Create a dedicated cursor for this operation
             cursor = self.capture_conn.cursor()
             cursor.execute("""
                 INSERT INTO dns_queries
-                (timestamp, src_ip, query_domain, query_type, response_domain, response_type)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (current_time, src_ip, query_domain, query_type, response_domain, response_type))
+                (timestamp, src_ip, query_domain, query_type, response_domain, response_type, 
+                ttl, cname_record, ns_record, a_record, aaaa_record)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (current_time, src_ip, query_domain, query_type, response_domain, response_type,
+                ttl, cname, ns, a_record, aaaa_record))
             self.capture_conn.commit()
             cursor.close()
             return True
@@ -463,16 +487,19 @@ class DatabaseManager:
             logger.error(f"Error adding alert: {e}")
             return False
         
-    def add_http_request(self, connection_key, method, host, uri, version, user_agent, referer, content_type, headers_json, request_size):
-        """Store HTTP request information"""
+    def add_http_request(self, connection_key, method, host, uri, version, user_agent, referer, 
+                        content_type, headers_json, request_size, x_forwarded_for=None):
+        """Store HTTP request information with X-Forwarded-For"""
         try:
             cursor = self.capture_conn.cursor()
             current_time = time.time()
             cursor.execute("""
                 INSERT INTO http_requests
-                (connection_key, timestamp, method, host, uri, version, user_agent, referer, content_type, request_headers, request_size)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (connection_key, current_time, method, host, uri, version, user_agent, referer, content_type, headers_json, request_size))
+                (connection_key, timestamp, method, host, uri, version, user_agent, referer, 
+                content_type, request_headers, request_size, x_forwarded_for)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (connection_key, current_time, method, host, uri, version, user_agent, referer, 
+                content_type, headers_json, request_size, x_forwarded_for))
             
             request_id = cursor.lastrowid
             if headers_json:
@@ -504,8 +531,9 @@ class DatabaseManager:
             return False
 
     def add_tls_connection(self, connection_key, tls_version, cipher_suite, server_name, ja3_fingerprint, 
-                        ja3s_fingerprint, cert_issuer, cert_subject, cert_valid_from, cert_valid_to, cert_serial):
-        """Store TLS connection information"""
+                        ja3s_fingerprint, cert_issuer, cert_subject, cert_valid_from, cert_valid_to, 
+                        cert_serial, record_content_type=None, session_id=None):
+        """Store TLS connection information with new fields"""
         try:
             cursor = self.capture_conn.cursor()
             current_time = time.time()
@@ -513,31 +541,51 @@ class DatabaseManager:
                 INSERT OR REPLACE INTO tls_connections
                 (connection_key, timestamp, tls_version, cipher_suite, server_name, ja3_fingerprint, 
                 ja3s_fingerprint, certificate_issuer, certificate_subject, certificate_validity_start, 
-                certificate_validity_end, certificate_serial)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                certificate_validity_end, certificate_serial, record_content_type, session_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (connection_key, current_time, tls_version, cipher_suite, server_name, ja3_fingerprint, 
-                ja3s_fingerprint, cert_issuer, cert_subject, cert_valid_from, cert_valid_to, cert_serial))
-            self.capture_conn.commit()  # Commit immediately
+                ja3s_fingerprint, cert_issuer, cert_subject, cert_valid_from, cert_valid_to, cert_serial,
+                record_content_type, session_id))
+            self.capture_conn.commit()
             cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error storing TLS connection: {e}")
             return False
         
-    def add_arp_data(self, src_ip, dst_ip, operation, timestamp):
-        """Store ARP packet information"""
+    def add_arp_data(self, src_ip, dst_ip, operation, timestamp, src_mac=None):
+        """Store ARP packet information with MAC address"""
         try:
             cursor = self.capture_conn.cursor()
             cursor.execute("""
                 INSERT INTO arp_data
                 (timestamp, src_ip, dst_ip, operation, src_mac)
                 VALUES (?, ?, ?, ?, ?)
-            """, (timestamp, src_ip, dst_ip, operation, None))  # Add NULL for src_mac
+            """, (timestamp, src_ip, dst_ip, operation, src_mac))
             self.capture_conn.commit()
             cursor.close()
             return True
         except Exception as e:
             logger.error(f"Error storing ARP data: {e}")
+            return False
+        
+    def add_smb_file(self, connection_key, filename, operation="access", size=0, timestamp=None):
+        """Store SMB file access information"""
+        try:
+            cursor = self.capture_conn.cursor()
+            if timestamp is None:
+                timestamp = time.time()
+            
+            cursor.execute("""
+                INSERT INTO smb_files
+                (connection_key, filename, operation, size, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (connection_key, filename, operation, size, timestamp))
+            self.capture_conn.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.error(f"Error storing SMB file data: {e}")
             return False
         
     def update_connection_ttl(self, connection_key, ttl):

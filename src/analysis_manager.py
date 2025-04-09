@@ -170,7 +170,7 @@ class AnalysisManager:
             logger.warning("No analysis plugins were loaded! Advanced analysis will be disabled.")
     
     def _setup_analysis1_db(self):
-        """Set up analysis_1 database tables"""
+        """Set up analysis_1 database tables with support for new fields"""
         cursor = self.analysis1_conn.cursor()
         try:
             # Configure for performance
@@ -224,7 +224,7 @@ class AnalysisManager:
                 )
             """)
             
-            # DNS queries table (new)
+            # DNS queries table (updated with new fields)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS dns_queries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,12 +232,17 @@ class AnalysisManager:
                     query_domain TEXT NOT NULL,
                     query_type TEXT,
                     response_domain TEXT,  
-                    response_type TEXT,   
+                    response_type TEXT,
+                    ttl INTEGER,
+                    cname_record TEXT,
+                    ns_record TEXT,
+                    a_record TEXT,
+                    aaaa_record TEXT,
                     timestamp REAL NOT NULL
                 )
             """)
             
-            # HTTP requests table (new)
+            # HTTP requests table (updated with X-Forwarded-For)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS http_requests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -246,18 +251,24 @@ class AnalysisManager:
                     host TEXT,
                     uri TEXT,
                     referer TEXT,
+                    request_headers TEXT,
+                    request_size INTEGER,
+                    content_type TEXT,
                     user_agent TEXT,
+                    x_forwarded_for TEXT,
                     version TEXT,
                     timestamp REAL NOT NULL
                 )
             """)
             
-            # HTTP responses table (new)
+            # HTTP responses table (existing)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS http_responses (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     request_id INTEGER,
+                    http_request_id INTEGER,
                     status_code INTEGER,
+                    response_headers TEXT,
                     server TEXT,
                     timestamp REAL NOT NULL,
                     content_type TEXT,
@@ -266,7 +277,7 @@ class AnalysisManager:
                 )
             """)
             
-            # TLS connections table (new)
+            # TLS connections table (updated with new fields)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS tls_connections (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -276,16 +287,18 @@ class AnalysisManager:
                     server_name TEXT,
                     ja3_fingerprint TEXT,
                     ja3s_fingerprint TEXT,
+                    record_content_type INTEGER,
+                    session_id TEXT,
                     certificate_issuer TEXT,
                     certificate_subject TEXT,
                     certificate_validity_start TEXT,
                     certificate_validity_end TEXT,
-                    certificate_serial   TEXT,
+                    certificate_serial TEXT,
                     timestamp REAL NOT NULL
                 )
             """)
             
-            # ICMP packets table (new)
+            # ICMP packets table (existing)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS icmp_packets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -296,14 +309,26 @@ class AnalysisManager:
                 )
             """)
             
-            # ARP data table (new)
+            # ARP data table (updated with MAC address)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS arp_data (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     src_ip TEXT NOT NULL,
                     dst_ip TEXT NOT NULL,
-                    src_mac TEXT,  
+                    src_mac TEXT,
                     operation INTEGER,
+                    timestamp REAL NOT NULL
+                )
+            """)
+            
+            # SMB files table (new)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS smb_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    connection_key TEXT NOT NULL,
+                    filename TEXT,
+                    operation TEXT,
+                    size INTEGER DEFAULT 0,
                     timestamp REAL NOT NULL
                 )
             """)
@@ -320,7 +345,7 @@ class AnalysisManager:
                 )
             """)
             
-            # Connection statistics table (new)
+            # Connection statistics table (existing)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS connection_statistics (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -360,6 +385,10 @@ class AnalysisManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_data_src_dst ON arp_data(src_ip, dst_ip)")
             
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_conn_stats_time ON connection_statistics(timestamp)")
+            
+            # New indices for SMB files
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_smb_files_conn ON smb_files(connection_key)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_smb_files_filename ON smb_files(filename)")
             
             self.analysis1_conn.commit()
             logger.info("Analysis_1 database tables initialized")
