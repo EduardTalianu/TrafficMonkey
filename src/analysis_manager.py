@@ -156,6 +156,15 @@ class AnalysisManager:
         self.analysis_plugins_dir = os.path.join(app_root, "analysis")
         os.makedirs(self.analysis_plugins_dir, exist_ok=True)
         
+        # Import and initialize RedReportManager
+        try:
+            from red_report_manager import RedReportManager
+            self.red_report_manager = RedReportManager(app_root, self)
+            logger.info("Red Report Manager initialized")
+        except Exception as e:
+            logger.error(f"Error initializing Red Report Manager: {e}")
+            self.red_report_manager = None
+        
         # Load analysis plugins
         self.load_analysis_plugins()
         

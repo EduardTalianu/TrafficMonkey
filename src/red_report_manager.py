@@ -59,22 +59,9 @@ class RedReportManager:
             logger.error(f"Error ensuring x_red table exists: {e}")
     
     def add_red_finding(self, src_ip, dst_ip, rule_name, description, 
-                       severity="medium", details=None, connection_key=None, remediation=None):
+                    severity="medium", details=None, connection_key=None, remediation=None):
         """
         Add a red team finding to both the database and a file
-        
-        Parameters:
-        - src_ip: Source IP address
-        - dst_ip: Destination IP address
-        - rule_name: Name of the rule that triggered the finding
-        - description: Description of the finding
-        - severity: Severity level (low, medium, high, critical)
-        - details: Additional details as a dict (will be stored as JSON)
-        - connection_key: Optional connection key
-        - remediation: Optional remediation guidance
-        
-        Returns:
-        - True if successful, False otherwise
         """
         try:
             current_time = time.time()
@@ -100,7 +87,12 @@ class RedReportManager:
             # 2. Store in red folder as a JSON file
             timestamp_str = datetime.fromtimestamp(current_time).strftime("%Y%m%d_%H%M%S")
             safe_rule_name = rule_name.replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')
-            filename = f"{timestamp_str}_{safe_rule_name}_{src_ip}_{dst_ip}.json"
+            
+            # Sanitize IP addresses for filename - replace colons with underscores for IPv6 compatibility
+            safe_src_ip = src_ip.replace(':', '_')
+            safe_dst_ip = dst_ip.replace(':', '_')
+            
+            filename = f"{timestamp_str}_{safe_rule_name}_{safe_src_ip}_{safe_dst_ip}.json"
             file_path = os.path.join(self.red_dir, filename)
             
             report_data = {
