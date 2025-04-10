@@ -410,14 +410,6 @@ class TrafficCaptureEngine:
                 self._process_arp_packet_ek(layers)
                 # Still continue processing as a normal packet if IP fields are present
 
-            # Check for SMB data
-            smb_filename = None
-            if "smb_filename" in layers:
-                smb_filename = self.get_layer_value(layers, "smb_filename")
-                if smb_filename:
-                    # Store SMB file access
-                    self._store_smb_data(layers, src_ip, dst_ip, src_port, dst_port, connection_key)
-
             # Basic data validation for IP-based packets
             # For ARP packets, we may not have both IPs, so don't return early
             if (not "arp_src_proto_ipv4" in layers and not "arp_dst_proto_ipv4" in layers) and (not src_ip or not dst_ip):
@@ -480,11 +472,19 @@ class TrafficCaptureEngine:
                 if "icmp_type" in layers:
                     self._store_icmp_data(layers, src_ip, dst_ip)
                 
-                # Track ports for port scan detection - now forwarded to analysis_manager
+                # Check for SMB data
+                if "smb_filename" in layers or "smb_session_setup_account" in layers:
+                    smb_filename = self.get_layer_value(layers, "smb_filename")
+                    if smb_filename:
+                        self._store_smb_data(layers, src_ip, dst_ip, src_port, dst_port, connection_key)
+                    # Store SMB authentication data
+                    self._store_smb_auth(layers, connection_key)
+                
+                # Track ports for port scan detection
                 if dst_port and self.analysis_manager:
                     self.analysis_manager.add_port_scan_data(src_ip, dst_ip, dst_port)
-                
-                # Store basic protocol info based on port - now forwarded to analysis_manager
+                    
+                # Store basic protocol info based on port
                 if dst_port and self.analysis_manager:
                     # Store based on common port numbers - simplified detection
                     if dst_port == 80:
@@ -495,6 +495,26 @@ class TrafficCaptureEngine:
                         self.analysis_manager.add_app_protocol(connection_key, "DNS", detection_method="port-based")
                     elif dst_port == 445 or src_port == 445:
                         self.analysis_manager.add_app_protocol(connection_key, "SMB", detection_method="port-based")
+                    elif dst_port == 88:
+                        self.analysis_manager.add_app_protocol(connection_key, "Kerberos", detection_method="port-based")
+                    elif dst_port == 3389:
+                        self.analysis_manager.add_app_protocol(connection_key, "RDP", detection_method="port-based")
+                        
+                # Store authentication data if present
+                if "http_authorization" in layers:
+                    self._store_http_auth(layers, connection_key)
+                    
+                if "ntlmssp_negotiateflags" in layers or "ntlmssp_ntlmserverchallenge" in layers or "ntlmssp_ntlmv2_response" in layers:
+                    self._store_ntlm_auth(layers, connection_key)
+                    
+                if "http_file_data" in layers:
+                    self._store_http_file_data(layers, connection_key)
+                    
+                if "http_cookie" in layers:
+                    self._store_http_cookies(layers, connection_key)
+                    
+                if "kerberos_CNameString" in layers or "kerberos_realm" in layers or "kerberos_msg_type" in layers:
+                    self._store_kerberos_auth(layers, connection_key)
                 
                 # Store the basic connection in the database with MAC address
                 if src_ip and dst_ip:  # Only add if we have both IPs
@@ -902,6 +922,208 @@ class TrafficCaptureEngine:
             return self.db_manager.add_icmp_packet(src_ip, dst_ip, icmp_type)
         except Exception as e:
             self.gui.update_output(f"Error storing ICMP data: {e}")
+            return False
+        
+    def _store_http_auth(self, layers, connection_key):
+        """Store HTTP authentication data"""
+        try:
+            # Get authorization header
+            auth_header = self._get_layer_value(layers, "http_authorization")
+            if not auth_header:
+                return False
+                
+            # Determine auth type (Basic, NTLM, Bearer, etc.)
+            auth_type = "Unknown"
+            username = ""
+            credentials = ""
+            
+            if auth_header.startswith("Basic "):
+                auth_type = "Basic"
+                # Extract credentials
+                try:
+                    encoded_creds = auth_header.split(' ')[1]
+                    decoded = base64.b64decode(encoded_creds).decode('utf-8', errors='ignore')
+                    if ':' in decoded:
+                        username, password = decoded.split(':', 1)
+                        credentials = f"{username}:{password}"
+                except:
+                    pass
+            elif auth_header.startswith("NTLM "):
+                auth_type = "NTLM"
+            elif auth_header.startswith("Bearer "):
+                auth_type = "Bearer" 
+            elif auth_header.startswith("Digest "):
+                auth_type = "Digest"
+                
+            current_time = time.time()
+            
+            # Store in database
+            cursor = self.db_manager.capture_conn.cursor()
+            cursor.execute("""
+                INSERT INTO http_auth
+                (connection_key, auth_type, auth_header, username, credentials, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (connection_key, auth_type, auth_header, username, credentials, current_time))
+            self.db_manager.capture_conn.commit()
+            cursor.close()
+            
+            return True
+        except Exception as e:
+            self.gui.update_output(f"Error storing HTTP auth: {e}")
+            return False
+
+    def _store_ntlm_auth(self, layers, connection_key):
+        """Store NTLM authentication data"""
+        try:
+            # Check if this is an NTLM authentication packet
+            negotiate_flags = self.get_layer_value(layers, "ntlmssp_negotiateflags")  # Updated
+            ntlm_challenge = self.get_layer_value(layers, "ntlmssp_ntlmserverchallenge")  # Updated
+            ntlmv2_response = self.get_layer_value(layers, "ntlmssp_ntlmv2_response")
+            
+            # Skip if none of the NTLM fields are present
+            if not negotiate_flags and not ntlm_challenge and not ntlmv2_response:
+                return False
+                
+            # Extract domain and username if available
+            domain = self.get_layer_value(layers, "ntlmssp_domain_name")  # Updated
+            username = self.get_layer_value(layers, "ntlmssp_auth_username")  # Updated
+                
+            current_time = time.time()
+            
+            # Store in database
+            cursor = self.db_manager.capture_conn.cursor()
+            cursor.execute("""
+                INSERT INTO ntlm_auth
+                (connection_key, negotiate_flags, ntlm_challenge, ntlmv2_response, domain, username, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (connection_key, negotiate_flags, ntlm_challenge, ntlmv2_response, domain, username, current_time))
+            self.db_manager.capture_conn.commit()
+            cursor.close()
+            
+            return True
+        except Exception as e:
+            self.gui.update_output(f"Error storing NTLM auth: {e}")
+            return False
+
+    def _store_http_file_data(self, layers, connection_key):
+        """Store HTTP file data content"""
+        try:
+            # Get file data
+            file_data = self._get_layer_value(layers, "http_file_data")
+            if not file_data:
+                return False
+                
+            # Determine content type if available
+            content_type = self._get_layer_value(layers, "http_content_type")
+                
+            current_time = time.time()
+            
+            # Store in database
+            cursor = self.db_manager.capture_conn.cursor()
+            cursor.execute("""
+                INSERT INTO http_file_data
+                (connection_key, content_type, file_data, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (connection_key, content_type, file_data, current_time))
+            self.db_manager.capture_conn.commit()
+            cursor.close()
+            
+            return True
+        except Exception as e:
+            self.gui.update_output(f"Error storing HTTP file data: {e}")
+            return False
+
+    def _store_http_cookies(self, layers, connection_key):
+        """Store HTTP cookie data"""
+        try:
+            # Get cookie data
+            cookie_value = self._get_layer_value(layers, "http_cookie")
+            if not cookie_value:
+                return False
+                
+            # Try to get domain
+            host = self._get_layer_value(layers, "http_host")
+                
+            current_time = time.time()
+            
+            # Store in database
+            cursor = self.db_manager.capture_conn.cursor()
+            cursor.execute("""
+                INSERT INTO http_cookies
+                (connection_key, cookie_name, cookie_value, domain, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (connection_key, "", cookie_value, host, current_time))
+            self.db_manager.capture_conn.commit()
+            cursor.close()
+            
+            return True
+        except Exception as e:
+            self.gui.update_output(f"Error storing HTTP cookies: {e}")
+            return False
+
+    def _store_kerberos_auth(self, layers, connection_key):
+        """Store Kerberos authentication data"""
+        try:
+            # Get Kerberos fields
+            username = self._get_layer_value(layers, "kerberos_CNameString")
+            realm = self._get_layer_value(layers, "kerberos_realm")
+            msg_type = self._get_layer_value(layers, "kerberos_msg_type")
+            
+            # Skip if no Kerberos data
+            if not username and not realm and not msg_type:
+                return False
+                
+            current_time = time.time()
+            
+            # Convert msg_type to integer if present
+            msg_type_int = None
+            if msg_type:
+                try:
+                    msg_type_int = int(msg_type)
+                except:
+                    pass
+            
+            # Store in database
+            cursor = self.db_manager.capture_conn.cursor()
+            cursor.execute("""
+                INSERT INTO kerberos_auth
+                (connection_key, msg_type, username, realm, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (connection_key, msg_type_int, username, realm, current_time))
+            self.db_manager.capture_conn.commit()
+            cursor.close()
+            
+            return True
+        except Exception as e:
+            self.gui.update_output(f"Error storing Kerberos auth: {e}")
+            return False
+
+    def _store_smb_auth(self, layers, connection_key):
+        """Store SMB authentication data"""
+        try:
+            # Get SMB auth fields
+            account = self.get_layer_value(layers, "ntlmssp_auth_username")  # Updated
+            domain = self.get_layer_value(layers, "ntlmssp_domain_name")  # Updated
+            
+            # Skip if no SMB auth data
+            if not account and not domain:
+                return False
+                
+            current_time = time.time()
+            
+            # Store in database
+            cursor = self.db_manager.capture_conn.cursor()
+            cursor.execute("""
+                INSERT INTO smb_auth
+                (connection_key, domain, account, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (connection_key, domain, account, current_time))
+            self.db_manager.capture_conn.commit()
+            cursor.close()
+            
+            return True
+        except Exception as e:
+            self.gui.update_output(f"Error storing SMB auth: {e}")
             return False
 
     def _process_arp_packet_ek(self, layers):

@@ -652,6 +652,11 @@ class LiveCaptureGUI:
         self.cache_expiry = {}
         self.cache_lifetime = 60  # seconds
 
+        # Initialize the red report manager
+        from src.red_report_manager import RedReportManager
+        self.red_report_manager = RedReportManager(self.app_root, self.analysis_manager)
+        self.update_output("Red Report Manager initialized")
+
     def get_cached_data(self, cache_key, query_func, *args, force_refresh=False, **kwargs):
         """Get data from cache or fetch from database if expired"""
         current_time = time.time()
@@ -1494,3 +1499,29 @@ class LiveCaptureGUI:
         if hasattr(self, 'capture_engine'):
             return self.capture_engine.packet_count
         return 0
+    
+    def add_red_finding(self, src_ip, dst_ip, description, severity="medium", details=None, connection_key=None, remediation=None):
+        """
+        Add a red team finding
+        This will be stored in the x_red table and as a file in the red folder
+        
+        Parameters:
+        - src_ip: Source IP address
+        - dst_ip: Destination IP address 
+        - description: Description of the finding
+        - severity: Severity level (low, medium, high, critical)
+        - details: Additional details as a dict (will be stored as JSON)
+        - connection_key: Optional connection key
+        - remediation: Optional remediation guidance
+        
+        Returns:
+        - True if successful, False otherwise
+        """
+        if self.db_manager and hasattr(self.db_manager, 'gui') and hasattr(self.db_manager.gui, 'red_report_manager'):
+            # Use the red report manager to add the finding
+            return self.db_manager.gui.red_report_manager.add_red_finding(
+                src_ip, dst_ip, self.name, description, severity, details, connection_key, remediation
+            )
+        
+        # Fallback if red_report_manager is not available
+        return self.add_alert(src_ip, f"RED TEAM FINDING ({severity}): {description}")

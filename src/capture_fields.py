@@ -355,6 +355,100 @@ CAPTURE_FIELDS = [
         "required": False,
         "description": "Ethernet source MAC address"
     },
+    # Authentication-related fields
+    {
+        "tshark_field": "http.authorization",
+        "category": "http",
+        "db_mapping": {"table": "http_auth", "column": "auth_header"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "HTTP Authorization header"
+    },
+    {
+        "tshark_field": "ntlmssp.negotiateflags",
+        "category": "ntlm",
+        "db_mapping": {"table": "ntlm_auth", "column": "negotiate_flags"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "NTLM negotiation flags"
+    },
+    {
+        "tshark_field": "ntlmssp.ntlmserverchallenge",
+        "category": "ntlm",
+        "db_mapping": {"table": "ntlm_auth", "column": "ntlm_challenge"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "NTLM challenge"
+    },
+    {
+        "tshark_field": "ntlmssp.ntlmv2_response",
+        "category": "ntlm",
+        "db_mapping": {"table": "ntlm_auth", "column": "ntlmv2_response"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "NTLMv2 response hash"
+    },
+
+    # Content fields for data extraction and credential harvesting
+    {
+        "tshark_field": "http.file_data",
+        "category": "http",
+        "db_mapping": {"table": "http_file_data", "column": "file_data"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "HTTP file data content"
+    },
+    {
+        "tshark_field": "http.cookie",
+        "category": "http",
+        "db_mapping": {"table": "http_cookies", "column": "cookie_value"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "HTTP cookie data"
+    },
+
+    # Kerberos authentication fields
+    {
+        "tshark_field": "kerberos.CNameString", 
+        "category": "kerberos",
+        "db_mapping": {"table": "kerberos_auth", "column": "username"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "Kerberos username"
+    },
+    {
+        "tshark_field": "kerberos.realm",
+        "category": "kerberos",
+        "db_mapping": {"table": "kerberos_auth", "column": "realm"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "Kerberos realm"
+    },
+    {
+        "tshark_field": "kerberos.msg_type",
+        "category": "kerberos",
+        "db_mapping": {"table": "kerberos_auth", "column": "msg_type"},
+        "data_type": "INTEGER",
+        "required": False,
+        "description": "Kerberos message type"
+    },
+# SMB authentication details
+    {
+        "tshark_field": "ntlmssp.auth.username",
+        "category": "smb",
+        "db_mapping": {"table": "smb_auth", "column": "account"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "SMB session username"
+    },
+    {
+        "tshark_field": "ntlmssp.auth.domain",
+        "category": "smb",
+        "db_mapping": {"table": "smb_auth", "column": "domain"},
+        "data_type": "TEXT",
+        "required": False,
+        "description": "SMB session domain"
+    },
     {
         "tshark_field": "smb2.filename",
         "category": "smb",
@@ -470,6 +564,63 @@ TABLE_DEFINITIONS = {
         {"name": "certificate_validity_start", "type": "TEXT", "required": False},
         {"name": "certificate_validity_end", "type": "TEXT", "required": False},
         {"name": "certificate_serial", "type": "TEXT", "required": False}
+    ],
+        "http_auth": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "connection_key", "type": "TEXT", "required": True},
+        {"name": "auth_type", "type": "TEXT", "required": False},
+        {"name": "auth_header", "type": "TEXT", "required": True},
+        {"name": "username", "type": "TEXT", "required": False},
+        {"name": "credentials", "type": "TEXT", "required": False},
+        {"name": "timestamp", "type": "REAL", "required": True}
+    ],
+
+    "ntlm_auth": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "connection_key", "type": "TEXT", "required": True},
+        {"name": "negotiate_flags", "type": "TEXT", "required": False},
+        {"name": "ntlm_challenge", "type": "TEXT", "required": False},
+        {"name": "ntlmv2_response", "type": "TEXT", "required": False},
+        {"name": "domain", "type": "TEXT", "required": False},
+        {"name": "username", "type": "TEXT", "required": False},
+        {"name": "timestamp", "type": "REAL", "required": True}
+    ],
+
+    "http_file_data": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "connection_key", "type": "TEXT", "required": True},
+        {"name": "content_type", "type": "TEXT", "required": False},
+        {"name": "file_data", "type": "TEXT", "required": False},
+        {"name": "timestamp", "type": "REAL", "required": True}
+    ],
+
+    "http_cookies": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "connection_key", "type": "TEXT", "required": True},
+        {"name": "cookie_name", "type": "TEXT", "required": False},
+        {"name": "cookie_value", "type": "TEXT", "required": True},
+        {"name": "domain", "type": "TEXT", "required": False},
+        {"name": "timestamp", "type": "REAL", "required": True}
+    ],
+
+    "kerberos_auth": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "connection_key", "type": "TEXT", "required": True},
+        {"name": "msg_type", "type": "INTEGER", "required": False},
+        {"name": "username", "type": "TEXT", "required": False},
+        {"name": "realm", "type": "TEXT", "required": False},
+        {"name": "service_name", "type": "TEXT", "required": False},
+        {"name": "ticket_size", "type": "INTEGER", "required": False},
+        {"name": "timestamp", "type": "REAL", "required": True}
+    ],
+
+    "smb_auth": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "connection_key", "type": "TEXT", "required": True},
+        {"name": "domain", "type": "TEXT", "required": False},
+        {"name": "account", "type": "TEXT", "required": False},
+        {"name": "share_name", "type": "TEXT", "required": False},
+        {"name": "timestamp", "type": "REAL", "required": True}
     ],
     "arp_data": [
         {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
@@ -670,6 +821,78 @@ def create_standard_indices(cursor):
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_http_headers_req 
             ON http_headers(request_id)
+        """)
+        
+    # HTTP authentication indices
+    if 'http_auth' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_auth_conn
+            ON http_auth(connection_key)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_auth_type
+            ON http_auth(auth_type)
+        """)
+    
+    # NTLM authentication indices
+    if 'ntlm_auth' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ntlm_auth_conn
+            ON ntlm_auth(connection_key)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ntlm_auth_user
+            ON ntlm_auth(username)
+        """)
+    
+    # HTTP file data indices
+    if 'http_file_data' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_file_conn
+            ON http_file_data(connection_key)
+        """)
+    
+    # HTTP cookies indices
+    if 'http_cookies' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_cookies_conn
+            ON http_cookies(connection_key)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_http_cookies_domain
+            ON http_cookies(domain)
+        """)
+    
+    # Kerberos authentication indices
+    if 'kerberos_auth' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_kerberos_auth_conn
+            ON kerberos_auth(connection_key)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_kerberos_auth_user
+            ON kerberos_auth(username)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_kerberos_auth_realm
+            ON kerberos_auth(realm)
+        """)
+    
+    # SMB authentication indices
+    if 'smb_auth' in existing_tables:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_smb_auth_conn
+            ON smb_auth(connection_key)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_smb_auth_account
+            ON smb_auth(account)
         """)
 
 def get_integrated_schema(extended_tables=None):
