@@ -9,6 +9,7 @@ import time
 import ipaddress
 import urllib.request
 import io
+import json
 from datetime import datetime
 from PIL import Image, ImageTk
 
@@ -81,12 +82,16 @@ class GeoLocationSubtab(SubtabBase):
                       variable=self.show_only_alerts_var,
                       command=self.refresh).pack(side="left", padx=5)
         
+        # Add button to view threat intelligence for IPs
+        ttk.Button(options_frame, text="View Threat Intel", 
+                  command=self.view_threat_intel).pack(side="right", padx=5)
+        
         # Geo location treeview - now with AS Owner column
         self.geo_tree, _ = gui.tab_factory.create_tree_with_scrollbar(
             self.tab_frame,
-            columns=("ip", "country", "city", "as_owner", "alerts", "connections"),
-            headings=["IP Address", "Country", "City", "AS Owner", "Alerts", "Connections"],
-            widths=[150, 100, 120, 200, 60, 80],
+            columns=("ip", "country", "city", "as_owner", "threat_score", "alerts", "connections"),
+            headings=["IP Address", "Country", "City", "AS Owner", "Threat Score", "Alerts", "Connections"],
+            widths=[150, 100, 120, 180, 90, 60, 80],
             height=10
         )
         
@@ -127,18 +132,46 @@ class GeoLocationSubtab(SubtabBase):
         # Bind event to show details for selected IP
         self.geo_tree.bind("<<TreeviewSelect>>", self.show_location_details)
         
-        # Create context menu
-        gui.ip_manager.create_context_menu(
-            self.geo_tree, 
-            self.selected_ip_var, 
-            lambda: self.show_location_details(None)
-        )
+        # Create context menu with enhanced options
+        self._create_context_menu()
         
         # Try to load the GeoIP databases
         self.load_geoip_databases()
         
         # Try to download the world map
         self.download_world_map()
+    
+    def _create_context_menu(self):
+        """Create a context menu with enhanced options"""
+        # Get parent window reference correctly
+        parent_window = self.tab_frame.winfo_toplevel()
+        
+        menu = tk.Menu(parent_window, tearoff=0)
+        menu.add_command(label="Copy IP", 
+                        command=lambda: gui.ip_manager.copy_ip_to_clipboard(self.selected_ip_var.get()))
+        menu.add_command(label="Mark as False Positive", 
+                        command=lambda: gui.ip_manager.mark_as_false_positive(self.selected_ip_var.get()))
+        menu.add_separator()
+        menu.add_command(label="View Threat Intelligence", 
+                        command=self.view_threat_intel)
+        menu.add_command(label="Show This IP on Map", 
+                        command=lambda: self.show_ip_on_map(self.selected_ip_var.get()))
+        
+        # Bind context menu
+        def show_context_menu(event):
+            # Update IP variable
+            selected = self.geo_tree.selection()
+            if selected:
+                ip = self.geo_tree.item(selected[0], "values")[0]
+                self.selected_ip_var.set(ip)
+                
+                # Show menu
+                menu.post(event.x_root, event.y_root)
+                
+                # Also show location details
+                self.show_location_details(None)
+        
+        self.geo_tree.bind("<Button-3>", show_context_menu)
     
     def download_world_map(self):
         """Download or load a world map image for the visualization"""
@@ -326,6 +359,41 @@ class GeoLocationSubtab(SubtabBase):
             self.geo_data_cache[ip] = location
             return location
         
+        # First check if we already have this data in x_ip_geolocation
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            cursor.execute("""
+                SELECT country, region, city, latitude, longitude, asn, asn_name
+                FROM x_ip_geolocation
+                WHERE ip_address = ?
+            """, (ip,))
+            
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if result:
+                country, region, city, latitude, longitude, asn, asn_name = result
+                
+                # Create location object from database data
+                location = {
+                    "country": country,
+                    "city": city,
+                    "region": region,
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "asn": asn,
+                    "as_org": asn_name,
+                    "database": "Database",
+                    "is_local": False
+                }
+                
+                # Cache the result
+                self.geo_data_cache[ip] = location
+                return location
+        except Exception as e:
+            self.update_output(f"Error checking geolocation database: {e}")
+        
+        # If not in database, look it up using GeoIP
         location = {"country": "Unknown", "city": "Unknown", "asn": None, "as_org": "Unknown"}
         
         # Try ASN database to get organization info
@@ -358,6 +426,9 @@ class GeoLocationSubtab(SubtabBase):
                     "is_local": False
                 })
                 
+                # Store this data in the x_ip_geolocation table
+                self._store_geolocation_in_database(ip, location)
+                
                 # Cache the result
                 self.geo_data_cache[ip] = location
                 return location
@@ -388,6 +459,9 @@ class GeoLocationSubtab(SubtabBase):
                     "database": "Country",
                     "is_local": False
                 })
+                
+                # Store this data in the x_ip_geolocation table
+                self._store_geolocation_in_database(ip, location)
                 
                 # Cache the result
                 self.geo_data_cache[ip] = location
@@ -423,6 +497,45 @@ class GeoLocationSubtab(SubtabBase):
         })
         self.geo_data_cache[ip] = location
         return location
+
+    def _store_geolocation_in_database(self, ip, location):
+        """Store geolocation data in the x_ip_geolocation table"""
+        try:
+            # Get a cursor from analysis_manager
+            cursor = gui.analysis_manager.get_cursor()
+            
+            # Prepare the data for insertion
+            country = location.get("country") if location.get("country") != "Unknown" else None
+            region = location.get("region") if location.get("region") != "Unknown" else None
+            city = location.get("city") if location.get("city") != "Unknown" else None
+            latitude = location.get("latitude") or 0
+            longitude = location.get("longitude") or 0
+            asn = location.get("asn")
+            asn_name = location.get("as_org") if location.get("as_org") != "Unknown" else None
+            
+            # Use direct SQL INSERT to ensure it's working
+            cursor.execute("""
+                INSERT OR REPLACE INTO x_ip_geolocation
+                (ip_address, country, region, city, latitude, longitude, asn, asn_name, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (ip, country, region, city, latitude, longitude, asn, asn_name))
+            
+            # Commit the changes
+            gui.analysis_manager.analysis1_conn.commit()
+            
+            # Close the cursor
+            cursor.close()
+            
+            # Log success
+            self.update_output(f"Stored geolocation data for {ip} in database")
+            
+            # Verify data was stored by querying it back
+            self._verify_geolocation_storage(ip)
+        except Exception as e:
+            self.update_output(f"Error storing geolocation in database: {e}")
+            import traceback
+            traceback.print_exc()
+
     
     def refresh(self, ip_filter=None):
         """Refresh geo location data with actual database queries for ALL IPs"""
@@ -442,11 +555,11 @@ class GeoLocationSubtab(SubtabBase):
                 # List to store all unique IP addresses with counts
                 ip_data = {}
                 
-                # 1. Get IPs from alerts table with alert counts
-                self.update_output("Querying alerts table...")
+                # 1. Get IPs from x_alerts table with alert counts (updated table name)
+                self.update_output("Querying x_alerts table...")
                 sql = """
                     SELECT ip_address, COUNT(*) as alert_count, MAX(timestamp) as last_seen
-                    FROM alerts
+                    FROM x_alerts
                 """
                 
                 # Add filter if provided
@@ -459,9 +572,13 @@ class GeoLocationSubtab(SubtabBase):
                 
                 for ip, alert_count, last_seen in cursor.execute(sql, params).fetchall():
                     if ip:
+                        # Skip false positives
+                        if ip in gui.false_positives:
+                            continue
+                            
                         # Initialize if this is a new IP
                         if ip not in ip_data:
-                            ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None}
+                            ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None, 'threat_score': 0}
                         
                         # Update alert count
                         ip_data[ip]['alerts'] = alert_count
@@ -479,6 +596,33 @@ class GeoLocationSubtab(SubtabBase):
                         # Update last seen if this timestamp is newer
                         if last_seen and (not ip_data[ip]['last_seen'] or float(last_seen) > float(ip_data[ip]['last_seen'])):
                             ip_data[ip]['last_seen'] = last_seen
+                
+                # Get threat scores from x_ip_threat_intel table
+                self.update_output("Querying x_ip_threat_intel table...")
+                threat_sql = """
+                    SELECT ip_address, threat_score
+                    FROM x_ip_threat_intel
+                """
+                
+                # Add filter if provided
+                if ip_filter:
+                    threat_sql += " WHERE ip_address LIKE ?"
+                    threat_params = (f"%{ip_filter}%",)
+                else:
+                    threat_params = ()
+                
+                for ip, score in cursor.execute(threat_sql, threat_params).fetchall():
+                    if ip and score:
+                        # Skip false positives
+                        if ip in gui.false_positives:
+                            continue
+                            
+                        # Initialize if this is a new IP
+                        if ip not in ip_data:
+                            ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None, 'threat_score': 0}
+                            
+                        # Update threat score
+                        ip_data[ip]['threat_score'] = float(score)
                 
                 # Skip connection queries if we only want IPs with alerts
                 if not self.show_only_alerts_var.get():
@@ -500,13 +644,17 @@ class GeoLocationSubtab(SubtabBase):
                     
                     for ip, conn_count, last_seen in cursor.execute(conn_sql, conn_params).fetchall():
                         if ip:
+                            # Skip false positives
+                            if ip in gui.false_positives:
+                                continue
+                                
                             # Skip if we only want IPs with alerts and this IP has none
                             if self.show_only_alerts_var.get() and (ip not in ip_data or ip_data[ip]['alerts'] == 0):
                                 continue
                                 
                             # Initialize if this is a new IP
                             if ip not in ip_data:
-                                ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None}
+                                ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None, 'threat_score': 0}
                             
                             # Add connection count
                             ip_data[ip]['connections'] += conn_count
@@ -542,13 +690,17 @@ class GeoLocationSubtab(SubtabBase):
                     
                     for ip, conn_count, last_seen in cursor.execute(dst_sql, dst_params).fetchall():
                         if ip:
+                            # Skip false positives
+                            if ip in gui.false_positives:
+                                continue
+                                
                             # Skip if we only want IPs with alerts and this IP has none
                             if self.show_only_alerts_var.get() and (ip not in ip_data or ip_data[ip]['alerts'] == 0):
                                 continue
                                 
                             # Initialize if this is a new IP
                             if ip not in ip_data:
-                                ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None}
+                                ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None, 'threat_score': 0}
                             
                             # Add connection count
                             ip_data[ip]['connections'] += conn_count
@@ -585,13 +737,17 @@ class GeoLocationSubtab(SubtabBase):
                     
                     for ip, query_count, last_seen in cursor.execute(dns_sql, dns_params).fetchall():
                         if ip:
+                            # Skip false positives
+                            if ip in gui.false_positives:
+                                continue
+                                
                             # Skip if we only want IPs with alerts and this IP has none
                             if self.show_only_alerts_var.get() and (ip not in ip_data or ip_data[ip]['alerts'] == 0):
                                 continue
                                 
                             # Initialize if this is a new IP
                             if ip not in ip_data:
-                                ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None}
+                                ip_data[ip] = {'alerts': 0, 'connections': 0, 'last_seen': None, 'threat_score': 0}
                             
                             # Add to connection count (count DNS queries as connections)
                             ip_data[ip]['connections'] += query_count
@@ -620,6 +776,7 @@ class GeoLocationSubtab(SubtabBase):
                     alert_count = data['alerts']
                     connection_count = data['connections']
                     last_seen = data['last_seen']
+                    threat_score = data['threat_score']
                     
                     # Skip IPs with no alerts if that filter is enabled
                     if self.show_only_alerts_var.get() and alert_count == 0:
@@ -634,11 +791,11 @@ class GeoLocationSubtab(SubtabBase):
                     else:
                         last_seen_formatted = "Unknown"
                     
-                    # Add to result list with both alert count and connection count
-                    result.append((ip, alert_count, connection_count, last_seen_formatted))
+                    # Add to result list with threat score, alert count and connection count
+                    result.append((ip, alert_count, connection_count, threat_score, last_seen_formatted))
                 
-                # Sort by alert count (descending), then by connections (descending)
-                result.sort(key=lambda x: (-(x[1] or 0), -(x[2] or 0)))
+                # Sort by threat score (descending), then by alert count (descending)
+                result.sort(key=lambda x: (-(x[3] or 0), -(x[1] or 0)))
                 
                 # Limit to top 200 IPs for performance
                 return result[:200]
@@ -687,7 +844,7 @@ class GeoLocationSubtab(SubtabBase):
         display_data = []
         
         # Process each IP
-        for i, (ip, alert_count, connection_count, last_seen) in enumerate(geo_data):
+        for i, (ip, alert_count, connection_count, threat_score, last_seen) in enumerate(geo_data):
             # Get location data
             location = self.get_ip_location(ip)
             
@@ -702,12 +859,16 @@ class GeoLocationSubtab(SubtabBase):
             else:
                 as_info = location.get("as_org", "Unknown")
             
-            # Add to result list with AS information
+            # Format threat score
+            threat_score_str = f"{threat_score:.1f}" if threat_score > 0 else "0.0"
+            
+            # Add to result list with AS information and threat score
             display_data.append((
                 ip,
                 location.get("country", "Unknown"),
                 location.get("city", "Unknown"),
                 as_info,
+                threat_score_str,
                 alert_count,
                 connection_count
             ))
@@ -724,14 +885,399 @@ class GeoLocationSubtab(SubtabBase):
         # Populate tree using TreeViewManager
         gui.tree_manager.populate_tree(self.geo_tree, display_data)
         
+        # Apply color formatting based on threat score
+        for item_id in self.geo_tree.get_children():
+            values = self.geo_tree.item(item_id, "values")
+            if len(values) >= 5:  # Check if we have the threat score column
+                try:
+                    score = float(values[4])
+                    if score > 6:
+                        self.geo_tree.item(item_id, tags=("high_threat",))
+                    elif score > 3:
+                        self.geo_tree.item(item_id, tags=("medium_threat",))
+                except (ValueError, TypeError):
+                    pass
+        
+        # Configure tag colors
+        self.geo_tree.tag_configure("high_threat", background="#ffe6e6")  # Light red
+        self.geo_tree.tag_configure("medium_threat", background="#fff6e6")  # Light orange
+        
         # Show statistics
-        external_count = sum(1 for ip, country, city, as_info, alerts, conns in display_data 
+        external_count = sum(1 for ip, country, city, as_info, threat, alerts, conns in display_data 
                             if country not in ["Local Network", "Unknown"])
         
-        alert_count = sum(1 for ip, country, city, as_info, alerts, conns in display_data if alerts > 0)
+        alert_count = sum(1 for ip, country, city, as_info, threat, alerts, conns in display_data if int(alerts) > 0)
+        high_threat_count = sum(1 for ip, country, city, as_info, threat, alerts, conns in display_data 
+                              if float(threat) > 3)
         
-        status = f"Showing {len(display_data)} IP addresses ({external_count} external, {alert_count} with alerts)"
+        status = (f"Showing {len(display_data)} IP addresses ({external_count} external, "
+                 f"{alert_count} with alerts, {high_threat_count} with threat score > 3)")
         self.update_output(status)
+    
+    def view_threat_intel(self):
+        """View detailed threat intelligence for the selected IP"""
+        ip = self.selected_ip_var.get()
+        if not ip:
+            gui.update_output("No IP selected")
+            return
+        
+        # Show a dialog with threat intelligence data
+        try:
+            # Get parent window reference correctly
+            parent_window = self.tab_frame.winfo_toplevel()
+            
+            # Queue the query to get threat intel
+            gui.analysis_manager.queue_query(
+                lambda: self._fetch_threat_intel_details(ip),
+                lambda data: self._display_threat_intel_details(data, parent_window)
+            )
+        except Exception as e:
+            gui.update_output(f"Error fetching threat intelligence: {e}")
+    
+    def _fetch_threat_intel_details(self, ip):
+        """Fetch detailed threat intelligence for an IP"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            
+            # Get threat intelligence data from x_ip_threat_intel table
+            cursor.execute("""
+                SELECT
+                    threat_score,
+                    threat_type,
+                    confidence,
+                    source,
+                    first_seen,
+                    last_seen,
+                    details,
+                    protocol,
+                    destination_ip,
+                    destination_port,
+                    detection_method,
+                    alert_count
+                FROM x_ip_threat_intel
+                WHERE ip_address = ?
+            """, (ip,))
+            
+            threat_intel = cursor.fetchone()
+            
+            # Get recent alerts for this IP from x_alerts table
+            cursor.execute("""
+                SELECT
+                    alert_message,
+                    rule_name,
+                    timestamp
+                FROM x_alerts
+                WHERE ip_address = ?
+                ORDER BY timestamp DESC
+                LIMIT 10
+            """, (ip,))
+            
+            alerts = cursor.fetchall()
+            
+            # Get geolocation data from x_ip_geolocation table
+            cursor.execute("""
+                SELECT
+                    country,
+                    region,
+                    city,
+                    asn,
+                    asn_name
+                FROM x_ip_geolocation
+                WHERE ip_address = ?
+            """, (ip,))
+            
+            geolocation = cursor.fetchone()
+            
+            cursor.close()
+            
+            return {
+                "ip": ip,
+                "threat_intel": threat_intel,
+                "alerts": alerts,
+                "geolocation": geolocation,
+                "location": self.get_ip_location(ip)  # Include our cached geolocation data
+            }
+            
+        except Exception as e:
+            gui.update_output(f"Error fetching threat intelligence details: {e}")
+            return {"ip": ip, "error": str(e)}
+    
+    def _display_threat_intel_details(self, data, parent_window):
+        """Display threat intelligence details in a dialog with the correct parent window"""
+        ip = data.get("ip", "Unknown")
+        
+        # Create dialog window with the provided parent window
+        dialog = tk.Toplevel(parent_window)
+        dialog.title(f"Threat Intelligence for {ip}")
+        dialog.geometry("600x500")
+        
+        # Make dialog modal
+        dialog.transient(parent_window)
+        dialog.grab_set()
+        
+        # Main frame with padding
+        main_frame = ttk.Frame(dialog, padding="10")
+        main_frame.pack(fill="both", expand=True)
+        
+        # IP and score information
+        header_frame = ttk.Frame(main_frame)
+        header_frame.pack(fill="x", pady=5)
+        
+        ttk.Label(header_frame, text=f"IP Address: {ip}", font=("TkDefaultFont", 12, "bold")).pack(side="left")
+        
+        if "error" in data:
+            ttk.Label(main_frame, text=f"Error: {data['error']}", foreground="red").pack(pady=10)
+        else:
+            # Threat intelligence details
+            threat_intel = data.get("threat_intel")
+            geolocation = data.get("geolocation") or {}
+            location = data.get("location") or {}
+            
+            if threat_intel:
+                score, threat_type, confidence, source, first_seen, last_seen, details, protocol, destination_ip, destination_port, detection_method, alert_count = threat_intel
+                
+                # Format timestamps
+                if isinstance(first_seen, (int, float)):
+                    first_seen = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(first_seen))
+                if isinstance(last_seen, (int, float)):
+                    last_seen = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_seen))
+                
+                # Score indicator
+                score_frame = ttk.Frame(header_frame)
+                score_frame.pack(side="right")
+                
+                score_color = "green"
+                if score > 3:
+                    score_color = "orange"
+                if score > 6:
+                    score_color = "red"
+                
+                ttk.Label(score_frame, text=f"Threat Score: ", font=("TkDefaultFont", 10)).pack(side="left")
+                ttk.Label(score_frame, text=f"{score:.1f}", foreground=score_color, font=("TkDefaultFont", 12, "bold")).pack(side="left")
+                
+                # Create notebook for tabs
+                notebook = ttk.Notebook(main_frame)
+                notebook.pack(fill="both", expand=True, pady=10)
+                
+                # Details tab
+                details_frame = ttk.Frame(notebook, padding=10)
+                notebook.add(details_frame, text="Threat Details")
+                
+                # Grid for details
+                fields = [
+                    ("Threat Type", threat_type),
+                    ("Confidence", f"{confidence:.2f}" if confidence else "Unknown"),
+                    ("Detection Source", source or "Unknown"),
+                    ("Protocol", protocol or "Multiple/Unknown"),
+                    ("Detection Method", detection_method or "Heuristic"),
+                    ("First Seen", first_seen),
+                    ("Last Seen", last_seen),
+                    ("Alert Count", str(alert_count) if alert_count else "1")
+                ]
+                
+                # Add destination fields if present
+                if destination_ip:
+                    fields.append(("Destination IP", destination_ip))
+                if destination_port:
+                    fields.append(("Destination Port", str(destination_port)))
+                
+                for i, (label, value) in enumerate(fields):
+                    ttk.Label(details_frame, text=f"{label}:", font=("TkDefaultFont", 10, "bold")).grid(row=i, column=0, sticky="w", pady=3)
+                    ttk.Label(details_frame, text=value).grid(row=i, column=1, sticky="w", pady=3, padx=10)
+                
+                # Geolocation tab with enhanced information
+                geo_frame = ttk.Frame(notebook, padding=10)
+                notebook.add(geo_frame, text="Geolocation")
+                
+                # Merge geolocation data from database and cached lookups
+                country = geolocation[0] if geolocation else location.get("country", "Unknown")
+                region = geolocation[1] if geolocation else location.get("region", "Unknown")
+                city = geolocation[2] if geolocation else location.get("city", "Unknown")
+                asn = geolocation[3] if geolocation else location.get("asn", "Unknown")
+                asn_name = geolocation[4] if geolocation else location.get("as_org", "Unknown")
+                
+                # Get coordinates from location cache if available
+                latitude = location.get("latitude", 0)
+                longitude = location.get("longitude", 0)
+                
+                geo_fields = [
+                    ("Country", country or "Unknown"),
+                    ("Region", region or "Unknown"),
+                    ("City", city or "Unknown"),
+                    ("Latitude", f"{latitude:.4f}" if latitude else "Unknown"),
+                    ("Longitude", f"{longitude:.4f}" if longitude else "Unknown"),
+                    ("ASN", asn or "Unknown"),
+                    ("Network", asn_name or "Unknown")
+                ]
+                
+                for i, (label, value) in enumerate(geo_fields):
+                    ttk.Label(geo_frame, text=f"{label}:", font=("TkDefaultFont", 10, "bold")).grid(row=i, column=0, sticky="w", pady=3)
+                    ttk.Label(geo_frame, text=value).grid(row=i, column=1, sticky="w", pady=3, padx=10)
+                
+                # Alerts tab
+                alerts_frame = ttk.Frame(notebook, padding=10)
+                notebook.add(alerts_frame, text="Recent Alerts")
+                
+                # Create alerts treeview
+                alerts_tree, _ = gui.tab_factory.create_tree_with_scrollbar(
+                    alerts_frame,
+                    columns=("message", "rule", "timestamp"),
+                    headings=["Alert Message", "Rule", "Timestamp"],
+                    widths=[300, 150, 150],
+                    height=10
+                )
+                
+                # Populate alerts
+                alerts = data.get("alerts", [])
+                for alert_message, rule_name, timestamp in alerts:
+                    # Format timestamp
+                    if isinstance(timestamp, (int, float)):
+                        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+                    
+                    alerts_tree.insert("", "end", values=(alert_message, rule_name, timestamp))
+                
+                # JSON details tab if available
+                if details:
+                    import json
+                    try:
+                        # Try to parse the JSON details
+                        json_data = json.loads(details)
+                        
+                        json_frame = ttk.Frame(notebook, padding=10)
+                        notebook.add(json_frame, text="Raw Details")
+                        
+                        # Create text widget with scrollbar for JSON data
+                        json_text = tk.Text(json_frame, wrap="word", height=15)
+                        json_scroll = ttk.Scrollbar(json_frame, orient="vertical", command=json_text.yview)
+                        json_text.configure(yscrollcommand=json_scroll.set)
+                        
+                        json_scroll.pack(side="right", fill="y")
+                        json_text.pack(side="left", fill="both", expand=True)
+                        
+                        # Insert formatted JSON
+                        json_text.insert("1.0", json.dumps(json_data, indent=2))
+                        json_text.configure(state="disabled")  # Make read-only
+                    except:
+                        pass  # Skip JSON tab if parsing fails
+            else:
+                ttk.Label(main_frame, text="No threat intelligence data available for this IP", 
+                         font=("TkDefaultFont", 10, "italic")).pack(pady=20)
+                
+                # Show geolocation if available
+                if geolocation or location:
+                    ttk.Label(main_frame, text="Geolocation Information:", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(20, 5))
+                    
+                    geo_frame = ttk.Frame(main_frame)
+                    geo_frame.pack(fill="x", expand=False, pady=5)
+                    
+                    # Merge geolocation data from database and cached lookups
+                    country = geolocation[0] if geolocation else location.get("country", "Unknown")
+                    region = geolocation[1] if geolocation else location.get("region", "Unknown")
+                    city = geolocation[2] if geolocation else location.get("city", "Unknown")
+                    
+                    geo_info = f"Location: {city or 'Unknown'}, {region or 'Unknown'}, {country or 'Unknown'}"
+                    
+                    # ASN information
+                    asn = geolocation[3] if geolocation else location.get("asn", "Unknown")
+                    asn_name = geolocation[4] if geolocation else location.get("as_org", "Unknown")
+                    network_info = f"Network: ASN {asn or 'Unknown'} - {asn_name or 'Unknown'}"
+                    
+                    # Coordinates
+                    latitude = location.get("latitude", 0)
+                    longitude = location.get("longitude", 0)
+                    coord_info = f"Coordinates: {latitude:.4f}, {longitude:.4f}" if latitude or longitude else "Coordinates: Unknown"
+                    
+                    ttk.Label(geo_frame, text=geo_info).pack(anchor="w")
+                    ttk.Label(geo_frame, text=network_info).pack(anchor="w")
+                    ttk.Label(geo_frame, text=coord_info).pack(anchor="w")
+                
+                # Show alerts if available
+                alerts = data.get("alerts", [])
+                if alerts:
+                    ttk.Label(main_frame, text="Recent Alerts:", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(20, 5))
+                    
+                    alerts_frame = ttk.Frame(main_frame)
+                    alerts_frame.pack(fill="both", expand=True)
+                    
+                    # Create alerts treeview
+                    alerts_tree, _ = gui.tab_factory.create_tree_with_scrollbar(
+                        alerts_frame,
+                        columns=("message", "rule", "timestamp"),
+                        headings=["Alert Message", "Rule", "Timestamp"],
+                        widths=[300, 150, 150],
+                        height=10
+                    )
+                    
+                    # Populate alerts
+                    for alert_message, rule_name, timestamp in alerts:
+                        # Format timestamp
+                        if isinstance(timestamp, (int, float)):
+                            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+                        
+                        alerts_tree.insert("", "end", values=(alert_message, rule_name, timestamp))
+        
+        # Action buttons frame
+        action_frame = ttk.Frame(main_frame)
+        action_frame.pack(fill="x", pady=10)
+        
+        # Add Show on Map button
+        ttk.Button(action_frame, text="Show on Map", 
+                  command=lambda: self.show_ip_on_map(ip)).pack(side="left", padx=5)
+        
+        # Add to blocklist button
+        ttk.Button(action_frame, text="Add to Block List", 
+                  command=lambda: self._add_to_blocklist(ip)).pack(side="left", padx=5)
+        
+        # False positive button
+        ttk.Button(action_frame, text="Mark as False Positive", 
+                  command=lambda: gui.ip_manager.mark_as_false_positive(ip)).pack(side="left", padx=5)
+        
+        # Close button
+        ttk.Button(action_frame, text="Close", command=dialog.destroy).pack(side="right", padx=5)
+        
+        # Center the dialog on the parent window
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        x = parent_window.winfo_x() + (parent_window.winfo_width() - width) // 2
+        y = parent_window.winfo_y() + (parent_window.winfo_height() - height) // 2
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        
+        # Wait until the dialog is closed
+        dialog.wait_window()
+    
+    def _add_to_blocklist(self, ip):
+        """Add the IP to a blocklist"""
+        try:
+            # Example implementation - add to a blocklist table or file
+            # This would need to be implemented based on your specific requirements
+            gui.update_output(f"Adding {ip} to blocklist...")
+            
+            # For now, just add an alert recording this action
+            gui.analysis_manager.add_alert(
+                ip_address=ip,
+                alert_message=f"IP manually added to blocklist by user",
+                rule_name="Manual:BlocklistAddition"
+            )
+            
+            # Update threat intel with this information
+            threat_data = {
+                "score": 8.0,  # High score for blocklisted IP
+                "type": "UserBlocklist",
+                "confidence": 1.0,
+                "source": "User",
+                "detection_method": "Manual"
+            }
+            
+            gui.analysis_manager.update_threat_intel(ip, threat_data)
+            
+            gui.update_output(f"Added {ip} to blocklist successfully")
+            
+            # Refresh the display to reflect changes
+            self.refresh()
+            
+        except Exception as e:
+            gui.update_output(f"Error adding IP to blocklist: {e}")
     
     def show_location_details(self, event):
         """Show details for selected IP location"""
@@ -762,15 +1308,15 @@ class GeoLocationSubtab(SubtabBase):
         try:
             cursor = gui.analysis_manager.get_cursor()
             
-            # Get alert count
+            # Get alert count from x_alerts table
             count = cursor.execute(
-                "SELECT COUNT(*) FROM alerts WHERE ip_address = ?", 
+                "SELECT COUNT(*) FROM x_alerts WHERE ip_address = ?", 
                 (ip,)
             ).fetchone()[0]
             
             # Get most recent alert timestamp
             cursor.execute(
-                "SELECT timestamp FROM alerts WHERE ip_address = ? ORDER BY timestamp DESC LIMIT 1",
+                "SELECT timestamp FROM x_alerts WHERE ip_address = ? ORDER BY timestamp DESC LIMIT 1",
                 (ip,)
             )
             result = cursor.fetchone()
@@ -790,10 +1336,44 @@ class GeoLocationSubtab(SubtabBase):
         """Update the location details with alert and connection information"""
         alert_count, last_seen = alert_info
         
+        # Get threat score from x_ip_threat_intel
+        gui.analysis_manager.queue_query(
+            lambda: self._get_ip_threat_score(ip),
+            lambda threat_score: self._continue_location_details(ip, location, alert_info, threat_score)
+        )
+    
+    def _get_ip_threat_score(self, ip):
+        """Get threat score for an IP from the x_ip_threat_intel table"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            
+            # Query threat score
+            cursor.execute("""
+                SELECT threat_score, threat_type, source, detection_method
+                FROM x_ip_threat_intel
+                WHERE ip_address = ?
+            """, (ip,))
+            
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if result:
+                return result
+            else:
+                return (0, "None", "None", "None")
+        except Exception as e:
+            gui.update_output(f"Error getting threat score: {e}")
+            return (0, "Error", "Error", "Error")
+    
+    def _continue_location_details(self, ip, location, alert_info, threat_info):
+        """Continue updating location details with threat and connection information"""
+        alert_count, last_seen = alert_info
+        threat_score, threat_type, threat_source, detection_method = threat_info
+        
         # Get connection count information using analysis_manager
         gui.analysis_manager.queue_query(
             lambda: self._get_ip_connection_data(ip),
-            lambda result: self._update_connection_details(ip, location, alert_info, result)
+            lambda result: self._update_connection_details(ip, location, alert_info, threat_info, result)
         )
     
     def _get_ip_connection_data(self, ip):
@@ -831,9 +1411,10 @@ class GeoLocationSubtab(SubtabBase):
             gui.update_output(f"Error getting connection data: {e}")
             return 0, 0, 0, 0
 
-    def _update_connection_details(self, ip, location, alert_info, connection_data):
+    def _update_connection_details(self, ip, location, alert_info, threat_info, connection_data):
         """Update the details with connection information"""
         alert_count, last_seen = alert_info
+        threat_score, threat_type, threat_source, detection_method = threat_info
         src_count, dst_count, dns_count, tls_count = connection_data
         
         # Database source info
@@ -846,6 +1427,15 @@ class GeoLocationSubtab(SubtabBase):
         asn = location.get("asn")
         as_org = location.get("as_org", "Unknown")
         asn_detail = f"AS{asn} - {as_org}" if asn else as_org
+        
+        # Format threat score
+        if threat_score:
+            try:
+                threat_score_str = f"{float(threat_score):.1f}"
+            except (ValueError, TypeError):
+                threat_score_str = str(threat_score)
+        else:
+            threat_score_str = "0.0"
         
         # Prepare details data
         details = [
@@ -860,6 +1450,11 @@ class GeoLocationSubtab(SubtabBase):
             ("Timezone", location.get("timezone", "Unknown")),
             ("Network Type", "Local Network" if location.get("is_local", False) else "External Network"),
             ("Autonomous System", asn_detail),
+            ("", ""),  # Separator
+            ("Threat Score", threat_score_str),
+            ("Threat Type", threat_type if threat_type and threat_type != "None" else "Unknown"),
+            ("Threat Source", threat_source if threat_source and threat_source != "None" else "N/A"),
+            ("Detection Method", detection_method if detection_method and detection_method != "None" else "N/A"),
             ("", ""),  # Separator
             ("Alert Count", str(alert_count)),
             ("Last Seen", last_seen),
@@ -887,9 +1482,10 @@ class GeoLocationSubtab(SubtabBase):
         try:
             cursor = gui.analysis_manager.get_cursor()
             
+            # Updated to use x_alerts table
             rows = cursor.execute("""
                 SELECT rule_name, COUNT(*) as count
-                FROM alerts
+                FROM x_alerts
                 WHERE ip_address = ?
                 GROUP BY rule_name
                 ORDER BY count DESC
@@ -914,7 +1510,17 @@ class GeoLocationSubtab(SubtabBase):
         for rule_name, count in rows:
             gui.tree_manager.populate_tree(self.geo_details_tree, [(f"  {rule_name}", str(count))])
     
-    def show_map(self):
+    def show_ip_on_map(self, ip):
+        """Show a single IP on the map"""
+        if not ip:
+            gui.update_output("No IP selected")
+            return
+            
+        # Create a list with just this IP and pass to show_map
+        selected_ips = [ip]
+        self.show_map(selected_ips)
+    
+    def show_map(self, selected_ips=None):
         """Show world map with alert locations using downloaded or local map image"""
         if not self.city_reader and not self.country_reader:
             messagebox.showwarning("No GeoIP Database", 
@@ -928,29 +1534,33 @@ class GeoLocationSubtab(SubtabBase):
                               "No map image available. Using a simplified map view.")
             
             # Use the original map drawing code as fallback
-            self._show_simple_map()
+            self._show_simple_map(selected_ips)
             return
             
         # Get data for the map
-        selected_ips = []
-        selected = self.geo_tree.selection()
-        
-        if selected:
-            # If an IP is selected, show just that one
-            ip = self.geo_tree.item(selected[0], "values")[0]
-            selected_ips.append(ip)
-        else:
-            # Otherwise show all visible IPs (up to 30)
-            for item_id in self.geo_tree.get_children()[:30]:
-                ip = self.geo_tree.item(item_id, "values")[0]
+        if not selected_ips:
+            selected_ips = []
+            selected = self.geo_tree.selection()
+            
+            if selected:
+                # If an IP is selected, show just that one
+                ip = self.geo_tree.item(selected[0], "values")[0]
                 selected_ips.append(ip)
+            else:
+                # Otherwise show all visible IPs (up to 30)
+                for item_id in self.geo_tree.get_children()[:30]:
+                    ip = self.geo_tree.item(item_id, "values")[0]
+                    selected_ips.append(ip)
         
         if not selected_ips:
             messagebox.showinfo("No Data", "No IP addresses to display on map")
             return
             
+        # Get parent window reference correctly
+        parent_window = self.tab_frame.winfo_toplevel()
+            
         # Create a map window
-        map_window = tk.Toplevel(gui.master)
+        map_window = tk.Toplevel(parent_window)
         map_window.title("IP Location Map")
         map_window.geometry("1000x700")
         
@@ -986,9 +1596,34 @@ class GeoLocationSubtab(SubtabBase):
         # Draw the map on the canvas
         canvas.create_image(canvas_width/2, canvas_height/2, image=self.map_photo)
         
+        # Track threat scores for legend colors
+        max_score = 0
+        
         # Draw IP locations on the map
+        ip_markers = []
+        shown_ips = 0
+        
         for ip in selected_ips:
+            # Get location and threat data
             location = self.get_ip_location(ip)
+            
+            # Query threat intel data for this IP
+            cursor = gui.analysis_manager.get_cursor()
+            cursor.execute("""
+                SELECT threat_score, threat_type 
+                FROM x_ip_threat_intel 
+                WHERE ip_address = ?
+            """, (ip,))
+            
+            threat_data = cursor.fetchone() or (0, "None")
+            cursor.close()
+            
+            threat_score = threat_data[0] or 0
+            threat_type = threat_data[1] or "None"
+            
+            # Update max score
+            if threat_score > max_score:
+                max_score = threat_score
             
             # Skip IPs with no location data
             if location.get("is_local", False):
@@ -1006,84 +1641,161 @@ class GeoLocationSubtab(SubtabBase):
             x = canvas_width / 2 + (lon / 180.0 * canvas_width / 2)
             y = canvas_height / 2 - (lat / 90.0 * canvas_height / 2)
             
-            # Determine dot color based on database source
-            dot_color = "#ff6666"  # Red for city database
-            if location.get("database") == "Country":
-                dot_color = "#ff9933"  # Orange for country-only lookups
+            # Determine dot color based on threat score and database source
+            dot_color = "#3498db"  # Default blue
+            if threat_score > 6:
+                dot_color = "#e74c3c"  # Red for high threat
+            elif threat_score > 3:
+                dot_color = "#f39c12"  # Orange for medium threat
+            elif location.get("database") == "Country":
+                dot_color = "#95a5a6"  # Gray for country-only lookups
             
+            # Create a slightly larger marker for higher threat scores
+            dot_size = 5
+            if threat_score > 6:
+                dot_size = 7
+            elif threat_score > 3:
+                dot_size = 6
+                
             # Draw dot for IP
-            dot_id = canvas.create_oval(x-5, y-5, x+5, y+5, fill=dot_color, outline="black")
+            dot_id = canvas.create_oval(x-dot_size, y-dot_size, x+dot_size, y+dot_size, 
+                                      fill=dot_color, outline="black")
             
-            # Create tooltip with IP information including AS info
+            # Add alert count indicator if available
+            cursor = gui.analysis_manager.get_cursor()
+            cursor.execute("SELECT COUNT(*) FROM x_alerts WHERE ip_address = ?", (ip,))
+            alert_count = cursor.fetchone()[0]
+            cursor.close()
+            
+            # Create tooltip with IP information including threat score and alert count
             as_info = ""
             if location.get("asn"):
-                as_info = f" - AS{location.get('asn')} ({location.get('as_org', '')})"
+                as_info = f" - AS{location.get('asn')}"
                 
-            tooltip_text = f"{ip}: {location.get('country', '')}/{location.get('city', '')}{as_info}"
+            threat_info = f" (Threat: {threat_score})" if threat_score > 0 else ""
+            alert_info = f" [{alert_count} alerts]" if alert_count > 0 else ""
             
-            # Bind mouse events for tooltip
-            def show_tooltip(event, text=tooltip_text, dot=dot_id):
-                # Create tooltip near the dot
-                x, y = canvas.coords(dot)[:2]
-                tip = canvas.create_text(x+10, y-15, text=text, fill="black", 
-                                         font=("Arial", 8), anchor="w",
-                                         tags=f"tooltip_{dot}")
-                # Create background for better readability
-                bbox = canvas.bbox(tip)
-                bg = canvas.create_rectangle(bbox, fill="white", outline="black", 
-                                           tags=f"tooltip_bg_{dot}")
-                canvas.tag_lower(bg, tip)
+            tooltip_text = (f"{ip}: {location.get('country', '')}/{location.get('city', '')}"
+                          f"{as_info}{threat_info}{alert_info}")
             
-            def hide_tooltip(event, dot=dot_id):
-                # Remove the tooltip
-                canvas.delete(f"tooltip_{dot}")
-                canvas.delete(f"tooltip_bg_{dot}")
+            # Create a smaller label with just the IP under the dot
+            if len(selected_ips) < 10:  # Only show labels if not too many IPs
+                canvas.create_text(x, y+dot_size+10, text=ip, font=("Arial", 8))
             
-            canvas.tag_bind(dot_id, "<Enter>", show_tooltip)
-            canvas.tag_bind(dot_id, "<Leave>", hide_tooltip)
+            # Store IP marker info
+            ip_markers.append((dot_id, tooltip_text, x, y))
+            shown_ips += 1
+        
+        # Add hover tooltips
+        def show_tooltip(event):
+            # Find which dot is under the cursor
+            x, y = event.x, event.y
+            for dot_id, text, dot_x, dot_y in ip_markers:
+                bbox = canvas.bbox(dot_id)
+                if bbox and bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]:
+                    # Create tooltip near the dot
+                    tip = canvas.create_text(dot_x+10, dot_y-15, text=text, fill="black", 
+                                           font=("Arial", 8), anchor="w",
+                                           tags="tooltip")
+                    # Create background for better readability
+                    bbox = canvas.bbox(tip)
+                    bg = canvas.create_rectangle(bbox, fill="white", outline="black", 
+                                               tags="tooltip_bg")
+                    canvas.tag_lower(bg, tip)
+                    break
+        
+        def hide_tooltip(event):
+            # Remove all tooltips
+            canvas.delete("tooltip")
+            canvas.delete("tooltip_bg")
+        
+        canvas.bind("<Motion>", show_tooltip)
+        canvas.bind("<Leave>", hide_tooltip)
         
         # Add a legend
         legend_frame = ttk.LabelFrame(map_window, text="Legend")
         legend_frame.pack(fill="x", padx=10, pady=5)
         
-        ttk.Label(legend_frame, text="Red: City Database").pack(side="left", padx=20)
-        ttk.Label(legend_frame, text="Orange: Country Database").pack(side="left", padx=20)
-        ttk.Label(legend_frame, text="Local/Private IPs not shown").pack(side="left", padx=20)
+        # Create a frame for color key items
+        color_frame = ttk.Frame(legend_frame)
+        color_frame.pack(side="left", padx=10, pady=5)
+        
+        # Add color legend items
+        def add_color_item(parent, color, label):
+            frame = ttk.Frame(parent)
+            frame.pack(side="left", padx=10)
+            
+            canvas = tk.Canvas(frame, width=16, height=16, highlightthickness=0)
+            canvas.pack(side="left")
+            canvas.create_oval(2, 2, 14, 14, fill=color, outline="black")
+            
+            ttk.Label(frame, text=label).pack(side="left", padx=2)
+        
+        add_color_item(color_frame, "#e74c3c", "High Threat (>6)")
+        add_color_item(color_frame, "#f39c12", "Medium Threat (>3)")
+        add_color_item(color_frame, "#3498db", "Low/No Threat")
+        add_color_item(color_frame, "#95a5a6", "Country-level Only")
         
         # Add stats about shown IPs
-        shown_ips = sum(1 for ip in selected_ips 
-                       if not self.get_ip_location(ip).get("is_local", False) 
-                       and (self.get_ip_location(ip).get("latitude", 0) != 0 
-                            or self.get_ip_location(ip).get("longitude", 0) != 0))
-                       
         ttk.Label(legend_frame, 
                  text=f"Showing {shown_ips} of {len(selected_ips)} IP addresses").pack(side="right", padx=20)
         
+        # Add buttons frame
+        button_frame = ttk.Frame(map_window)
+        button_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Add save button
+        def save_map():
+            try:
+                from tkinter import filedialog
+                file_path = filedialog.asksaveasfilename(
+                    defaultextension=".png",
+                    filetypes=[("PNG Image", "*.png"), ("All Files", "*.*")],
+                    title="Save Map As"
+                )
+                if file_path:
+                    # Create a PostScript file
+                    ps_data = canvas.postscript(colormode="color")
+                    
+                    # Convert PostScript to image using PIL
+                    img = Image.open(io.BytesIO(ps_data.encode('utf-8')))
+                    img.save(file_path, "PNG")
+                    
+                    messagebox.showinfo("Save Complete", f"Map saved to {file_path}")
+            except Exception as e:
+                messagebox.showerror("Save Error", f"Error saving map: {e}")
+        
+        ttk.Button(button_frame, text="Save Map Image", command=save_map).pack(side="left", padx=5)
+        
         # Add close button
-        ttk.Button(map_window, text="Close", command=map_window.destroy).pack(pady=10)
+        ttk.Button(button_frame, text="Close", command=map_window.destroy).pack(side="right", padx=5)
     
-    def _show_simple_map(self):
+    def _show_simple_map(self, selected_ips=None):
         """Fallback method that shows a simple drawn map if no image is available"""
         # Get data for the map
-        selected_ips = []
-        selected = self.geo_tree.selection()
-        
-        if selected:
-            # If an IP is selected, show just that one
-            ip = self.geo_tree.item(selected[0], "values")[0]
-            selected_ips.append(ip)
-        else:
-            # Otherwise show all visible IPs (up to 20)
-            for item_id in self.geo_tree.get_children()[:20]:
-                ip = self.geo_tree.item(item_id, "values")[0]
+        if not selected_ips:
+            selected_ips = []
+            selected = self.geo_tree.selection()
+            
+            if selected:
+                # If an IP is selected, show just that one
+                ip = self.geo_tree.item(selected[0], "values")[0]
                 selected_ips.append(ip)
+            else:
+                # Otherwise show all visible IPs (up to 20)
+                for item_id in self.geo_tree.get_children()[:20]:
+                    ip = self.geo_tree.item(item_id, "values")[0]
+                    selected_ips.append(ip)
         
         if not selected_ips:
             messagebox.showinfo("No Data", "No IP addresses to display on map")
             return
             
+        # Get parent window reference correctly
+        parent_window = self.tab_frame.winfo_toplevel()
+            
         # Create a map window
-        map_window = tk.Toplevel(gui.master)
+        map_window = tk.Toplevel(parent_window)
         map_window.title("IP Location Map")
         map_window.geometry("800x600")
         
@@ -1119,7 +1831,22 @@ class GeoLocationSubtab(SubtabBase):
         # Draw IP locations on the map
         ip_count = 0
         for ip in selected_ips:
+            # Fetch location and threat data
             location = self.get_ip_location(ip)
+            
+            # Query threat intel from x_ip_threat_intel
+            cursor = gui.analysis_manager.get_cursor()
+            cursor.execute("""
+                SELECT threat_score, threat_type 
+                FROM x_ip_threat_intel 
+                WHERE ip_address = ?
+            """, (ip,))
+            
+            threat_data = cursor.fetchone() or (0, "None")
+            cursor.close()
+            
+            threat_score = threat_data[0] or 0
+            threat_type = threat_data[1] or "None"
             
             # Skip local IPs
             if location.get("is_local", False):
@@ -1137,10 +1864,14 @@ class GeoLocationSubtab(SubtabBase):
             x = 400 + (lon / 180.0 * 350)
             y = 300 - (lat / 90.0 * 250)
             
-            # Determine dot color based on database source
-            dot_color = "red"
-            if location.get("database") == "Country":
-                dot_color = "orange"  # Use orange for country-only lookups
+            # Determine dot color based on threat score
+            dot_color = "blue"  # Default color
+            if threat_score > 6:
+                dot_color = "red"  # High threat
+            elif threat_score > 3:
+                dot_color = "orange"  # Medium threat
+            elif location.get("database") == "Country":
+                dot_color = "gray"  # Country-only lookup
             
             # Draw dot for IP
             canvas.create_oval(x-5, y-5, x+5, y+5, fill=dot_color, outline="black")
@@ -1148,27 +1879,60 @@ class GeoLocationSubtab(SubtabBase):
             # Draw IP label
             canvas.create_text(x, y-15, text=ip, font=("Arial", 8))
             
+            # Get alert count
+            cursor = gui.analysis_manager.get_cursor()
+            cursor.execute("SELECT COUNT(*) FROM x_alerts WHERE ip_address = ?", (ip,))
+            alert_count = cursor.fetchone()[0]
+            cursor.close()
+            
             # Get AS info for label
             as_info = ""
             if location.get("asn"):
                 as_info = f" (AS{location.get('asn')})"
             
+            # Format threat and alert info
+            threat_info = f"Threat:{threat_score:.1f}" if threat_score > 0 else ""
+            alert_info = f"Alerts:{alert_count}" if alert_count > 0 else ""
+            
+            # Combine threat and alert info
+            stats_info = ""
+            if threat_info and alert_info:
+                stats_info = f" [{threat_info}, {alert_info}]"
+            elif threat_info:
+                stats_info = f" [{threat_info}]"
+            elif alert_info:
+                stats_info = f" [{alert_info}]"
+            
             # Draw country/city/AS label if available
-            location_text = f"{location.get('country', '')}/{location.get('city', '')}{as_info}"
+            location_text = f"{location.get('country', '')}/{location.get('city', '')}{as_info}{stats_info}"
             if location_text != "/":
                 canvas.create_text(x, y+15, text=location_text, font=("Arial", 8))
                 
             ip_count += 1
         
         # Add a legend
-        canvas.create_text(100, 50, text="IP Location Map", font=("Arial", 12, "bold"), anchor="w")
-        canvas.create_oval(100, 65, 110, 75, fill="red", outline="black")
-        canvas.create_text(120, 70, text="IP Location (City DB)", font=("Arial", 10), anchor="w")
+        canvas.create_text(100, 30, text="IP Location Map", font=("Arial", 12, "bold"), anchor="w")
         
-        canvas.create_oval(100, 85, 110, 95, fill="orange", outline="black")
-        canvas.create_text(120, 90, text="IP Location (Country DB only)", font=("Arial", 10), anchor="w")
+        # Draw color legend
+        x_pos = 100
+        y_pos = 70
         
-        canvas.create_text(400, 30, text="Simplified Map (Local IPs not shown)", 
+        canvas.create_oval(x_pos, y_pos-5, x_pos+10, y_pos+5, fill="red", outline="black")
+        canvas.create_text(x_pos+15, y_pos, text="High Threat (>6)", font=("Arial", 8), anchor="w")
+        
+        x_pos += 100
+        canvas.create_oval(x_pos, y_pos-5, x_pos+10, y_pos+5, fill="orange", outline="black")
+        canvas.create_text(x_pos+15, y_pos, text="Medium Threat (>3)", font=("Arial", 8), anchor="w")
+        
+        x_pos += 120
+        canvas.create_oval(x_pos, y_pos-5, x_pos+10, y_pos+5, fill="blue", outline="black")
+        canvas.create_text(x_pos+15, y_pos, text="Low/No Threat", font=("Arial", 8), anchor="w")
+        
+        x_pos += 100
+        canvas.create_oval(x_pos, y_pos-5, x_pos+10, y_pos+5, fill="gray", outline="black")
+        canvas.create_text(x_pos+15, y_pos, text="Country DB only", font=("Arial", 8), anchor="w")
+        
+        canvas.create_text(400, 50, text="Simplified Map (Local IPs not shown)", 
                           font=("Arial", 10, "italic"))
         
         # Add close button

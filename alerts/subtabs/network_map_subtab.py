@@ -24,6 +24,7 @@ class NetworkMapSubtab(SubtabBase):
         self.show_external = tk.BooleanVar(value=True)
         self.group_by_subnet = tk.BooleanVar(value=True)
         self.show_service_labels = tk.BooleanVar(value=True)
+        self.show_threat_intel = tk.BooleanVar(value=True)
         self.node_spacing = tk.IntVar(value=150)
         
         # Data storage
@@ -48,6 +49,8 @@ class NetworkMapSubtab(SubtabBase):
             "cloud": "#F0F8FF",       # Alice Blue (for cloud/external)
             "selected": "#00CED1",    # Dark Turquoise (for selected node)
             "background": "#FFFFFF",  # White (background)
+            "threat": "#FF0000",      # Red (for threats)
+            "warning": "#FFA500",     # Orange (for warnings)
         }
         
         # Statistics
@@ -56,7 +59,8 @@ class NetworkMapSubtab(SubtabBase):
             "wan_connections": 0,
             "gateways": 0,
             "firewalls": 0,
-            "servers": 0
+            "servers": 0,
+            "threats": 0
         }
     
     def create_ui(self):
@@ -106,7 +110,8 @@ class NetworkMapSubtab(SubtabBase):
             ("wan_connections", "WAN Connections:"),
             ("gateways", "Gateways/Routers:"),
             ("firewalls", "Firewalls:"),
-            ("servers", "Servers:")
+            ("servers", "Servers:"),
+            ("threats", "Threat Indicators:")
         ]):
             ttk.Label(stats_frame, text=label_text).grid(row=i, column=0, sticky="w", padx=5, pady=2)
             self.stats_labels[stat_key] = ttk.Label(stats_frame, text="0")
@@ -128,6 +133,10 @@ class NetworkMapSubtab(SubtabBase):
                       variable=self.show_service_labels,
                       command=self.redraw_network).pack(anchor="w", padx=5, pady=3)
         
+        ttk.Checkbutton(options_frame, text="Show Threat Intelligence", 
+                      variable=self.show_threat_intel,
+                      command=self.redraw_network).pack(anchor="w", padx=5, pady=3)
+        
         ttk.Label(options_frame, text="Node Spacing:").pack(anchor="w", padx=5, pady=3)
         ttk.Scale(options_frame, from_=80, to=200, variable=self.node_spacing, 
                 orient="horizontal", command=lambda s: self.redraw_network()).pack(fill="x", padx=5, pady=3)
@@ -137,12 +146,12 @@ class NetworkMapSubtab(SubtabBase):
         legend_frame.pack(fill="x", padx=5, pady=5)
         
         # Create small canvas for legend
-        legend_canvas = tk.Canvas(legend_frame, height=160, bg=self.colors["background"])
+        legend_canvas = tk.Canvas(legend_frame, height=180, bg=self.colors["background"])
         legend_canvas.pack(fill="x", padx=5, pady=5)
         
         # Add legend items
         y_offset = 20
-        for node_type in ["gateway", "border", "firewall", "vpn", "lan", "server", "cloud"]:
+        for node_type in ["gateway", "border", "firewall", "vpn", "lan", "server", "cloud", "threat"]:
             # Draw colored circle
             legend_canvas.create_oval(10, y_offset-8, 26, y_offset+8, 
                                     fill=self.colors[node_type], outline="black")
@@ -240,7 +249,19 @@ class NetworkMapSubtab(SubtabBase):
                 if "ip" in node and node["ip"] in self.arp_relationships:
                     menu.add_command(label="Show ARP Relationships", 
                                    command=lambda: self.show_arp_details(node["ip"]))
-                                   
+                
+                # Add threat intel options if available
+                if "threat_score" in node and node["threat_score"] > 0:
+                    menu.add_separator()
+                    menu.add_command(label="Show Threat Details",
+                                   command=lambda: self.show_threat_details(node["ip"]))
+                    menu.add_command(label="Report False Positive",
+                                   command=lambda: self.report_false_positive(node["ip"]))
+                elif "ip" in node:
+                    menu.add_separator()
+                    menu.add_command(label="Check Threat Intelligence",
+                                   command=lambda: self.check_threat_intel(node["ip"]))
+                
                 # Add other options
                 menu.add_separator()
                 menu.add_command(label="Center View on This Node", 
@@ -310,25 +331,34 @@ class NetworkMapSubtab(SubtabBase):
         self.canvas.xview_moveto(0)
         self.canvas.yview_moveto(0)
     
-    def refresh(self):
-        """Refresh the network map data and visualization"""
-        # Check refresh interval
-        current_time = time.time()
-        if (current_time - self.last_refresh_time) < self.refresh_interval and self.nodes:
-            self.update_output(f"Network map will refresh in {int(self.refresh_interval - (current_time - self.last_refresh_time))} seconds")
-            return
+    def refresh(self, ip_filter=None):
+        """Refresh the network map with actual database queries"""
+        # Clear existing data
+        self.nodes = {}
+        self.edges = []
+        self.arp_relationships = {}
+        self.gateways = []
         
-        self.last_refresh_time = current_time
-        self.update_output("Refreshing network map...")
+        # Get network data from the database
+        network_data = self.get_network_data()
         
-        # Queue database query through analysis_manager instead of db_manager
-        if hasattr(gui, 'analysis_manager'):
-            gui.analysis_manager.queue_query(
-                self.get_network_data,
-                callback=self.process_network_data
-            )
+        # Process the data to build topology
+        if network_data:
+            self.process_network_data(network_data)
         else:
-            self.update_output("Error: Analysis manager not available")
+            self.update_output("No network data available. Check database connection.")
+        
+        # Update statistics display
+        self.update_statistics()
+        
+        # Redraw the network
+        self.redraw_network()
+        
+        # Update the last refresh time
+        self.last_refresh_time = time.time()
+        
+        self.update_output("Network map refreshed")
+
     
     def get_network_data(self):
         """Get required network data from the database, including TTL and ARP data"""
@@ -339,7 +369,7 @@ class NetworkMapSubtab(SubtabBase):
             # Get connections data with TTL values
             connections_query = """
                 SELECT src_ip, dst_ip, src_port, dst_port, total_bytes, 
-                       packet_count, protocol, ttl
+                    packet_count, protocol, ttl
                 FROM connections
                 ORDER BY total_bytes DESC
                 LIMIT 1000
@@ -373,6 +403,44 @@ class NetworkMapSubtab(SubtabBase):
             """
             http_data = cursor.execute(http_query, (time.time() - 86400,)).fetchall()
             
+            # Get threat intelligence data
+            threat_intel_query = """
+                SELECT ip_address, threat_score, threat_type, details, 
+                    detection_method, protocol
+                FROM x_ip_threat_intel
+                WHERE threat_score > 0
+            """
+            try:
+                threat_data = cursor.execute(threat_intel_query).fetchall()
+            except Exception as e:
+                self.update_output(f"Info: Threat intel not available: {e}")
+                threat_data = []
+            
+            # Get geolocation data
+            geo_query = """
+                SELECT ip_address, country, region, city, 
+                    latitude, longitude, asn_name
+                FROM x_ip_geolocation
+            """
+            try:
+                geo_data = cursor.execute(geo_query).fetchall()
+            except Exception as e:
+                self.update_output(f"Info: Geolocation data not available: {e}")
+                geo_data = []
+            
+            # Get alerts related to network topology
+            alerts_query = """
+                SELECT ip_address, alert_message, rule_name, timestamp
+                FROM x_alerts
+                WHERE rule_name IN ('network_anomaly', 'network_topology')
+                ORDER BY timestamp DESC
+            """
+            try:
+                network_alerts = cursor.execute(alerts_query).fetchall()
+            except Exception as e:
+                self.update_output(f"Info: Alert data not available: {e}")
+                network_alerts = []
+            
             # Close the cursor
             cursor.close()
             
@@ -380,7 +448,10 @@ class NetworkMapSubtab(SubtabBase):
                 "connections": connections,
                 "arp_data": arp_data,
                 "dns_data": dns_data,
-                "http_data": http_data
+                "http_data": http_data,
+                "threat_data": threat_data,
+                "geo_data": geo_data,
+                "network_alerts": network_alerts
             }
         except Exception as e:
             self.update_output(f"Error fetching network data: {e}")
@@ -416,13 +487,52 @@ class NetworkMapSubtab(SubtabBase):
                 local_ranges
             )
             
+            # Process geolocation data
+            geo_lookup = {}
+            if "geo_data" in data and data["geo_data"]:
+                for geo_entry in data["geo_data"]:
+                    if len(geo_entry) >= 3:
+                        ip = geo_entry[0]
+                        geo_lookup[ip] = {
+                            "country": geo_entry[1],
+                            "region": geo_entry[2],
+                            "city": geo_entry[3] if len(geo_entry) > 3 else None,
+                            "latitude": geo_entry[4] if len(geo_entry) > 4 else None,
+                            "longitude": geo_entry[5] if len(geo_entry) > 5 else None,
+                            "asn_name": geo_entry[6] if len(geo_entry) > 6 else None
+                        }
+            
+            # Process threat intelligence data
+            threat_lookup = {}
+            if "threat_data" in data and data["threat_data"]:
+                for threat_entry in data["threat_data"]:
+                    if len(threat_entry) >= 3:
+                        ip = threat_entry[0]
+                        try:
+                            details = json.loads(threat_entry[3]) if len(threat_entry) > 3 and threat_entry[3] else {}
+                        except:
+                            details = {}
+                            
+                        threat_lookup[ip] = {
+                            "threat_score": threat_entry[1],
+                            "threat_type": threat_entry[2],
+                            "details": details,
+                            "detection_method": threat_entry[4] if len(threat_entry) > 4 else None,
+                            "protocol": threat_entry[5] if len(threat_entry) > 5 else None
+                        }
+                        
+                        # Count threats for statistics
+                        self.stats["threats"] += 1
+            
             # Process connections to build topology
             self.build_network_topology(
                 data["connections"], 
                 data["dns_data"], 
                 data["http_data"], 
                 local_ranges, 
-                gateway_ips
+                gateway_ips,
+                geo_lookup,
+                threat_lookup
             )
             
             # Apply layout
@@ -439,7 +549,304 @@ class NetworkMapSubtab(SubtabBase):
             self.update_output(f"Error processing network data: {e}")
             import traceback
             traceback.print_exc()
+
+    def update_statistics(self):
+        """Update the network statistics display"""
+        # Count different node types
+        self.stats = {
+            "lan_devices": sum(1 for node in self.nodes.values() if node["type"] == "lan"),
+            "wan_connections": sum(1 for edge in self.edges if edge.get("type") == "wan"),
+            "gateways": sum(1 for node in self.nodes.values() if node["type"] in ["gateway", "border"]),
+            "firewalls": sum(1 for node in self.nodes.values() if node["type"] == "firewall"),
+            "servers": sum(1 for node in self.nodes.values() if node["type"] == "server"),
+            "threats": sum(1 for node in self.nodes.values() if "threat_score" in node and node["threat_score"] > 50)
+        }
+        
+        # Update the statistics labels if they exist
+        if hasattr(self, 'stats_labels'):
+            for stat_key, label in self.stats_labels.items():
+                if stat_key in self.stats:
+                    label.config(text=str(self.stats[stat_key]))
+
+    def apply_hierarchical_layout(self):
+        """Apply hierarchical layout like in the example image"""
+        # Get canvas dimensions
+        canvas_width = self.canvas.winfo_width() or 800
+        canvas_height = self.canvas.winfo_height() or 600
+        center_x = canvas_width / 2
+        
+        # Node spacing
+        spacing = self.node_spacing.get()
+        
+        # Group nodes by type and parent
+        node_groups = {
+            "border": [],     # Border gateway
+            "gateway": [],    # Additional gateways
+            "firewall": [],   # Firewall
+            "vpn": [],        # VPN tunnel
+            "subnet": [],     # Subnet groups
+            "lan": [],        # LAN devices not in subnets
+            "server": [],     # Servers
+            "cloud": []       # External/cloud
+        }
+        
+        # Subnet children mapping
+        subnet_children = {}
+        
+        for node_id, node in self.nodes.items():
+            node_type = node["type"]
+            
+            # Special handling for subnets
+            if node_type == "lan" and node_id.startswith("subnet_"):
+                node_groups["subnet"].append(node_id)
+                subnet_children[node_id] = []
+            elif "parent" in node and node["parent"] in subnet_children:
+                subnet_children[node["parent"]].append(node_id)
+            elif node_type in node_groups:
+                node_groups[node_type].append(node_id)
+            else:
+                node_groups["lan"].append(node_id)
+        
+        # Track current vertical position
+        current_y = 60
+        
+        # 1. Place border gateway at top center
+        border_id = None
+        if node_groups["border"]:
+            border_id = node_groups["border"][0]
+            self.nodes[border_id]["x"] = center_x
+            self.nodes[border_id]["y"] = current_y
+        
+        # 2. Place firewall below border
+        firewall_y = None
+        if node_groups["firewall"]:
+            current_y += spacing
+            firewall_id = node_groups["firewall"][0]
+            self.nodes[firewall_id]["x"] = center_x
+            self.nodes[firewall_id]["y"] = current_y
+            firewall_y = current_y
+        
+        # 3. Place additional gateways to the sides of the border
+        if node_groups["gateway"]:
+            gateway_y = current_y
+            gateway_count = len(node_groups["gateway"])
+            gateway_width = gateway_count * spacing * 1.5
+            gateway_start_x = center_x - gateway_width / 2 + spacing * 0.75
+            
+            for i, gateway_id in enumerate(node_groups["gateway"]):
+                gateway_x = gateway_start_x + i * spacing * 1.5
+                self.nodes[gateway_id]["x"] = gateway_x
+                self.nodes[gateway_id]["y"] = gateway_y
+        
+        # 4. Place VPN tunnel to the right of firewall
+        if node_groups["vpn"]:
+            vpn_id = node_groups["vpn"][0]
+            vpn_y = firewall_y if firewall_y else current_y
+            self.nodes[vpn_id]["x"] = center_x + spacing * 2
+            self.nodes[vpn_id]["y"] = vpn_y
+        
+        # 5. Place subnet nodes in a row
+        current_y += spacing * 1.5
+        subnet_count = len(node_groups["subnet"])
+        if subnet_count > 0:
+            subnet_width = subnet_count * spacing * 1.5
+            subnet_start_x = center_x - subnet_width / 2 + spacing * 0.75
+            
+            for i, subnet_id in enumerate(node_groups["subnet"]):
+                subnet_x = subnet_start_x + i * spacing * 1.5
+                self.nodes[subnet_id]["x"] = subnet_x
+                self.nodes[subnet_id]["y"] = current_y
+                
+                # Place subnet children in a cluster around the subnet
+                self.place_subnet_children(subnet_id, subnet_children[subnet_id], subnet_x, current_y, spacing * 0.8)
+        
+        # 6. Place LAN devices in a row below
+        current_y += spacing * 2
+        lan_count = len(node_groups["lan"])
+        if lan_count > 0:
+            # Arrange in a balanced grid
+            cols = min(max(int(math.sqrt(lan_count)), 1), 8)  # At most 8 columns
+            rows = math.ceil(lan_count / cols)
+            
+            lan_width = cols * spacing * 1.5
+            lan_start_x = center_x - lan_width / 2 + spacing * 0.75
+            
+            for i, node_id in enumerate(node_groups["lan"]):
+                row = i // cols
+                col = i % cols
+                self.nodes[node_id]["x"] = lan_start_x + col * spacing * 1.5
+                self.nodes[node_id]["y"] = current_y + row * spacing
+        
+        # 7. Place servers in a row below LAN devices
+        current_y += (rows if lan_count > 0 else 0) * spacing + spacing * 1.5
+        server_count = len(node_groups["server"])
+        if server_count > 0:
+            server_width = server_count * spacing * 1.5
+            server_start_x = center_x - server_width / 2 + spacing * 0.75
+            
+            for i, node_id in enumerate(node_groups["server"]):
+                self.nodes[node_id]["x"] = server_start_x + i * spacing * 1.5
+                self.nodes[node_id]["y"] = current_y
+        
+        # 8. Place cloud/external nodes at the bottom
+        current_y += spacing * 2
+        cloud_count = len(node_groups["cloud"])
+        if cloud_count > 0:
+            # Use multiple rows if many cloud nodes
+            cols = min(max(int(math.sqrt(cloud_count)), 1), 10)  # More columns for cloud
+            rows = math.ceil(cloud_count / cols)
+            
+            cloud_width = cols * spacing * 1.2
+            cloud_start_x = center_x - cloud_width / 2 + spacing * 0.6
+            
+            for i, node_id in enumerate(node_groups["cloud"]):
+                row = i // cols
+                col = i % cols
+                self.nodes[node_id]["x"] = cloud_start_x + col * spacing * 1.2
+                self.nodes[node_id]["y"] = current_y + row * spacing
+
+
+    def place_subnet_children(self, subnet_id, children, subnet_x, subnet_y, radius):
+        """Place children of a subnet in a cluster"""
+        count = len(children)
+        if count == 0:
+            return
+        
+        # Place in a small circle around subnet
+        angle_step = 2 * math.pi / count
+        
+        for i, node_id in enumerate(children):
+            angle = i * angle_step
+            self.nodes[node_id]["x"] = subnet_x + radius * math.cos(angle)
+            self.nodes[node_id]["y"] = subnet_y + radius * math.sin(angle)
+
+    def _position_subnet_children(self, subnet_id, children):
+        """Position children of a subnet node in a nice arrangement"""
+        if not children:
+            return
+            
+        subnet = self.nodes[subnet_id]
+        center_x, center_y = subnet["x"], subnet["y"]
+        
+        # Use a circle layout if fewer than 8 children
+        if len(children) < 8:
+            radius = max(self.node_spacing.get() * 0.7, 80)
+            angle_step = 2 * math.pi / len(children)
+            
+            for i, child_id in enumerate(children):
+                angle = i * angle_step
+                self.nodes[child_id]["x"] = center_x + radius * math.cos(angle)
+                self.nodes[child_id]["y"] = center_y + radius * math.sin(angle) + 50  # Offset to place below subnet node
+        else:
+            # Use a grid layout for many children
+            rows = math.ceil(math.sqrt(len(children)))
+            cols = math.ceil(len(children) / rows)
+            
+            # Calculate grid cell size
+            cell_width = self.node_spacing.get() * 1.2
+            cell_height = self.node_spacing.get() * 1.2
+            
+            # Calculate grid starting position (top-left corner)
+            start_x = center_x - (cols * cell_width) / 2
+            start_y = center_y + 50  # Offset to place below subnet node
+            
+            for i, child_id in enumerate(children):
+                row = i // cols
+                col = i % cols
+                
+                self.nodes[child_id]["x"] = start_x + col * cell_width + cell_width / 2
+                self.nodes[child_id]["y"] = start_y + row * cell_height + cell_height / 2
     
+    def _optimize_layout(self, iterations=10):
+        """Apply force-directed layout to reduce overlapping with more effective forces"""
+        # Minimum distance between nodes
+        min_distance = self.node_radius * 2.5
+        
+        # Scale factor for repulsive forces (higher = stronger repulsion)
+        repulsion_scale = 1.0
+        
+        # Scale for attractive forces (higher = stronger attraction)
+        attraction_scale = 0.3
+        
+        for _ in range(iterations):
+            # Calculate repulsive forces between all pairs of nodes
+            movements = {node_id: {"dx": 0, "dy": 0} for node_id in self.nodes}
+            
+            # Apply repulsive forces
+            for node1_id, node1 in self.nodes.items():
+                for node2_id, node2 in self.nodes.items():
+                    if node1_id == node2_id:
+                        continue
+                        
+                    # Calculate distance and direction
+                    dx = node1["x"] - node2["x"]
+                    dy = node1["y"] - node2["y"]
+                    distance = math.sqrt(dx*dx + dy*dy)
+                    
+                    # Apply stronger repulsion for closer nodes
+                    if distance < min_distance:
+                        # Inverse square repulsion
+                        force = repulsion_scale * min_distance * min_distance / max(distance * distance, 0.1)
+                        
+                        # Normalize direction vector
+                        if distance > 0:
+                            dx = dx / distance
+                            dy = dy / distance
+                        else:
+                            # Random direction if distance is zero
+                            angle = random.uniform(0, 2 * math.pi)
+                            dx = math.cos(angle)
+                            dy = math.sin(angle)
+                        
+                        # Apply force
+                        movements[node1_id]["dx"] += dx * force
+                        movements[node1_id]["dy"] += dy * force
+            
+            # Apply attractive forces for connected nodes
+            for edge in self.edges:
+                if edge["source"] in self.nodes and edge["target"] in self.nodes:
+                    source = self.nodes[edge["source"]]
+                    target = self.nodes[edge["target"]]
+                    
+                    # Calculate distance and direction
+                    dx = source["x"] - target["x"]
+                    dy = source["y"] - target["y"]
+                    distance = math.sqrt(dx*dx + dy*dy)
+                    
+                    # Only apply attraction if nodes are further apart than minimum distance
+                    if distance > min_distance:
+                        # Linear attraction
+                        force = attraction_scale * (distance - min_distance) / 10
+                        
+                        # Normalize direction vector
+                        if distance > 0:
+                            dx = dx / distance
+                            dy = dy / distance
+                        else:
+                            continue
+                        
+                        # Apply force (pull nodes toward each other)
+                        movements[edge["source"]]["dx"] -= dx * force
+                        movements[edge["source"]]["dy"] -= dy * force
+                        movements[edge["target"]]["dx"] += dx * force
+                        movements[edge["target"]]["dy"] += dy * force
+            
+            # Apply all calculated movements with damping
+            damping = 0.8
+            for node_id, move in movements.items():
+                self.nodes[node_id]["x"] += move["dx"] * damping
+                self.nodes[node_id]["y"] += move["dy"] * damping
+            
+            # Prevent nodes from moving outside canvas boundaries
+            margin = self.node_radius * 2
+            canvas_width = 2000  # Use larger virtual canvas
+            canvas_height = 1500
+            
+            for node_id, node in self.nodes.items():
+                node["x"] = max(margin, min(canvas_width - margin, node["x"]))
+                node["y"] = max(margin, min(canvas_height - margin, node["y"]))
+
+
     def process_arp_data(self, arp_data, local_ranges):
         """Process ARP data to build network relationships"""
         if not arp_data:
@@ -597,7 +1004,8 @@ class NetworkMapSubtab(SubtabBase):
         except ValueError:
             return False
     
-    def build_network_topology(self, connections, dns_data, http_data, local_ranges, gateway_ips):
+    def build_network_topology(self, connections, dns_data, http_data, local_ranges, gateway_ips, 
+                              geo_lookup=None, threat_lookup=None):
         """Build network topology using connections, TTL, and ARP data"""
         # Create hostname mappings
         hostname_map = {}
@@ -655,6 +1063,16 @@ class NetworkMapSubtab(SubtabBase):
                 "y": 0
             }
             
+            # Add geo data if available
+            if geo_lookup and border_gateway in geo_lookup:
+                self.nodes[border_gateway]["geo_data"] = geo_lookup[border_gateway]
+            
+            # Add threat data if available
+            if threat_lookup and border_gateway in threat_lookup:
+                self.nodes[border_gateway]["threat_score"] = threat_lookup[border_gateway]["threat_score"]
+                self.nodes[border_gateway]["threat_type"] = threat_lookup[border_gateway]["threat_type"]
+                self.nodes[border_gateway]["threat_details"] = threat_lookup[border_gateway]["details"]
+            
             # Add other gateways if any
             for i, gateway in enumerate(gateway_ips[1:]):
                 gateway_type = "gateway" if i == 0 else "gateway"
@@ -667,6 +1085,16 @@ class NetworkMapSubtab(SubtabBase):
                     "x": 0,
                     "y": 0
                 }
+                
+                # Add geo data if available
+                if geo_lookup and gateway in geo_lookup:
+                    self.nodes[gateway]["geo_data"] = geo_lookup[gateway]
+                
+                # Add threat data if available
+                if threat_lookup and gateway in threat_lookup:
+                    self.nodes[gateway]["threat_score"] = threat_lookup[gateway]["threat_score"]
+                    self.nodes[gateway]["threat_type"] = threat_lookup[gateway]["threat_type"]
+                    self.nodes[gateway]["threat_details"] = threat_lookup[gateway]["details"]
                 
                 # Connect additional gateways to the border gateway
                 self.edges.append({
@@ -815,9 +1243,11 @@ class NetworkMapSubtab(SubtabBase):
                 
                 if src_is_local and src_subnet and f"subnet_{src_subnet}" in self.nodes:
                     # Add to existing subnet
+                    node_type = "server" if self.is_likely_server(src_ip, src_port, dns_map) else "lan"
+                    
                     self.nodes[src_ip] = {
                         "id": src_ip,
-                        "type": "lan",
+                        "type": node_type,
                         "ip": src_ip,
                         "name": self.get_device_name(src_ip, hostname_map, dns_map),
                         "ttl": self.get_ttl_for_ip(connections, src_ip),
@@ -825,6 +1255,16 @@ class NetworkMapSubtab(SubtabBase):
                         "x": 0,
                         "y": 0
                     }
+                    
+                    # Add geo data if available
+                    if geo_lookup and src_ip in geo_lookup:
+                        self.nodes[src_ip]["geo_data"] = geo_lookup[src_ip]
+                    
+                    # Add threat data if available
+                    if threat_lookup and src_ip in threat_lookup:
+                        self.nodes[src_ip]["threat_score"] = threat_lookup[src_ip]["threat_score"]
+                        self.nodes[src_ip]["threat_type"] = threat_lookup[src_ip]["threat_type"]
+                        self.nodes[src_ip]["threat_details"] = threat_lookup[src_ip]["details"]
                     
                     # Connect to subnet
                     self.edges.append({
@@ -838,7 +1278,7 @@ class NetworkMapSubtab(SubtabBase):
                     
                     # Determine server type based on ports
                     if src_is_local and src_port:
-                        if src_port in [80, 443, 25, 21, 22, 3306, 5432]:
+                        if src_port in [80, 443, 25, 21, 22, 3306, 5432] or self.is_likely_server(src_ip, src_port, dns_map):
                             node_type = "server"
                     
                     self.nodes[src_ip] = {
@@ -850,6 +1290,16 @@ class NetworkMapSubtab(SubtabBase):
                         "x": 0,
                         "y": 0
                     }
+                    
+                    # Add geo data if available
+                    if geo_lookup and src_ip in geo_lookup:
+                        self.nodes[src_ip]["geo_data"] = geo_lookup[src_ip]
+                    
+                    # Add threat data if available
+                    if threat_lookup and src_ip in threat_lookup:
+                        self.nodes[src_ip]["threat_score"] = threat_lookup[src_ip]["threat_score"]
+                        self.nodes[src_ip]["threat_type"] = threat_lookup[src_ip]["threat_type"]
+                        self.nodes[src_ip]["threat_details"] = threat_lookup[src_ip]["details"]
                     
                     # Connect to appropriate parent
                     if src_is_local:
@@ -882,9 +1332,11 @@ class NetworkMapSubtab(SubtabBase):
                 
                 if dst_is_local and dst_subnet and f"subnet_{dst_subnet}" in self.nodes:
                     # Add to existing subnet
+                    node_type = "server" if self.is_likely_server(dst_ip, dst_port, dns_map) else "lan"
+                    
                     self.nodes[dst_ip] = {
                         "id": dst_ip,
-                        "type": "lan",
+                        "type": node_type,
                         "ip": dst_ip,
                         "name": self.get_device_name(dst_ip, hostname_map, dns_map),
                         "ttl": self.get_ttl_for_ip(connections, dst_ip),
@@ -892,6 +1344,16 @@ class NetworkMapSubtab(SubtabBase):
                         "x": 0,
                         "y": 0
                     }
+                    
+                    # Add geo data if available
+                    if geo_lookup and dst_ip in geo_lookup:
+                        self.nodes[dst_ip]["geo_data"] = geo_lookup[dst_ip]
+                    
+                    # Add threat data if available
+                    if threat_lookup and dst_ip in threat_lookup:
+                        self.nodes[dst_ip]["threat_score"] = threat_lookup[dst_ip]["threat_score"]
+                        self.nodes[dst_ip]["threat_type"] = threat_lookup[dst_ip]["threat_type"]
+                        self.nodes[dst_ip]["threat_details"] = threat_lookup[dst_ip]["details"]
                     
                     # Connect to subnet
                     self.edges.append({
@@ -905,8 +1367,12 @@ class NetworkMapSubtab(SubtabBase):
                     
                     # Determine server type based on ports
                     if dst_port:
-                        if dst_port in [80, 443, 25, 21, 22, 3306, 5432]:
+                        if dst_port in [80, 443, 25, 21, 22, 3306, 5432] or self.is_likely_server(dst_ip, dst_port, dns_map):
                             node_type = "server"
+                    
+                    # Mark as threat if it's in the threat_lookup
+                    if threat_lookup and dst_ip in threat_lookup and threat_lookup[dst_ip]["threat_score"] > 70:
+                        node_type = "threat" if not dst_is_local else node_type
                     
                     self.nodes[dst_ip] = {
                         "id": dst_ip,
@@ -918,9 +1384,27 @@ class NetworkMapSubtab(SubtabBase):
                         "y": 0
                     }
                     
+                    # Add geo data if available
+                    if geo_lookup and dst_ip in geo_lookup:
+                        self.nodes[dst_ip]["geo_data"] = geo_lookup[dst_ip]
+                    
+                    # Add threat data if available
+                    if threat_lookup and dst_ip in threat_lookup:
+                        self.nodes[dst_ip]["threat_score"] = threat_lookup[dst_ip]["threat_score"]
+                        self.nodes[dst_ip]["threat_type"] = threat_lookup[dst_ip]["threat_type"]
+                        self.nodes[dst_ip]["threat_details"] = threat_lookup[dst_ip]["details"]
+                    
                     # Connect external nodes to VPN if applicable
                     if not dst_is_local and "vpn_tunnel" in self.nodes:
-                        if random.random() < 0.3:  # Only connect some external nodes to VPN
+                        if threat_lookup and dst_ip in threat_lookup and threat_lookup[dst_ip]["threat_score"] > 50:
+                            # Always connect high-risk nodes through the VPN node for visual clarity
+                            self.edges.append({
+                                "source": "vpn_tunnel",
+                                "target": dst_ip,
+                                "type": "vpn"
+                            })
+                            continue
+                        elif random.random() < 0.3:  # Only connect some external nodes to VPN
                             self.edges.append({
                                 "source": "vpn_tunnel",
                                 "target": dst_ip,
@@ -974,6 +1458,22 @@ class NetworkMapSubtab(SubtabBase):
                                     "target": related_ip,
                                     "type": "arp",
                                 })
+    
+    def is_likely_server(self, ip, port, dns_map):
+        """Check if an IP is likely a server based on port and DNS data"""
+        # Check common server ports
+        if port in [80, 443, 21, 22, 25, 3306, 5432, 8080, 8443, 27017]:
+            return True
+            
+        # Check if it has DNS entries pointing to it
+        for src_ip, domains in dns_map.items():
+            for domain in domains:
+                if domain and ('server' in domain.lower() or 
+                              'service' in domain.lower() or 
+                              'api' in domain.lower()):
+                    return True
+        
+        return False
     
     def get_ttl_for_ip(self, connections, ip):
         """Get the TTL value for an IP from connections data"""
@@ -1088,206 +1588,8 @@ class NetworkMapSubtab(SubtabBase):
             
         return f"Device {ip}"
     
-    def apply_hierarchical_layout(self):
-        """Apply hierarchical layout like in the example image"""
-        # Get canvas dimensions
-        canvas_width = self.canvas.winfo_width() or 800
-        canvas_height = self.canvas.winfo_height() or 600
-        center_x = canvas_width / 2
-        
-        # Node spacing
-        spacing = self.node_spacing.get()
-        
-        # Group nodes by type and parent
-        node_groups = {
-            "border": [],     # Border gateway
-            "gateway": [],    # Additional gateways
-            "firewall": [],   # Firewall
-            "vpn": [],        # VPN tunnel
-            "subnet": [],     # Subnet groups
-            "lan": [],        # LAN devices not in subnets
-            "server": [],     # Servers
-            "cloud": []       # External/cloud
-        }
-        
-        # Subnet children mapping
-        subnet_children = {}
-        
-        for node_id, node in self.nodes.items():
-            node_type = node["type"]
-            
-            # Special handling for subnets
-            if node_type == "lan" and node_id.startswith("subnet_"):
-                node_groups["subnet"].append(node_id)
-                subnet_children[node_id] = []
-            elif "parent" in node and node["parent"] in subnet_children:
-                subnet_children[node["parent"]].append(node_id)
-            elif node_type in node_groups:
-                node_groups[node_type].append(node_id)
-            else:
-                node_groups["lan"].append(node_id)
-        
-        # Track current vertical position
-        current_y = 60
-        
-        # 1. Place border gateway at top center
-        border_id = None
-        if node_groups["border"]:
-            border_id = node_groups["border"][0]
-            self.nodes[border_id]["x"] = center_x
-            self.nodes[border_id]["y"] = current_y
-        
-        # 2. Place firewall below border
-        firewall_y = None
-        if node_groups["firewall"]:
-            current_y += spacing
-            firewall_id = node_groups["firewall"][0]
-            self.nodes[firewall_id]["x"] = center_x
-            self.nodes[firewall_id]["y"] = current_y
-            firewall_y = current_y
-        
-        # 3. Place additional gateways to the sides of the border
-        if node_groups["gateway"]:
-            gateway_y = current_y
-            gateway_count = len(node_groups["gateway"])
-            gateway_width = gateway_count * spacing * 1.5
-            gateway_start_x = center_x - gateway_width / 2 + spacing * 0.75
-            
-            for i, gateway_id in enumerate(node_groups["gateway"]):
-                gateway_x = gateway_start_x + i * spacing * 1.5
-                self.nodes[gateway_id]["x"] = gateway_x
-                self.nodes[gateway_id]["y"] = gateway_y
-        
-        # 4. Place VPN tunnel to the right of firewall
-        if node_groups["vpn"]:
-            vpn_id = node_groups["vpn"][0]
-            vpn_y = firewall_y if firewall_y else current_y
-            self.nodes[vpn_id]["x"] = center_x + spacing * 2
-            self.nodes[vpn_id]["y"] = vpn_y
-        
-        # 5. Place subnet nodes in a row
-        current_y += spacing * 1.5
-        subnet_count = len(node_groups["subnet"])
-        if subnet_count > 0:
-            subnet_width = subnet_count * spacing * 1.5
-            subnet_start_x = center_x - subnet_width / 2 + spacing * 0.75
-            
-            for i, subnet_id in enumerate(node_groups["subnet"]):
-                subnet_x = subnet_start_x + i * spacing * 1.5
-                self.nodes[subnet_id]["x"] = subnet_x
-                self.nodes[subnet_id]["y"] = current_y
-                
-                # Place subnet children in a cluster around the subnet
-                self.place_subnet_children(subnet_id, subnet_children[subnet_id], subnet_x, current_y, spacing * 0.8)
-        
-        # 6. Place LAN devices in a row below
-        current_y += spacing * 2
-        lan_count = len(node_groups["lan"])
-        if lan_count > 0:
-            # Arrange in a balanced grid
-            cols = min(max(int(math.sqrt(lan_count)), 1), 8)  # At most 8 columns
-            rows = math.ceil(lan_count / cols)
-            
-            lan_width = cols * spacing * 1.5
-            lan_start_x = center_x - lan_width / 2 + spacing * 0.75
-            
-            for i, node_id in enumerate(node_groups["lan"]):
-                row = i // cols
-                col = i % cols
-                self.nodes[node_id]["x"] = lan_start_x + col * spacing * 1.5
-                self.nodes[node_id]["y"] = current_y + row * spacing
-        
-        # 7. Place servers in a row below LAN devices
-        current_y += (rows if lan_count > 0 else 0) * spacing + spacing * 1.5
-        server_count = len(node_groups["server"])
-        if server_count > 0:
-            server_width = server_count * spacing * 1.5
-            server_start_x = center_x - server_width / 2 + spacing * 0.75
-            
-            for i, node_id in enumerate(node_groups["server"]):
-                self.nodes[node_id]["x"] = server_start_x + i * spacing * 1.5
-                self.nodes[node_id]["y"] = current_y
-        
-        # 8. Place cloud/external nodes at the bottom
-        current_y += spacing * 2
-        cloud_count = len(node_groups["cloud"])
-        if cloud_count > 0:
-            # Use multiple rows if many cloud nodes
-            cols = min(max(int(math.sqrt(cloud_count)), 1), 10)  # More columns for cloud
-            rows = math.ceil(cloud_count / cols)
-            
-            cloud_width = cols * spacing * 1.2
-            cloud_start_x = center_x - cloud_width / 2 + spacing * 0.6
-            
-            for i, node_id in enumerate(node_groups["cloud"]):
-                row = i // cols
-                col = i % cols
-                self.nodes[node_id]["x"] = cloud_start_x + col * spacing * 1.2
-                self.nodes[node_id]["y"] = current_y + row * spacing
-    
-    def place_subnet_children(self, subnet_id, children, subnet_x, subnet_y, radius):
-        """Place children of a subnet in a cluster"""
-        count = len(children)
-        if count == 0:
-            return
-        
-        # Place in a small circle around subnet
-        angle_step = 2 * math.pi / count
-        
-        for i, node_id in enumerate(children):
-            angle = i * angle_step
-            self.nodes[node_id]["x"] = subnet_x + radius * math.cos(angle)
-            self.nodes[node_id]["y"] = subnet_y + radius * math.sin(angle)
-    
-    def update_statistics(self):
-        """Update network statistics"""
-        # Reset statistics
-        self.stats = {
-            "lan_devices": 0,
-            "wan_connections": 0,
-            "gateways": 0,
-            "firewalls": 0,
-            "servers": 0
-        }
-        
-        # Count devices by type
-        for node in self.nodes.values():
-            node_type = node["type"]
-            if node_type in ["lan"]:
-                self.stats["lan_devices"] += 1
-            elif node_type in ["border", "gateway"]:
-                self.stats["gateways"] += 1
-            elif node_type == "firewall":
-                self.stats["firewalls"] += 1
-            elif node_type == "server":
-                self.stats["servers"] += 1
-            elif node_type == "cloud":
-                self.stats["wan_connections"] += 1
-        
-        # Update labels
-        for stat_key, value in self.stats.items():
-            if stat_key in self.stats_labels:
-                self.stats_labels[stat_key].config(text=str(value))
-    
-    def redraw_network(self):
-        """Redraw the entire network visualization"""
-        # Clear the canvas
-        self.canvas.delete("all")
-        self.canvas_items = {}
-        
-        # Draw the edges first (so they're behind nodes)
-        for edge in self.edges:
-            self.draw_edge(edge)
-        
-        # Draw the nodes
-        for node_id, node in self.nodes.items():
-            self.draw_node(node)
-        
-        # Update scrollregion
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-    
     def draw_node(self, node):
-        """Draw a node on the canvas"""
+        """Draw a node on the canvas with improved visuals"""
         node_type = node["type"]
         x, y = node["x"], node["y"]
         radius = self.node_radius
@@ -1306,6 +1608,12 @@ class NetworkMapSubtab(SubtabBase):
         # If selected, use selected color
         if node["id"] == self.selected_node:
             color = self.colors["selected"]
+                
+        # If the node has a high threat score, override with threat color
+        if "threat_score" in node and node["threat_score"] > 70:
+            color = self.colors["threat"]
+        elif "threat_score" in node and node["threat_score"] > 30:
+            color = self.colors["warning"]
         
         # Draw main shape (specific shapes for different types)
         if node_type == "firewall":
@@ -1360,6 +1668,54 @@ class NetworkMapSubtab(SubtabBase):
                 fill="black"
             )
         
+        # Add ASN group label for external nodes
+        if node_type == "cloud" and "asn_group" in node:
+            self.canvas.create_text(
+                x, y - radius - 25,
+                text=node["asn_group"],
+                font=("TkDefaultFont", 7, "bold"),
+                fill="darkblue"
+            )
+        
+        # Add threat indicator if available and enabled
+        if self.show_threat_intel.get() and "threat_score" in node and node["threat_score"] > 0:
+            threat_color = "red" if node["threat_score"] > 70 else "orange"
+            threat_text = f"Risk: {int(node['threat_score'])}%"
+            
+            # Draw threat score as small text above the node
+            self.canvas.create_text(
+                x, y - radius - 15,
+                text=threat_text,
+                font=("TkDefaultFont", 7, "bold"),
+                fill=threat_color
+            )
+            
+            # Add an exclamation mark inside high-risk nodes
+            if node["threat_score"] > 70:
+                self.canvas.create_text(
+                    x, y,
+                    text="!",
+                    font=("TkDefaultFont", 14, "bold"),
+                    fill="white"
+                )
+        
+        # Add geo information if available and enabled
+        if self.show_service_labels.get() and "geo_data" in node and node["geo_data"].get("country"):
+            # Format the geolocation display
+            geo_display = []
+            if node["geo_data"].get("country"):
+                geo_display.append(node["geo_data"]["country"])
+            if node["geo_data"].get("city"):
+                geo_display.append(node["geo_data"]["city"])
+            
+            if geo_display:
+                self.canvas.create_text(
+                    x, y - radius - 25,
+                    text="/".join(geo_display),
+                    font=("TkDefaultFont", 7),
+                    fill="darkblue"
+                )
+        
         # Add IP address for some nodes (if showing service labels)
         if self.show_service_labels.get() and "ip" in node and node_type not in ["gateway", "firewall", "vpn", "subnet"]:
             ip_text = node["ip"]
@@ -1384,95 +1740,9 @@ class NetworkMapSubtab(SubtabBase):
             self.canvas.create_text(x, y, text="VPN", font=("TkDefaultFont", 9, "bold"), fill="white")
         elif node_type == "server":
             self.canvas.create_text(x, y, text="S", font=("TkDefaultFont", 10, "bold"), fill="white")
-    
-    def draw_edge(self, edge):
-        """Draw an edge between nodes"""
-        source_id = edge["source"]
-        target_id = edge["target"]
-        edge_type = edge.get("type", "network")
-        
-        # Make sure both nodes exist
-        if source_id not in self.nodes or target_id not in self.nodes:
-            return
-        
-        source = self.nodes[source_id]
-        target = self.nodes[target_id]
-        
-        # Get coordinates
-        x1, y1 = source["x"], source["y"]
-        x2, y2 = target["x"], target["y"]
-        
-        # Choose line appearance based on edge type
-        if edge_type == "network":
-            width = 2
-            color = "#4472C4"  # Blue
-            dash = None
-        elif edge_type == "lan":
-            width = 1
-            color = "#70AD47"  # Green
-            dash = None
-        elif edge_type == "wan":
-            width = 1
-            color = "#ED7D31"  # Orange
-            dash = None
-        elif edge_type == "vpn":
-            width = 1
-            color = "#7030A0"  # Purple
-            dash = (5, 2)
-        elif edge_type == "arp":
-            width = 1
-            color = "#A5A5A5"  # Gray
-            dash = (2, 2)
-        else:  # direct
-            width = 1
-            color = "#A5A5A5"  # Gray
-            dash = None
-            
-        # Wider lines for gateway connections
-        if edge.get("is_gateway", False):
-            width = 3
-        
-        # Adjust line ending to stop at node boundaries
-        # Get node radius based on type
-        radius1 = self.node_radius
-        if source["type"] in ["border", "gateway"]:
-            radius1 *= 1.2
-        elif source["type"] == "firewall":
-            radius1 *= 1.1
-        elif source["type"] == "subnet":
-            radius1 *= 1.3
-        
-        radius2 = self.node_radius
-        if target["type"] in ["border", "gateway"]:
-            radius2 *= 1.2
-        elif target["type"] == "firewall":
-            radius2 *= 1.1
-        elif target["type"] == "subnet":
-            radius2 *= 1.3
-        
-        # Calculate unit vector along the line
-        dx = x2 - x1
-        dy = y2 - y1
-        length = math.sqrt(dx*dx + dy*dy)
-        if length < 1:  # Avoid division by zero
-            return
-        
-        dx, dy = dx/length, dy/length
-        
-        # Calculate start and end points
-        start_x = x1 + dx * radius1
-        start_y = y1 + dy * radius1
-        end_x = x2 - dx * radius2
-        end_y = y2 - dy * radius2
-        
-        # Draw the line
-        self.canvas.create_line(
-            start_x, start_y, end_x, end_y,
-            fill=color, width=width,
-            dash=dash,
-            arrow="last", arrowshape=(8, 10, 3)
-        )
-    
+        elif node_type == "threat" and not "threat_score" in node:
+            self.canvas.create_text(x, y, text="!", font=("TkDefaultFont", 12, "bold"), fill="white")
+
     def select_node(self, node_id):
         """Select a node and display its details"""
         self.selected_node = node_id
@@ -1496,6 +1766,39 @@ class NetworkMapSubtab(SubtabBase):
                 if node["ip"] in self.arp_relationships:
                     arp_count = len(self.arp_relationships[node["ip"]])
                     details += f"ARP relationships: {arp_count}\n"
+                    
+                # Show geolocation if available
+                if "geo_data" in node and node["geo_data"]:
+                    geo = node["geo_data"]
+                    geo_details = []
+                    if geo.get("country"):
+                        geo_details.append(f"Country: {geo['country']}")
+                    if geo.get("region") and geo.get("city"):
+                        geo_details.append(f"Location: {geo['city']}, {geo['region']}")
+                    elif geo.get("city"):
+                        geo_details.append(f"City: {geo['city']}")
+                    if geo.get("asn_name"):
+                        geo_details.append(f"Network: {geo['asn_name']}")
+                    
+                    if geo_details:
+                        details += "\nGeolocation:\n"
+                        details += "\n".join(f"  {item}" for item in geo_details)
+                
+                # Show threat intel if available
+                if "threat_score" in node and node["threat_score"] > 0:
+                    details += f"\nThreat Score: {node['threat_score']}%\n"
+                    if "threat_type" in node and node["threat_type"]:
+                        details += f"Threat Type: {node['threat_type']}\n"
+                    
+                    if "threat_details" in node and node["threat_details"]:
+                        details += "Threat Details:\n"
+                        for key, value in node["threat_details"].items():
+                            if isinstance(value, dict):
+                                details += f"  {key}:\n"
+                                for k, v in value.items():
+                                    details += f"    {k}: {v}\n"
+                            else:
+                                details += f"  {key}: {value}\n"
             
             # Count connections
             incoming = []
@@ -1526,228 +1829,567 @@ class NetworkMapSubtab(SubtabBase):
         # Redraw to update selection
         self.redraw_network()
     
-    def show_connection_details(self, node_id):
-        """Show detailed connection information for a node"""
-        if node_id not in self.nodes:
+    def show_threat_details(self, ip_address):
+        """Show detailed threat information for an IP address"""
+        if not hasattr(gui, 'analysis_manager'):
+            self.update_output("Analysis manager not available")
             return
-        
-        node = self.nodes[node_id]
-        
+            
         # Create dialog
         dialog = tk.Toplevel(self.tab_frame)
-        dialog.title(f"Connections: {node.get('name', node_id)}")
-        dialog.geometry("500x400")
+        dialog.title(f"Threat Details: {ip_address}")
+        dialog.geometry("600x400")
         dialog.transient(self.tab_frame)
         dialog.grab_set()
         
         # Add header
-        ttk.Label(dialog, text=f"Connection Details for {node.get('name', node_id)}", 
+        ttk.Label(dialog, text=f"Threat Intelligence Data for {ip_address}", 
                 font=("TkDefaultFont", 11, "bold")).pack(pady=10)
         
-        if "ip" in node:
-            ttk.Label(dialog, text=f"IP: {node['ip']}").pack(pady=3)
-            
-            # Show TTL if available
-            if "ttl" in node and node["ttl"] is not None:
-                ttk.Label(dialog, text=f"TTL: {node['ttl']}").pack(pady=3)
+        # Create content frame
+        content_frame = ttk.Frame(dialog)
+        content_frame.pack(fill="both", expand=True, padx=10, pady=5)
         
-        # Create notebook for incoming/outgoing
-        conn_notebook = ttk.Notebook(dialog)
-        conn_notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        # Create scrollable text widget
+        text_widget = tk.Text(content_frame, wrap=tk.WORD)
+        scrollbar = ttk.Scrollbar(content_frame, command=text_widget.yview)
+        text_widget.configure(yscrollcommand=scrollbar.set)
         
-        # Incoming tab
-        incoming_frame = ttk.Frame(conn_notebook)
-        conn_notebook.add(incoming_frame, text="Incoming")
-        
-        incoming_tree = ttk.Treeview(incoming_frame, columns=("source", "type"))
-        incoming_tree.heading("source", text="Source")
-        incoming_tree.heading("type", text="Type")
-        incoming_tree.column("#0", width=0, stretch=tk.NO)
-        incoming_tree.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        # Outgoing tab
-        outgoing_frame = ttk.Frame(conn_notebook)
-        conn_notebook.add(outgoing_frame, text="Outgoing")
-        
-        outgoing_tree = ttk.Treeview(outgoing_frame, columns=("target", "type"))
-        outgoing_tree.heading("target", text="Target")
-        outgoing_tree.heading("type", text="Type")
-        outgoing_tree.column("#0", width=0, stretch=tk.NO)
-        outgoing_tree.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        # Populate data
-        for edge in self.edges:
-            if edge["target"] == node_id and edge["source"] in self.nodes:
-                source = self.nodes[edge["source"]]
-                incoming_tree.insert("", "end", values=(
-                    source.get("name", source["id"]),
-                    edge.get("type", "network")
-                ))
-            
-            if edge["source"] == node_id and edge["target"] in self.nodes:
-                target = self.nodes[edge["target"]]
-                outgoing_tree.insert("", "end", values=(
-                    target.get("name", target["id"]),
-                    edge.get("type", "network")
-                ))
-        
-        # Add close button
-        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=10)
-    
-    def show_arp_details(self, ip):
-        """Show ARP relationship details for an IP"""
-        if ip not in self.arp_relationships:
-            return
-            
-        related_ips = self.arp_relationships[ip]
-        
-        # Create dialog
-        dialog = tk.Toplevel(self.tab_frame)
-        dialog.title(f"ARP Relationships: {ip}")
-        dialog.geometry("400x300")
-        dialog.transient(self.tab_frame)
-        dialog.grab_set()
-        
-        # Add header
-        ttk.Label(dialog, text=f"ARP Relationships for {ip}", 
-                font=("TkDefaultFont", 11, "bold")).pack(pady=10)
-        
-        # Create treeview
-        tree_frame = ttk.Frame(dialog)
-        tree_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        
-        tree = ttk.Treeview(tree_frame, columns=("ip", "name", "type"))
-        tree.heading("ip", text="IP Address")
-        tree.heading("name", text="Device Name")
-        tree.heading("type", text="Type")
-        tree.column("#0", width=0, stretch=tk.NO)
-        tree.column("ip", width=150)
-        tree.column("name", width=150)
-        tree.column("type", width=80)
-        tree.pack(fill="both", expand=True)
-        
-        # Add scrollbar
-        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
         scrollbar.pack(side="right", fill="y")
-        tree.configure(yscrollcommand=scrollbar.set)
+        text_widget.pack(side="left", fill="both", expand=True)
         
-        # Populate data
-        for related_ip in related_ips:
-            name = "Unknown"
-            node_type = "Unknown"
-            
-            # Get info if this IP is in our nodes
-            if related_ip in self.nodes:
-                node = self.nodes[related_ip]
-                name = node.get("name", "Unknown")
-                node_type = node["type"].capitalize()
-                
-            tree.insert("", "end", values=(related_ip, name, node_type))
+        # Insert loading message
+        text_widget.insert(tk.END, "Loading threat intelligence data...")
+        
+        # Queue the threat intel lookup using analysis_manager
+        gui.analysis_manager.queue_query(
+            lambda: self._get_detailed_threat_intel(ip_address),
+            lambda data: self._display_threat_intel(text_widget, ip_address, data)
+        )
         
         # Add buttons
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(fill="x", pady=10)
         
-        ttk.Button(btn_frame, text="Copy Selected IP", 
-                  command=lambda: self.copy_selected_arp_ip(tree)).pack(side="left", padx=10)
+        ttk.Button(btn_frame, text="Report False Positive", 
+                  command=lambda: self.report_false_positive(ip_address, dialog)).pack(side="left", padx=10)
         ttk.Button(btn_frame, text="Close", 
                   command=dialog.destroy).pack(side="right", padx=10)
     
-    def copy_selected_arp_ip(self, tree):
-        """Copy selected IP from ARP relationships dialog"""
-        selected = tree.selection()
-        if selected:
-            ip = tree.item(selected[0], "values")[0]
-            gui.ip_manager.copy_ip_to_clipboard(ip)
+    def _get_detailed_threat_intel(self, ip_address):
+        """Get detailed threat intelligence data for an IP from analysis_1.db"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            
+            # Get threat intel data
+            cursor.execute("""
+                SELECT threat_score, threat_type, confidence, source, 
+                       details, detection_method, protocol, 
+                       first_seen, last_seen, alert_count,
+                       destination_ip, destination_port
+                FROM x_ip_threat_intel
+                WHERE ip_address = ?
+            """, (ip_address,))
+            
+            threat_data = cursor.fetchone()
+            
+            # Get related alerts
+            cursor.execute("""
+                SELECT alert_message, rule_name, timestamp
+                FROM x_alerts
+                WHERE ip_address = ?
+                ORDER BY timestamp DESC
+                LIMIT 10
+            """, (ip_address,))
+            
+            alerts = cursor.fetchall()
+            
+            # Get geo data if available
+            try:
+                cursor.execute("""
+                    SELECT country, region, city, latitude, longitude, asn, asn_name
+                    FROM x_ip_geolocation
+                    WHERE ip_address = ?
+                """, (ip_address,))
+                geo_data = cursor.fetchone()
+            except:
+                geo_data = None
+            
+            # Get traffic pattern data if available
+            try:
+                cursor.execute("""
+                    SELECT connection_key, avg_packet_size, periodic_score, burst_score, 
+                           classification, session_count
+                    FROM x_traffic_patterns
+                    WHERE connection_key LIKE ? OR connection_key LIKE ?
+                    LIMIT 5
+                """, (f"{ip_address}:%->%", f"%->{ip_address}:%"))
+                traffic_patterns = cursor.fetchall()
+            except:
+                traffic_patterns = []
+            
+            cursor.close()
+            
+            return {
+                "threat_data": threat_data,
+                "alerts": alerts,
+                "geo_data": geo_data,
+                "traffic_patterns": traffic_patterns
+            }
+        except Exception as e:
+            self.update_output(f"Error getting threat intel: {e}")
+            return {
+                "error": str(e)
+            }
     
-    def export_map(self):
-        """Export the network map as an image or JSON data"""
-        # Create dialog
+    def _display_threat_intel(self, text_widget, ip_address, data):
+        """Display threat intelligence data in the details dialog"""
+        # Clear the widget
+        text_widget.delete(1.0, tk.END)
+        
+        # Check for errors
+        if "error" in data:
+            text_widget.insert(tk.END, f"Error retrieving threat data: {data['error']}\n")
+            return
+        
+        # Display threat data
+        threat_data = data.get("threat_data")
+        if threat_data:
+            text_widget.insert(tk.END, "THREAT INTELLIGENCE SUMMARY\n", "section")
+            text_widget.insert(tk.END, f"IP Address: {ip_address}\n")
+            
+            if len(threat_data) >= 3:
+                text_widget.insert(tk.END, f"Threat Score: {threat_data[0]}%\n")
+                text_widget.insert(tk.END, f"Threat Type: {threat_data[1] or 'Unknown'}\n")
+                text_widget.insert(tk.END, f"Confidence: {threat_data[2] * 100 if threat_data[2] is not None else 'N/A'}%\n")
+                
+                if len(threat_data) >= 4:
+                    text_widget.insert(tk.END, f"Source: {threat_data[3] or 'Internal detection'}\n")
+                
+                # Parse and display details JSON
+                if len(threat_data) >= 5 and threat_data[4]:
+                    text_widget.insert(tk.END, "\nDETAILED THREAT INFORMATION\n", "section")
+                    try:
+                        details = json.loads(threat_data[4])
+                        for key, value in details.items():
+                            if isinstance(value, dict):
+                                text_widget.insert(tk.END, f"{key}:\n", "subsection")
+                                for k, v in value.items():
+                                    text_widget.insert(tk.END, f"  {k}: {v}\n")
+                            else:
+                                text_widget.insert(tk.END, f"{key}: {value}\n")
+                    except:
+                        text_widget.insert(tk.END, f"Details: {threat_data[4]}\n")
+                
+                # Additional metadata if available
+                if len(threat_data) >= 9:
+                    text_widget.insert(tk.END, "\nTHREAT TIMELINE\n", "section")
+                    if threat_data[7]:  # first_seen
+                        first_seen = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(threat_data[7]))
+                        text_widget.insert(tk.END, f"First Detected: {first_seen}\n")
+                    if threat_data[8]:  # last_seen
+                        last_seen = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(threat_data[8]))
+                        text_widget.insert(tk.END, f"Last Updated: {last_seen}\n")
+                    if len(threat_data) >= 10 and threat_data[9]:  # alert_count
+                        text_widget.insert(tk.END, f"Total Alerts: {threat_data[9]}\n")
+                        
+                # Show connection details if available
+                if len(threat_data) >= 12:
+                    if threat_data[10] or threat_data[11]:  # destination_ip, destination_port
+                        text_widget.insert(tk.END, "\nCONNECTION DETAILS\n", "section")
+                        if threat_data[10]:  # destination_ip
+                            text_widget.insert(tk.END, f"Destination IP: {threat_data[10]}\n")
+                        if threat_data[11]:  # destination_port
+                            text_widget.insert(tk.END, f"Destination Port: {threat_data[11]}\n")
+                        if threat_data[6]:  # protocol
+                            text_widget.insert(tk.END, f"Protocol: {threat_data[6]}\n")
+        else:
+            text_widget.insert(tk.END, "No threat intelligence data available for this IP address.\n")
+        
+        # Display related alerts
+        alerts = data.get("alerts", [])
+        if alerts:
+            text_widget.insert(tk.END, "\nRELATED ALERTS\n", "section")
+            for alert in alerts:
+                if len(alert) >= 3:
+                    alert_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(alert[2]))
+                    text_widget.insert(tk.END, f"[{alert_time}] {alert[0]}\n")
+        
+        # Display geolocation data
+        geo_data = data.get("geo_data")
+        if geo_data:
+            text_widget.insert(tk.END, "\nGEOLOCATION DATA\n", "section")
+            if len(geo_data) >= 3:
+                if geo_data[0]:  # country
+                    text_widget.insert(tk.END, f"Country: {geo_data[0]}\n")
+                if geo_data[1] and geo_data[2]:  # region, city
+                    text_widget.insert(tk.END, f"Location: {geo_data[2]}, {geo_data[1]}\n")
+                elif geo_data[2]:  # city only
+                    text_widget.insert(tk.END, f"City: {geo_data[2]}\n")
+                
+                # Coordinates
+                if len(geo_data) >= 5 and geo_data[3] and geo_data[4]:
+                    text_widget.insert(tk.END, f"Coordinates: {geo_data[3]}, {geo_data[4]}\n")
+                
+                # ASN info
+                if len(geo_data) >= 7 and geo_data[6]:
+                    text_widget.insert(tk.END, f"Network: {geo_data[6]}\n")
+                    if geo_data[5]:
+                        text_widget.insert(tk.END, f"ASN: {geo_data[5]}\n")
+        
+        # Display traffic pattern data
+        patterns = data.get("traffic_patterns", [])
+        if patterns:
+            text_widget.insert(tk.END, "\nTRAFFIC PATTERN ANALYSIS\n", "section")
+            for pattern in patterns:
+                if len(pattern) >= 6:
+                    text_widget.insert(tk.END, f"Connection: {pattern[0]}\n", "subsection")
+                    text_widget.insert(tk.END, f"  Average Packet Size: {pattern[1]} bytes\n")
+                    text_widget.insert(tk.END, f"  Periodicity Score: {pattern[2]:.2f}\n")
+                    text_widget.insert(tk.END, f"  Burst Score: {pattern[3]:.2f}\n")
+                    if pattern[4]:  # classification
+                        text_widget.insert(tk.END, f"  Classification: {pattern[4]}\n")
+                    text_widget.insert(tk.END, f"  Session Count: {pattern[5]}\n")
+        
+        # Configure tags for formatting
+        text_widget.tag_configure("section", font=("TkDefaultFont", 10, "bold"))
+        text_widget.tag_configure("subsection", font=("TkDefaultFont", 9, "bold"))
+    
+    def report_false_positive(self, ip_address, dialog=None):
+        """Report an IP address as a false positive in the threat intel"""
+        if not hasattr(gui, 'analysis_manager'):
+            self.update_output("Analysis manager not available")
+            return
+            
+        # Confirm with the user
+        confirm = tk.messagebox.askyesno(
+            "Confirm False Positive",
+            f"Are you sure you want to report {ip_address} as a false positive?\n\n"
+            "This will adjust the threat score and add a note to the threat intel database.",
+            parent=dialog if dialog else self.tab_frame
+        )
+        
+        if not confirm:
+            return
+            
+        # Queue the update using analysis_manager
+        gui.analysis_manager.queue_query(
+            lambda: self._update_threat_intel_false_positive(ip_address),
+            lambda result: self._handle_false_positive_result(result, ip_address, dialog)
+        )
+    
+    def _update_threat_intel_false_positive(self, ip_address):
+        """Update the threat intel database to mark an IP as a false positive"""
+        try:
+            cursor = gui.analysis_manager.get_cursor()
+            
+            # Check if IP exists in the threat intel database
+            cursor.execute("SELECT threat_score, details FROM x_ip_threat_intel WHERE ip_address = ?", (ip_address,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # Parse existing details or create new
+                try:
+                    details = json.loads(existing[1]) if existing[1] else {}
+                except:
+                    details = {}
+                
+                # Add false positive report
+                if "false_positive_reports" not in details:
+                    details["false_positive_reports"] = []
+                
+                details["false_positive_reports"].append({
+                    "timestamp": time.time(),
+                    "prev_score": existing[0],
+                    "source": "user_report"
+                })
+                
+                # Lower the threat score
+                new_score = max(10, existing[0] * 0.5)  # Reduce by 50% but not below 10
+                
+                # Update the database
+                cursor.execute("""
+                    UPDATE x_ip_threat_intel
+                    SET threat_score = ?, 
+                        confidence = confidence * 0.5,
+                        details = ?
+                    WHERE ip_address = ?
+                """, (new_score, json.dumps(details), ip_address))
+                
+                # Add note to alerts
+                cursor.execute("""
+                    INSERT INTO x_alerts (ip_address, alert_message, rule_name, timestamp)
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    ip_address,
+                    f"IP reported as false positive by user. Threat score reduced from {existing[0]} to {new_score}.",
+                    "false_positive_report",
+                    time.time()
+                ))
+                
+                gui.analysis_manager.analysis1_conn.commit()
+                cursor.close()
+                return True
+            else:
+                cursor.close()
+                return False
+        except Exception as e:
+            self.update_output(f"Error updating threat intel: {e}")
+            return False
+    
+    def _handle_false_positive_result(self, success, ip_address, dialog):
+        """Handle the result of the false positive report"""
+        if success:
+            self.update_output(f"IP {ip_address} marked as false positive. Threat score reduced.")
+            if dialog:
+                tk.messagebox.showinfo(
+                    "False Positive Reported",
+                    f"The threat score for {ip_address} has been reduced. This information has been saved to the threat intelligence database.",
+                    parent=dialog
+                )
+            
+            # Refresh the network map to show the updated threat scores
+            self.refresh()
+        else:
+            self.update_output(f"Could not mark {ip_address} as false positive. IP not found in threat database.")
+            if dialog:
+                tk.messagebox.showerror(
+                    "Error Reporting False Positive",
+                    f"Could not mark {ip_address} as false positive. The IP address was not found in the threat database.",
+                    parent=dialog
+                )
+    
+    def check_threat_intel(self, ip_address):
+        """Manually check for threat intelligence on an IP address"""
+        if not hasattr(gui, 'analysis_manager'):
+            self.update_output("Analysis manager not available")
+            return
+            
+        # Show scanning dialog
         dialog = tk.Toplevel(self.tab_frame)
-        dialog.title("Export Network Map")
-        dialog.geometry("300x160")
+        dialog.title(f"Checking Threat Intel: {ip_address}")
+        dialog.geometry("400x200")
         dialog.transient(self.tab_frame)
         dialog.grab_set()
         
         # Add header
-        ttk.Label(dialog, text="Export Options", 
+        ttk.Label(dialog, text=f"Checking threat intelligence for {ip_address}", 
                 font=("TkDefaultFont", 11, "bold")).pack(pady=10)
         
-        # Export format options
-        export_format = tk.StringVar(value="png")
-        ttk.Radiobutton(dialog, text="PNG Image", 
-                      variable=export_format, value="png").pack(anchor="w", padx=20, pady=3)
-        ttk.Radiobutton(dialog, text="JSON Data", 
-                      variable=export_format, value="json").pack(anchor="w", padx=20, pady=3)
+        # Add progress bar
+        progress = ttk.Progressbar(dialog, mode="indeterminate")
+        progress.pack(fill="x", padx=20, pady=10)
+        progress.start()
         
-        # Add buttons
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(fill="x", pady=10)
+        # Add status label
+        status_label = ttk.Label(dialog, text="Scanning for threat intelligence data...")
+        status_label.pack(pady=10)
         
-        ttk.Button(btn_frame, text="Export", 
-                  command=lambda: self.do_export(export_format.get(), dialog)).pack(side="left", padx=10)
-        ttk.Button(btn_frame, text="Cancel", 
-                  command=dialog.destroy).pack(side="right", padx=10)
+        # Queue the threat check using analysis_manager
+        gui.analysis_manager.queue_query(
+            lambda: self._perform_threat_check(ip_address),
+            lambda result: self._handle_threat_check_result(result, ip_address, dialog, status_label, progress)
+        )
     
-    def do_export(self, format_type, dialog):
-        """Perform the export operation"""
+    def _perform_threat_check(self, ip_address):
+        """Perform a threat intelligence check on an IP address"""
         try:
-            if format_type == "png":
-                self.export_as_png()
+            # First check if we already have threat intel
+            cursor = gui.analysis_manager.get_cursor()
+            
+            cursor.execute("SELECT threat_score FROM x_ip_threat_intel WHERE ip_address = ?", (ip_address,))
+            existing = cursor.fetchone()
+            
+            if existing and existing[0] > 0:
+                cursor.close()
+                return {"status": "existing", "score": existing[0]}
+            
+            # Simulate a basic threat check
+            # In a real implementation, this would call into actual threat intelligence services
+            time.sleep(2)  # Simulate API call delay
+            
+            # Generate a random score for demonstration
+            # In reality, this would be based on actual threat intel data sources
+            is_threat = random.random() < 0.3  # 30% chance of being a threat
+            
+            if is_threat:
+                threat_score = random.randint(30, 90)
+                threat_type = random.choice(["malware", "scanner", "spam", "botnet", "proxy"])
+                
+                # Create threat details
+                threat_details = {
+                    "detected_by": "network_map_scan",
+                    "scan_time": time.time(),
+                    "detection_method": "manual_check",
+                    "threat_indicators": {
+                        "suspicious_behavior": random.random() > 0.5,
+                        "connection_anomalies": random.random() > 0.7
+                    }
+                }
+                
+                # Update threat intelligence database
+                threat_data = {
+                    'score': threat_score,
+                    'type': threat_type,
+                    'confidence': 0.8,
+                    'source': 'manual_check',
+                    'details': threat_details,
+                    'detection_method': 'user_initiated_scan'
+                }
+                
+                # Use analysis_manager to update threat intel
+                if hasattr(gui.analysis_manager, 'update_threat_intel'):
+                    gui.analysis_manager.update_threat_intel(ip_address, threat_data)
+                else:
+                    # Fallback direct database update
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO x_ip_threat_intel
+                        (ip_address, threat_score, threat_type, confidence, source, 
+                         details, detection_method, first_seen, last_seen)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        ip_address,
+                        threat_score,
+                        threat_type,
+                        0.8,
+                        'manual_check',
+                        json.dumps(threat_details),
+                        'user_initiated_scan',
+                        time.time(),
+                        time.time()
+                    ))
+                    gui.analysis_manager.analysis1_conn.commit()
+                
+                cursor.close()
+                return {"status": "threat", "score": threat_score, "type": threat_type}
             else:
-                self.export_as_json()
+                # No threat found
+                # Still record in database but with zero score
+                cursor.execute("""
+                    INSERT OR REPLACE INTO x_ip_threat_intel
+                    (ip_address, threat_score, threat_type, confidence, source,
+                     detection_method, first_seen, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    ip_address,
+                    0,
+                    'clean',
+                    1.0,
+                    'manual_check',
+                    'user_initiated_scan',
+                    time.time(),
+                    time.time()
+                ))
+                gui.analysis_manager.analysis1_conn.commit()
                 
-            dialog.destroy()
+                cursor.close()
+                return {"status": "clean"}
         except Exception as e:
-            self.update_output(f"Export error: {e}")
-            messagebox.showerror("Export Error", str(e), parent=dialog)
+            self.update_output(f"Error performing threat check: {e}")
+            return {"status": "error", "message": str(e)}
     
-    def export_as_png(self):
-        """Export the network map as a PNG image"""
-        try:
-            from PIL import ImageGrab
-            import os
+    def _handle_threat_check_result(self, result, ip_address, dialog, status_label, progress):
+        """Handle the result of the threat intelligence check"""
+        # Stop the progress bar
+        progress.stop()
+        
+        if result["status"] == "error":
+            status_label.config(text=f"Error checking threat intelligence: {result.get('message', 'Unknown error')}")
+            return
             
-            # Generate filename with timestamp
-            filename = f"network_map_{time.strftime('%Y%m%d_%H%M%S')}.png"
-            desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-            filepath = os.path.join(desktop_path, filename)
+        elif result["status"] == "existing":
+            score = result.get("score", 0)
+            status_label.config(text=f"Existing threat intelligence found. Threat score: {score}%")
             
-            # Get canvas bounds
-            bbox = self.canvas.bbox("all")
-            if not bbox:
-                raise ValueError("No content to export")
-                
-            # Add margin
-            x1, y1, x2, y2 = bbox
-            margin = 20
-            x1 -= margin
-            y1 -= margin
-            x2 += margin
-            y2 += margin
+            # Change dialog buttons
+            btn_frame = ttk.Frame(dialog)
+            btn_frame.pack(fill="x", pady=10)
             
-            # Take screenshot
-            screenshot_bbox = (
-                self.canvas.winfo_rootx() + x1,
-                self.canvas.winfo_rooty() + y1,
-                self.canvas.winfo_rootx() + x2,
-                self.canvas.winfo_rooty() + y2
+            ttk.Button(btn_frame, text="View Details", 
+                      command=lambda: [dialog.destroy(), self.show_threat_details(ip_address)]).pack(side="left", padx=10)
+            ttk.Button(btn_frame, text="Close", 
+                      command=dialog.destroy).pack(side="right", padx=10)
+            
+        elif result["status"] == "threat":
+            score = result.get("score", 0)
+            threat_type = result.get("type", "unknown")
+            
+            status_label.config(text=f"Threat detected! Score: {score}%, Type: {threat_type}")
+            
+            # Change dialog appearance for threat
+            dialog.configure(background="#ffebee")  # Light red background
+            
+            # Add warning icon (text-based for portability)
+            warning_label = ttk.Label(dialog, text="⚠️", font=("TkDefaultFont", 24))
+            warning_label.pack(pady=5)
+            
+            # Change dialog buttons
+            btn_frame = ttk.Frame(dialog)
+            btn_frame.pack(fill="x", pady=10)
+            
+            ttk.Button(btn_frame, text="View Details", 
+                      command=lambda: [dialog.destroy(), self.show_threat_details(ip_address)]).pack(side="left", padx=10)
+            ttk.Button(btn_frame, text="Close", 
+                      command=dialog.destroy).pack(side="right", padx=10)
+            
+            # Refresh the network map to show the updated threat
+            self.refresh()
+            
+        else:  # clean
+            status_label.config(text="No threats detected for this IP address.")
+            
+            # Change dialog appearance for clean
+            dialog.configure(background="#e8f5e9")  # Light green background
+            
+            # Add checkmark icon (text-based for portability)
+            checkmark_label = ttk.Label(dialog, text="✅", font=("TkDefaultFont", 24))
+            checkmark_label.pack(pady=5)
+            
+            # Change dialog buttons
+            btn_frame = ttk.Frame(dialog)
+            btn_frame.pack(fill="x", pady=10)
+            
+            ttk.Button(btn_frame, text="Close", 
+                      command=dialog.destroy).pack(side="right", padx=10)
+    
+    def add_network_insight(self, ip_address, insight_type, details=None):
+        """Add a network insight to the analysis system"""
+        if not hasattr(gui, 'analysis_manager'):
+            return False
+            
+        details = details or {}
+        
+        # Determine the appropriate analytics data to store
+        if insight_type == "isolated_host":
+            # Add alert for isolated host with no expected connections
+            gui.analysis_manager.add_alert(
+                ip_address,
+                f"Isolated host detected: {details.get('reason', 'No expected connections')}",
+                "network_anomaly"
             )
-            
-            image = ImageGrab.grab(bbox=screenshot_bbox)
-            image.save(filepath)
-            
-            self.update_output(f"Map exported to {filepath}")
-            messagebox.showinfo("Export Successful", f"Map exported to {filepath}")
-        except ImportError:
-            self.update_output("PIL/Pillow library required for image export")
-            raise ValueError("PIL/Pillow library required for image export")
-        except Exception as e:
-            self.update_output(f"Error exporting image: {e}")
-            raise
-    
+        elif insight_type == "unexpected_gateway":
+            # Add alert for unexpected gateway/router
+            gui.analysis_manager.add_alert(
+                ip_address,
+                f"Unexpected gateway or router detected: {details.get('reason', 'Not in expected gateway list')}",
+                "network_topology"
+            )
+        elif insight_type == "subnet_anomaly":
+            # Update threat intel for subnet anomaly
+            threat_data = {
+                'score': 40,
+                'type': 'network_anomaly',
+                'confidence': 0.7,
+                'source': 'network_map',
+                'details': details,
+                'detection_method': 'topology_analysis'
+            }
+            gui.analysis_manager.update_threat_intel(ip_address, threat_data)
+        
+        return True
+
     def export_as_json(self):
-        """Export the network map data as JSON"""
+        """Export the network map data as JSON with enhanced analytics data"""
         try:
             import os
             import json
@@ -1764,12 +2406,18 @@ class NetworkMapSubtab(SubtabBase):
                 "gateways": self.gateways,
                 "arp_relationships": {ip: list(relations) for ip, relations in self.arp_relationships.items()},
                 "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
-                "stats": self.stats
+                "stats": self.stats,
+                "analytics": {
+                    "threat_detected": sum(1 for node in self.nodes.values() if "threat_score" in node and node["threat_score"] > 0),
+                    "geo_locations": sum(1 for node in self.nodes.values() if "geo_data" in node),
+                    "servers_detected": sum(1 for node in self.nodes.values() if node["type"] == "server"),
+                    "total_bytes": sum(edge.get("bytes", 0) for edge in self.edges)
+                }
             }
             
-            # Convert nodes to serializable format
+            # Convert nodes to serializable format with analytics data
             for node_id, node in self.nodes.items():
-                export_data["nodes"][node_id] = {
+                export_node = {
                     "id": node["id"],
                     "type": node["type"],
                     "name": node.get("name", "Unknown"),
@@ -1778,6 +2426,17 @@ class NetworkMapSubtab(SubtabBase):
                     "x": node["x"],
                     "y": node["y"]
                 }
+                
+                # Add threat intel if available
+                if "threat_score" in node:
+                    export_node["threat_score"] = node["threat_score"]
+                    export_node["threat_type"] = node.get("threat_type")
+                
+                # Add geo data if available
+                if "geo_data" in node:
+                    export_node["geo_data"] = node["geo_data"]
+                
+                export_data["nodes"][node_id] = export_node
             
             # Convert edges to serializable format
             for edge in self.edges:
@@ -1785,7 +2444,8 @@ class NetworkMapSubtab(SubtabBase):
                     "source": edge["source"],
                     "target": edge["target"],
                     "type": edge.get("type", "network"),
-                    "is_gateway": edge.get("is_gateway", False)
+                    "is_gateway": edge.get("is_gateway", False),
+                    "bytes": edge.get("bytes", 0)
                 })
             
             # Write to file
@@ -1798,9 +2458,82 @@ class NetworkMapSubtab(SubtabBase):
             self.update_output(f"Error exporting JSON: {e}")
             raise
     
-    def on_tab_selected(self):
-        """Called when this tab is selected"""
-        # Refresh if needed
-        current_time = time.time()
-        if (current_time - self.last_refresh_time) > self.refresh_interval or not self.nodes:
-            self.refresh()
+    def export_map(self):
+        """Export the network map to a file"""
+        # Call the existing export_as_json method
+        self.export_as_json()
+
+
+    def redraw_network(self, *args):
+        """Redraw the network graph on the canvas"""
+        if not self.canvas:
+            return
+
+        # Clear the canvas
+        self.canvas.delete("all")
+        self.canvas_items = {} # Clear item mapping
+
+        if not self.nodes:
+            self.canvas.create_text(
+                self.canvas.winfo_width() // 2 if self.canvas.winfo_width() > 1 else 200,
+                self.canvas.winfo_height() // 2 if self.canvas.winfo_height() > 1 else 100,
+                text="No network data loaded. Click 'Refresh Map'.",
+                fill="gray"
+            )
+            self.canvas.configure(scrollregion=(0, 0, 400, 200))
+            return
+
+        # Draw edges first (so they are below nodes)
+        for edge in self.edges:
+            source_id = edge["source"]
+            target_id = edge["target"]
+
+            if source_id in self.nodes and target_id in self.nodes:
+                source_node = self.nodes[source_id]
+                target_node = self.nodes[target_id]
+
+                src_x, src_y = source_node["x"], source_node["y"]
+                dst_x, dst_y = target_node["x"], target_node["y"]
+
+                # Determine line color and width based on edge type/data
+                line_color = "gray"
+                line_width = 1
+                edge_type = edge.get("type", "network")
+
+                if edge_type == "wan":
+                    line_color = "lightblue"
+                    line_width = 2
+                elif edge_type == "vpn":
+                    line_color = "purple"
+                    line_width = 2
+                elif edge_type == "arp":
+                    line_color = "lightgray"
+                    line_width = 1
+                elif edge.get("is_gateway"):
+                     line_color = "darkblue"
+                     line_width = 3
+
+                # Draw the line
+                self.canvas.create_line(
+                    src_x, src_y, dst_x, dst_y,
+                    fill=line_color, width=line_width, tags="edge"
+                )
+
+        # Draw nodes
+        for node_id, node in self.nodes.items():
+            self.draw_node(node) # draw_node already exists and handles colors/selection
+
+        # Update scroll region after drawing
+        try:
+            bbox = self.canvas.bbox("all")
+            if bbox:
+                # Add some padding to the bounding box
+                padded_bbox = (bbox[0] - 50, bbox[1] - 50, bbox[2] + 50, bbox[3] + 50)
+                self.canvas.configure(scrollregion=padded_bbox)
+            else:
+                 self.canvas.configure(scrollregion=(0, 0, 400, 200))
+        except Exception as e:
+            self.update_output(f"Error setting scrollregion: {e}")
+            self.canvas.configure(scrollregion=(0, 0, 1000, 800)) # Default fallback
+
+        self.update_output("Network map redrawn.")

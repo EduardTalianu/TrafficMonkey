@@ -158,6 +158,12 @@ class DatabaseBrowserSubtab(SubtabBase):
                                            values=["capture", "analysis", "analysis_1"], width=10, state="readonly")
         structure_db_combobox.pack(side="left", padx=5)
         
+        # Export buttons
+        ttk.Button(control_frame, text="Export to CSV", 
+                  command=self.export_structure_to_csv).pack(side="right", padx=5)
+        ttk.Button(control_frame, text="Export to Markdown", 
+                  command=self.export_structure_to_markdown).pack(side="right", padx=5)
+        
         # Refresh button
         ttk.Button(control_frame, text="Refresh Structure", 
                   command=self.refresh_db_structure).pack(side="right", padx=5)
@@ -319,7 +325,279 @@ class DatabaseBrowserSubtab(SubtabBase):
             self.status_var.set(f"Error: {e}")
             self.update_output(f"Error loading database structure: {e}")
     
-    def on_structure_select(self, event):
+    def export_structure_to_csv(self):
+        """Export the database structure to CSV format"""
+        try:
+            # Ask for filename to save
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                initialfile=f"{self.db_var.get()}_structure.csv"
+            )
+            
+            if not filename:
+                return  # User cancelled
+                
+            # Get database connection
+            db_conn = self.get_db_connection()
+            cursor = db_conn.cursor()
+            
+            # Prepare data structure
+            structure_data = []
+            
+            # Add header row
+            structure_data.append(["DATABASE", self.db_var.get(), "", "", "", "", ""])
+            structure_data.append(["", "", "", "", "", "", ""])  # Empty row for separation
+            
+            # Get all tables
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            tables = cursor.fetchall()
+            
+            # Add tables section header
+            structure_data.append(["TABLES", f"Total: {len(tables)}", "", "", "", "", ""])
+            structure_data.append(["Table Name", "Row Count", "Column Count", "", "", "", ""])
+            
+            # Process each table
+            for table in tables:
+                table_name = table[0]
+                
+                # Count rows in table
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+                    row_count = cursor.fetchone()[0]
+                except:
+                    row_count = "N/A"
+                    
+                # Get table schema
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                columns = cursor.fetchall()
+                column_count = len(columns)
+                
+                # Add table row
+                structure_data.append([table_name, row_count, column_count, "", "", "", ""])
+                
+                # Add column header for this table
+                structure_data.append(["", "Column Name", "Type", "NOT NULL", "DEFAULT", "PRIMARY KEY", "Position"])
+                
+                # Add columns
+                for col in columns:
+                    col_id, col_name, col_type, not_null, default_val, primary_key = col
+                    structure_data.append(["", col_name, col_type, "Yes" if not_null == 1 else "No", 
+                                        default_val if default_val is not None else "", 
+                                        "Yes" if primary_key == 1 else "No", col_id])
+                
+                # Add empty row for separation
+                structure_data.append(["", "", "", "", "", "", ""])
+                
+            # Get all indices
+            cursor.execute("SELECT name, tbl_name FROM sqlite_master WHERE type='index' ORDER BY tbl_name, name")
+            indices = cursor.fetchall()
+            
+            # Add indices section header
+            structure_data.append(["INDICES", f"Total: {len(indices)}", "", "", "", "", ""])
+            structure_data.append(["Index Name", "Table", "Columns", "", "", "", ""])
+            
+            # Process each index
+            for index in indices:
+                index_name, table_name = index
+                
+                # Get index info
+                cursor.execute(f"PRAGMA index_info({index_name})")
+                index_columns = cursor.fetchall()
+                
+                # Get column names
+                column_names = []
+                for idx_col in index_columns:
+                    col_id = idx_col[2]
+                    # Make sure col_id is an integer
+                    try:
+                        col_id = int(col_id)
+                        cursor.execute(f"PRAGMA table_info({table_name})")
+                        table_cols = cursor.fetchall()
+                        if 0 <= col_id < len(table_cols):  # Ensure col_id is a valid index
+                            column_names.append(table_cols[col_id][1])
+                    except (ValueError, TypeError):
+                        # Skip if col_id is not a valid integer
+                        continue
+                    
+                # Check if unique
+                cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='index' AND name='{index_name}'")
+                sql = cursor.fetchone()
+                is_unique = False
+                if sql and sql[0] and "UNIQUE" in sql[0].upper():
+                    is_unique = True
+                
+                # Add index row
+                structure_data.append([index_name, table_name, ", ".join(column_names), 
+                                    "UNIQUE" if is_unique else "INDEX", "", "", ""])
+                
+            # Write to CSV
+            with open(filename, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerows(structure_data)
+                
+            self.status_var.set(f"Exported database structure to {filename}")
+            self.update_output(f"Successfully exported {self.db_var.get()} database structure to CSV")
+            
+        except Exception as e:
+            self.status_var.set(f"Error: {e}")
+            self.update_output(f"Error exporting database structure: {e}")
+            
+    def export_structure_to_markdown(self):
+        """Export the database structure to Markdown format"""
+        try:
+            # Ask for filename to save
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".md",
+                filetypes=[("Markdown files", "*.md"), ("All files", "*.*")],
+                initialfile=f"{self.db_var.get()}_structure.md"
+            )
+            
+            if not filename:
+                return  # User cancelled
+                
+            # Get database connection
+            db_conn = self.get_db_connection()
+            cursor = db_conn.cursor()
+            
+            # Prepare markdown content
+            md_content = []
+            
+            # Add header
+            md_content.append(f"# Database Structure: {self.db_var.get()}")
+            md_content.append(f"*Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}*")
+            md_content.append("")
+            
+            # Get all tables
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            tables = cursor.fetchall()
+            
+            # Add tables section
+            md_content.append(f"## Tables ({len(tables)})")
+            md_content.append("")
+            
+            # Process each table
+            for table in tables:
+                table_name = table[0]
+                
+                # Count rows in table
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+                    row_count = cursor.fetchone()[0]
+                except:
+                    row_count = "N/A"
+                    
+                # Get table schema
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                columns = cursor.fetchall()
+                column_count = len(columns)
+                
+                # Add table header
+                md_content.append(f"### Table: {table_name}")
+                md_content.append(f"- **Rows:** {row_count}")
+                md_content.append(f"- **Columns:** {column_count}")
+                md_content.append("")
+                
+                # Add columns table
+                md_content.append("| Position | Column Name | Type | Constraints |")
+                md_content.append("| -------- | ----------- | ---- | ----------- |")
+                
+                # Add columns
+                for col in columns:
+                    col_id, col_name, col_type, not_null, default_val, primary_key = col
+                    
+                    constraints = []
+                    if primary_key == 1:
+                        constraints.append("PRIMARY KEY")
+                    if not_null == 1:
+                        constraints.append("NOT NULL")
+                    if default_val is not None:
+                        constraints.append(f"DEFAULT {default_val}")
+                        
+                    constraints_str = ", ".join(constraints)
+                    
+                    md_content.append(f"| {col_id} | {col_name} | {col_type} | {constraints_str} |")
+                
+                md_content.append("")
+                
+                # Get indices for this table
+                cursor.execute(f"SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='{table_name}'")
+                table_indices = cursor.fetchall()
+                
+                if table_indices:
+                    md_content.append(f"#### Indices for {table_name}")
+                    md_content.append("")
+                    
+                    for idx in table_indices:
+                        index_name = idx[0]
+                        
+                        # Get index info
+                        cursor.execute(f"PRAGMA index_info({index_name})")
+                        index_columns = cursor.fetchall()
+                        
+                        # Get column names
+                        column_names = []
+                        for idx_col in index_columns:
+                            try:
+                                col_id = int(idx_col[2])  # Make sure col_id is an integer
+                                cursor.execute(f"PRAGMA table_info({table_name})")
+                                table_cols = cursor.fetchall()
+                                if 0 <= col_id < len(table_cols):  # Ensure col_id is a valid index
+                                    column_names.append(table_cols[col_id][1])
+                            except (ValueError, TypeError):
+                                # Skip if col_id is not a valid integer
+                                continue
+                            
+                        # Check if unique
+                        cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='index' AND name='{index_name}'")
+                        sql = cursor.fetchone()
+                        is_unique = False
+                        if sql and sql[0] and "UNIQUE" in sql[0].upper():
+                            is_unique = True
+                        
+                        # Add index info
+                        md_content.append(f"- **{index_name}**")
+                        md_content.append(f"  - Type: {'UNIQUE INDEX' if is_unique else 'INDEX'}")
+                        md_content.append(f"  - Columns: {', '.join(column_names)}")
+                        md_content.append("")
+                
+                md_content.append("")  # Extra blank line between tables
+            
+            # Get all views
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='view' ORDER BY name")
+            views = cursor.fetchall()
+            
+            if views:
+                # Add views section
+                md_content.append(f"## Views ({len(views)})")
+                md_content.append("")
+                
+                for view in views:
+                    view_name = view[0]
+                    
+                    # Get view definition
+                    cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='view' AND name='{view_name}'")
+                    view_sql = cursor.fetchone()
+                    if view_sql and view_sql[0]:
+                        # Add view info
+                        md_content.append(f"### View: {view_name}")
+                        md_content.append("```sql")
+                        md_content.append(view_sql[0])
+                        md_content.append("```")
+                        md_content.append("")
+            
+            # Write to markdown file
+            with open(filename, 'w', encoding='utf-8') as mdfile:
+                mdfile.write("\n".join(md_content))
+                
+            self.status_var.set(f"Exported database structure to {filename}")
+            self.update_output(f"Successfully exported {self.db_var.get()} database structure to Markdown")
+            
+        except Exception as e:
+            self.status_var.set(f"Error: {e}")
+            self.update_output(f"Error exporting database structure: {e}")
+    
+    def on_structure_select(self):
         """Handle selection in the structure tree"""
         selected_item = self.structure_tree.selection()
         if not selected_item:
