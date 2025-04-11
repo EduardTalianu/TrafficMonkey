@@ -24,6 +24,9 @@ class DatabaseManager:
         self.analysis_db_path = os.path.join(self.db_dir, "analysis.db")
         self.analysis_conn = sqlite3.connect(self.analysis_db_path, check_same_thread=False)
         
+        # Initialize analysis_manager as None, to be set externally
+        self.analysis_manager = None
+        
         # Setup databases using centralized schema
         self._setup_capture_db()
         self._setup_analysis_db()
@@ -162,22 +165,32 @@ class DatabaseManager:
                 if alert_data:
                     ip_address, alert_message, rule_name = alert_data
                     
-                    try:
-                        # Use our transaction context for proper transaction handling
-                        with self.transaction(self.capture_conn) as cursor:
-                            cursor.execute("""
-                                INSERT INTO alerts (ip_address, alert_message, rule_name)
-                                VALUES (?, ?, ?)
-                            """, (ip_address, alert_message, rule_name))
-                            logger.debug(f"Added alert to capture DB: {alert_message[:50]}...")
-                    except Exception as e:
-                        # Use message checking to determine if it's a real error
-                        error_msg = str(e).lower()
-                        if "not an error" in error_msg or "error return without exception set" in error_msg:
-                            # These are often not actual errors but SQLite status messages
-                            logger.debug(f"Non-critical SQLite message: {e}")
-                        else:
-                            logger.error(f"Error writing alert to capture DB: {e}")
+                    # Use analysis_manager if available
+                    if hasattr(self, 'analysis_manager') and self.analysis_manager:
+                        self.analysis_manager.add_alert(ip_address, alert_message, rule_name)
+                    else:
+                        # Fallback to directly writing to x_alerts in capture DB
+                        try:
+                            # Use our transaction context for proper transaction handling
+                            with self.transaction(self.capture_conn) as cursor:
+                                # Ensure x_alerts table exists
+                                cursor.execute("""
+                                    CREATE TABLE IF NOT EXISTS x_alerts (
+                                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                        ip_address TEXT,
+                                        alert_message TEXT,
+                                        rule_name TEXT,
+                                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                    )
+                                """)
+                                
+                                cursor.execute("""
+                                    INSERT INTO x_alerts (ip_address, alert_message, rule_name)
+                                    VALUES (?, ?, ?)
+                                """, (ip_address, alert_message, rule_name))
+                                logger.debug(f"Added alert to x_alerts table: {alert_message[:50]}...")
+                        except Exception as e:
+                            logger.error(f"Error writing alert to x_alerts table: {e}")
                     
                     # Mark as done
                     self.alert_queue.task_done()
@@ -231,9 +244,14 @@ class DatabaseManager:
         logger.debug("Query added to processing queue")
     
     def queue_alert(self, ip_address, alert_message, rule_name):
-        """Add an alert to the queue instead of writing directly"""
+        """Add an alert to the queue for writing to x_alerts"""
         try:
-            self.alert_queue.put((ip_address, alert_message, rule_name))
+            if self.analysis_manager:
+                # If we have an analysis manager, use it directly
+                return self.analysis_manager.add_alert(ip_address, alert_message, rule_name)
+            else:
+                # Otherwise queue it as before, but for x_alerts
+                self.alert_queue.put((ip_address, alert_message, rule_name))
             return True
         except Exception as e:
             logger.error(f"Error queuing alert: {e}")
@@ -466,15 +484,13 @@ class DatabaseManager:
     def update_connection_ttl(self, connection_key, ttl):
         """Update TTL value for a connection"""
         try:
-            cursor = self.capture_conn.cursor()
-            cursor.execute("""
-                UPDATE connections
-                SET ttl = ?
-                WHERE connection_key = ?
-            """, (ttl, connection_key))
-            self.capture_conn.commit()
-            cursor.close()
-            return True
+            with self.transaction(self.capture_conn) as cursor:
+                cursor.execute("""
+                    UPDATE connections
+                    SET ttl = ?
+                    WHERE connection_key = ?
+                """, (ttl, connection_key))
+                return True
         except Exception as e:
             logger.error(f"Error updating TTL: {e}")
             return False
@@ -858,6 +874,7 @@ class TransactionContext:
             try:
                 self.cursor.execute("BEGIN TRANSACTION")
                 self.transaction_active = True
+                logger.debug("Started new transaction")
             except sqlite3.OperationalError as e:
                 if "already a transaction in progress" in str(e) or "cannot start a transaction within a transaction" in str(e):
                     # Transaction already active, we'll use it but not commit/rollback
@@ -882,6 +899,7 @@ class TransactionContext:
                     # No exception occurred, commit the transaction
                     try:
                         self.connection.commit()
+                        logger.debug("Transaction committed successfully")
                     except sqlite3.OperationalError as e:
                         if "cannot commit - no transaction is active" in str(e):
                             logger.debug("No transaction to commit")
@@ -892,6 +910,7 @@ class TransactionContext:
                     # An exception occurred, roll back
                     try:
                         self.connection.rollback()
+                        logger.debug("Transaction rolled back due to exception")
                     except sqlite3.OperationalError as e:
                         if "cannot rollback - no transaction is active" in str(e):
                             logger.debug("No transaction to rollback")

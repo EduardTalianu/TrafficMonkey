@@ -80,9 +80,12 @@ class Rule:
     def add_alert(self, ip_address, alert_message):
         """
         Add an alert for an IP address
-        This will be stored in the alerts table
+        This will be stored in the x_alerts table via analysis_manager
         """
-        if self.db_manager:
+        if self.analysis_manager:
+            return self.analysis_manager.add_alert(ip_address, alert_message, self.name)
+        elif self.db_manager:
+            # Fallback to db_manager
             return self.db_manager.queue_alert(ip_address, alert_message, self.name)
         return False
     
@@ -126,8 +129,7 @@ class Rule:
             logging.error(f"Error ensuring x_red table exists: {e}")
             return False
     
-    def add_red_finding(self, src_ip, dst_ip, description,
-                    severity="medium", details=None, connection_key=None, remediation=None):
+    def add_red_finding(self, src_ip, dst_ip, description, severity="medium", details=None, connection_key=None, remediation=None):
         """
         Add a red team finding to both the database and a file
         """
@@ -152,14 +154,13 @@ class Rule:
                     details_json = str(details)
 
             # 1. Store in x_red table using analysis_manager
-            # MODIFIED THIS SECTION
             conn = None
             if self.analysis_manager and hasattr(self.analysis_manager, 'analysis1_conn'):
                 conn = self.analysis_manager.analysis1_conn
             elif self.db_manager and hasattr(self.db_manager, 'analysis_conn'):
-                 # Fallback to analysis.db if analysis_manager not available (less ideal)
-                 conn = self.db_manager.analysis_conn
-                 logging.warning("Using fallback analysis.db for red findings. analysis_manager might not be injected correctly.")
+                # Fallback to analysis.db if analysis_manager not available
+                conn = self.db_manager.analysis_conn
+                logging.warning("Using fallback analysis.db for red findings. analysis_manager might not be injected correctly.")
 
             if conn:
                 # Ensure x_red table exists (safety check, should be created by AnalysisManager now)
@@ -176,13 +177,14 @@ class Rule:
             else:
                 logging.error("Could not get a database connection to store red finding.")
 
-
-            # 2. Store in red folder as a JSON file (No changes needed here)
+            # 2. Store in red folder as a JSON file
             if self.red_dir:
                 timestamp_str = datetime.fromtimestamp(current_time).strftime("%Y%m%d_%H%M%S")
                 safe_rule_name = self.name.replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')
-                safe_src_ip = src_ip.replace(':', '_') if src_ip else 'NA'
-                safe_dst_ip = dst_ip.replace(':', '_') if dst_ip else 'NA'
+                
+                # Fix: Properly sanitize source and destination IPs for filenames
+                safe_src_ip = 'NA' if not src_ip else str(src_ip).replace(':', '_').replace('/', '_').replace('\\', '_')
+                safe_dst_ip = 'NA' if not dst_ip else str(dst_ip).replace(':', '_').replace('/', '_').replace('\\', '_')
 
                 filename = f"{timestamp_str}_{safe_rule_name}_{safe_src_ip}_{safe_dst_ip}.json"
                 file_path = os.path.join(self.red_dir, filename)
@@ -205,12 +207,8 @@ class Rule:
 
                 logging.info(f"Added red finding for {self.name} to both database and file: {filename}")
 
-            # Add a regular alert to make sure it's visible in the UI
-            # MODIFIED THIS: Use analysis_manager's add_alert if available
-            if self.analysis_manager:
-                self.analysis_manager.add_alert(src_ip, f"RED TEAM FINDING: {description} (Severity: {severity})", self.name)
-            elif self.db_manager: # Fallback
-                self.add_alert(src_ip, f"RED TEAM FINDING: {description} (Severity: {severity})")
+                # REMOVE THE ALERTS PART FROM HERE
+                # No more regular alerts for red findings
 
             return True
 
@@ -268,11 +266,7 @@ class Rule:
     def clear_red_findings(self):
         """Clear all red findings from both the database and folder"""
         try:
-            import os
-            import sqlite3 # Import for exception handling
-
             # Clear database
-            # MODIFIED THIS SECTION
             conn = None
             if self.analysis_manager and hasattr(self.analysis_manager, 'analysis1_conn'):
                 conn = self.analysis_manager.analysis1_conn
@@ -289,10 +283,10 @@ class Rule:
                     cursor.close()
                     logging.info("Cleared x_red table in the database.")
                 except sqlite3.OperationalError as e:
-                     if "no such table: x_red" in str(e):
-                         logging.warning("x_red table does not exist, nothing to clear.")
-                     else:
-                         raise e # Re-raise other operational errors
+                    if "no such table: x_red" in str(e):
+                        logging.warning("x_red table does not exist, nothing to clear.")
+                    else:
+                        raise e # Re-raise other operational errors
             else:
                 logging.error("Could not get database connection to clear red findings.")
 
@@ -837,6 +831,10 @@ class LiveCaptureGUI:
         # Initialize the analysis manager - make sure this happens BEFORE loading rules
         from analysis_manager import AnalysisManager
         self.analysis_manager = AnalysisManager(self.app_root, self.db_manager)
+        
+        # IMPORTANT: Set analysis_manager on the db_manager
+        if hasattr(self.db_manager, 'analysis_manager'):
+            self.db_manager.analysis_manager = self.analysis_manager
 
         # Only after db_manager is created, initialize the capture engine
         from traffic_capture import TrafficCaptureEngine
@@ -949,37 +947,6 @@ class LiveCaptureGUI:
             return []
 
         
-
-    def add_red_finding(self, src_ip, dst_ip, description, severity="medium", details=None, connection_key=None, remediation=None):
-        """
-        Add a red team finding
-        This will be stored in the x_red table and as a file in the red folder
-        """
-        if not self.rules:
-            self.update_output("No rules loaded, cannot add red finding")
-            return False
-            
-        # Use any rule to add the finding
-        rule = self.rules[0]
-        result = rule.add_red_finding(
-            src_ip=src_ip,
-            dst_ip=dst_ip, 
-            description=description,
-            severity=severity,
-            details=details,
-            connection_key=connection_key,
-            remediation=remediation
-        )
-        
-        if result:
-            self.update_output(f"Added red team finding: {description}")
-            # Don't try to refresh the red findings tab since it doesn't exist anymore
-            # Instead, refresh the alerts tab to show the new finding
-            self.refresh_alerts()
-        else:
-            self.update_output("Error adding red team finding")
-            
-        return result
 
     def get_cached_data(self, cache_key, query_func, *args, force_refresh=False, **kwargs):
         """Get data from cache or fetch from database if expired"""
@@ -1824,28 +1791,4 @@ class LiveCaptureGUI:
             return self.capture_engine.packet_count
         return 0
     
-    def add_red_finding(self, src_ip, dst_ip, description, severity="medium", details=None, connection_key=None, remediation=None):
-        """
-        Add a red team finding
-        This will be stored in the x_red table and as a file in the red folder
-        
-        Parameters:
-        - src_ip: Source IP address
-        - dst_ip: Destination IP address 
-        - description: Description of the finding
-        - severity: Severity level (low, medium, high, critical)
-        - details: Additional details as a dict (will be stored as JSON)
-        - connection_key: Optional connection key
-        - remediation: Optional remediation guidance
-        
-        Returns:
-        - True if successful, False otherwise
-        """
-        if self.db_manager and hasattr(self.db_manager, 'gui') and hasattr(self.db_manager.gui, 'red_report_manager'):
-            # Use the red report manager to add the finding
-            return self.db_manager.gui.red_report_manager.add_red_finding(
-                src_ip, dst_ip, self.name, description, severity, details, connection_key, remediation
-            )
-        
-        # Fallback if red_report_manager is not available
-        return self.add_alert(src_ip, f"RED TEAM FINDING ({severity}): {description}")
+    

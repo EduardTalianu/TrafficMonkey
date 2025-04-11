@@ -360,6 +360,17 @@ class TrafficCaptureEngine:
             return self.get_array_value(layers[field_name])
         return None
     
+    def _get_layer_value(self, layers, field_name):
+        """
+        Get a value from the layers object, handling the array format.
+        Returns the first value from the array if present, otherwise None.
+        """
+        if field_name in layers:
+            value = layers[field_name]
+            if isinstance(value, list) and value:
+                return value[0]
+        return None
+    
     def process_packet_ek(self, packet_data):
         """Process a packet in Elasticsearch Kibana format using field definitions"""
         try:
@@ -1187,3 +1198,4 @@ class TrafficCaptureEngine:
             # Queue the alert for processing
             return self.db_manager.queue_alert(ip_address, alert_message, rule_name)
         return False
+    
