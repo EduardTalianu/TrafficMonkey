@@ -3,12 +3,19 @@
 A comprehensive network traffic analyzer and security monitoring tool for detecting and alerting on suspicious network activity.
 
 **Purpose**: GUI-based network traffic analyzer with a plugin architecture.
+
 **Engine**: Uses TShark (via traffic_capture.py) for packet capture and initial field extraction based on capture_fields.py.
+
 **Data Storage**: Uses multiple SQLite databases (capture.db, analysis.db, analysis_1.db) managed by database_manager.py and analysis_manager.py. Data flows and gets synchronized between these.
+
 **Analysis**:
+
 **Rules**: (rules/ directory, loaded by traffic_analyzer.py) analyze data primarily from analysis.db.
+
 **Analysis Plugins**: (analysis/ directory, loaded by analysis_manager.py) process packet data directly or periodically, storing results often in analysis_1.db.
+
 **Output**: Displays information in a Tkinter GUI, organized into tabs and subtabs (alerts/subtabs/). Logs to file. Has a "Red Team" finding mechanism.
+
 
 ![Traffic Monkey Interface](gui_1.png)
 
