@@ -27,7 +27,7 @@ class TrafficPatternAnalyzer(AnalysisBase):
         try:
             # This table should already exist, but ensure it's properly set up
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS traffic_patterns (
+                CREATE TABLE IF NOT EXISTS x_traffic_patterns (
                     connection_key TEXT PRIMARY KEY,
                     avg_packet_size REAL,
                     std_dev_packet_size REAL,
@@ -43,8 +43,8 @@ class TrafficPatternAnalyzer(AnalysisBase):
             """)
             
             # Create indices
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_periodic ON traffic_patterns(periodic_score DESC)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_burst ON traffic_patterns(burst_score DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_periodic ON x_traffic_patterns(periodic_score DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_traffic_burst ON x_traffic_patterns(burst_score DESC)")
             
             self.analysis_manager.analysis1_conn.commit()
             logger.info("Traffic pattern tables initialized")
@@ -88,20 +88,20 @@ class TrafficPatternAnalyzer(AnalysisBase):
                 self.connections[connection_key].pop(0)  # Remove oldest
                 
             # Update traffic patterns in the database
-            self._update_traffic_patterns(connection_key, packet_size)
+            self._update_x_traffic_patterns(connection_key, packet_size)
             
             # Periodically analyze for beaconing behavior
             current_time = time.time()
             if current_time - self.last_analysis_time >= self.analysis_interval:
                 self.last_analysis_time = current_time
-                self._analyze_traffic_patterns()
+                self._analyze_x_traffic_patterns()
             
             return True
         except Exception as e:
             logger.error(f"Error analyzing packet for traffic patterns: {e}")
             return False
     
-    def _update_traffic_patterns(self, connection_key, packet_size):
+    def _update_x_traffic_patterns(self, connection_key, packet_size):
         """Update traffic pattern information for behavioral analysis"""
         try:
             cursor = self.analysis_manager.get_cursor()
@@ -109,7 +109,7 @@ class TrafficPatternAnalyzer(AnalysisBase):
             # Check if we already have a record for this connection
             cursor.execute("""
                 SELECT avg_packet_size, session_count, packet_size_distribution
-                FROM traffic_patterns
+                FROM x_traffic_patterns
                 WHERE connection_key = ?
             """, (connection_key,))
             
@@ -135,7 +135,7 @@ class TrafficPatternAnalyzer(AnalysisBase):
                 size_dist[size_key] = size_dist.get(size_key, 0) + 1
                 
                 cursor.execute("""
-                    UPDATE traffic_patterns
+                    UPDATE x_traffic_patterns
                     SET avg_packet_size = ?,
                         packet_size_distribution = ?,
                         session_count = session_count + 1,
@@ -147,7 +147,7 @@ class TrafficPatternAnalyzer(AnalysisBase):
                 size_dist = {str(packet_size - (packet_size % 100)): 1}
                 
                 cursor.execute("""
-                    INSERT INTO traffic_patterns
+                    INSERT INTO x_traffic_patterns
                     (connection_key, avg_packet_size, packet_size_distribution, session_count, first_seen, last_seen)
                     VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """, (connection_key, packet_size, json.dumps(size_dist)))
@@ -160,7 +160,7 @@ class TrafficPatternAnalyzer(AnalysisBase):
             logger.error(f"Error updating traffic patterns: {e}")
             return False
     
-    def _analyze_traffic_patterns(self):
+    def _analyze_x_traffic_patterns(self):
         """Analyze stored connection data for patterns"""
         try:
             # Calculate standard deviation and look for beaconing behavior
@@ -202,7 +202,7 @@ class TrafficPatternAnalyzer(AnalysisBase):
                                 try:
                                     # Update the periodic score
                                     cursor.execute("""
-                                        UPDATE traffic_patterns
+                                        UPDATE x_traffic_patterns
                                         SET periodic_score = ?,
                                             std_dev_packet_size = ?,
                                             classification = CASE WHEN ? > 7 THEN 'potential_beacon' ELSE classification END
@@ -251,7 +251,7 @@ class TrafficPatternAnalyzer(AnalysisBase):
             # Find high-scoring connections for beaconing
             cursor.execute("""
                 SELECT connection_key, periodic_score, avg_packet_size, session_count
-                FROM traffic_patterns
+                FROM x_traffic_patterns
                 WHERE periodic_score > 7
                 AND last_seen > ?
                 ORDER BY periodic_score DESC

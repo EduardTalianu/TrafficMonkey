@@ -1,9 +1,9 @@
-# connection_statistics.py - Aggregates connection statistics
+# x_connection_statistics.py - Aggregates connection statistics
 import time
 import logging
 import json
 
-logger = logging.getLogger('connection_statistics')
+logger = logging.getLogger('x_connection_statistics')
 
 class ConnectionStatisticsAnalyzer(AnalysisBase):
     """Aggregates connection statistics for dashboard display"""
@@ -22,7 +22,7 @@ class ConnectionStatisticsAnalyzer(AnalysisBase):
         try:
             # Create statistics table if it doesn't exist
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS connection_statistics (
+                CREATE TABLE IF NOT EXISTS x_connection_statistics (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp REAL,
                     total_connections INTEGER,
@@ -38,7 +38,7 @@ class ConnectionStatisticsAnalyzer(AnalysisBase):
             """)
             
             # Create index
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_conn_stats_time ON connection_statistics(timestamp)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_conn_stats_time ON x_connection_statistics(timestamp)")
             
             self.analysis_manager.analysis1_conn.commit()
             logger.info("Connection statistics tables initialized")
@@ -59,9 +59,9 @@ class ConnectionStatisticsAnalyzer(AnalysisBase):
             return False  # Not time for aggregation yet
         
         self.last_aggregation_time = current_time
-        return self.aggregate_connection_statistics()
+        return self.aggregate_x_connection_statistics()
     
-    def aggregate_connection_statistics(self):
+    def aggregate_x_connection_statistics(self):
         """
         Aggregate connection statistics and store in analysis_1.db
         """
@@ -95,7 +95,7 @@ class ConnectionStatisticsAnalyzer(AnalysisBase):
             # Store aggregated statistics
             current_time = time.time()
             cursor.execute("""
-                INSERT INTO connection_statistics
+                INSERT INTO x_connection_statistics
                 (timestamp, total_connections, active_connections, total_bytes, 
                 unique_src_ips, unique_dst_ips, rdp_connections, 
                 http_connections, https_connections, dns_queries)
@@ -133,7 +133,7 @@ class ConnectionStatisticsAnalyzer(AnalysisBase):
             cursor.execute("""
                 SELECT total_connections, active_connections, total_bytes, unique_src_ips, 
                        unique_dst_ips, rdp_connections, http_connections, https_connections, dns_queries
-                FROM connection_statistics
+                FROM x_connection_statistics
                 ORDER BY timestamp DESC
                 LIMIT 1
             """)

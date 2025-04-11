@@ -42,7 +42,7 @@ class ICMPAnalyzer(AnalysisBase):
         try:
             # ICMP flood events table with enhanced schema
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS icmp_flood_events (
+                CREATE TABLE IF NOT EXISTS x_icmp_flood_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     src_ip TEXT,
                     dst_ip TEXT,
@@ -65,7 +65,7 @@ class ICMPAnalyzer(AnalysisBase):
             
             # ICMP ping sweep events table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS icmp_sweep_events (
+                CREATE TABLE IF NOT EXISTS x_icmp_sweep_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     src_ip TEXT,
                     target_count INTEGER,
@@ -83,7 +83,7 @@ class ICMPAnalyzer(AnalysisBase):
             
             # ICMP behavior patterns table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS icmp_behavior_patterns (
+                CREATE TABLE IF NOT EXISTS x_icmp_behavior_patterns (
                     src_ip TEXT PRIMARY KEY,
                     first_seen REAL,
                     last_seen REAL,
@@ -100,16 +100,16 @@ class ICMPAnalyzer(AnalysisBase):
             """)
             
             # Create indices
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_flood_src ON icmp_flood_events(src_ip)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_flood_dst ON icmp_flood_events(dst_ip)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_flood_time ON icmp_flood_events(start_time)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_flood_type ON icmp_flood_events(event_type)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_flood_src ON x_icmp_flood_events(src_ip)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_flood_dst ON x_icmp_flood_events(dst_ip)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_flood_time ON x_icmp_flood_events(start_time)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_flood_type ON x_icmp_flood_events(event_type)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_sweep_src ON icmp_sweep_events(src_ip)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_sweep_time ON icmp_sweep_events(start_time)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_sweep_src ON x_icmp_sweep_events(src_ip)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_sweep_time ON x_icmp_sweep_events(start_time)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_behavior_seen ON icmp_behavior_patterns(last_seen)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_behavior_score ON icmp_behavior_patterns(behavioral_score)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_behavior_seen ON x_icmp_behavior_patterns(last_seen)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_icmp_behavior_score ON x_icmp_behavior_patterns(behavioral_score)")
             
             self.analysis_manager.analysis1_conn.commit()
             logger.info("ICMP analysis tables initialized with enhanced schema")
@@ -274,7 +274,7 @@ class ICMPAnalyzer(AnalysisBase):
             if recent_packet_count >= self.flood_threshold:
                 # Look for existing ongoing flood event
                 cursor.execute("""
-                    SELECT id, packet_count, start_time FROM icmp_flood_events
+                    SELECT id, packet_count, start_time FROM x_icmp_flood_events
                     WHERE src_ip = ? AND dst_ip = ? AND end_time > ? AND reported = 0
                     ORDER BY end_time DESC LIMIT 1
                 """, (src_ip, dst_ip, current_time - 60))  # Look for events in the last minute
@@ -313,7 +313,7 @@ class ICMPAnalyzer(AnalysisBase):
                     
                     # Update the event
                     cursor.execute("""
-                        UPDATE icmp_flood_events
+                        UPDATE x_icmp_flood_events
                         SET packet_count = packet_count + 1,
                             average_size = ?,
                             size_variation = ?,
@@ -373,7 +373,7 @@ class ICMPAnalyzer(AnalysisBase):
                     
                     # Create new flood event with enhanced metadata
                     cursor.execute("""
-                        INSERT INTO icmp_flood_events
+                        INSERT INTO x_icmp_flood_events
                         (src_ip, dst_ip, packet_count, average_size, size_variation, start_time, end_time, 
                          event_type, timing_pattern, sequence_pattern, burst_pattern, tunnel_probability,
                          likely_tool, interval_avg, interval_std)
@@ -461,7 +461,7 @@ class ICMPAnalyzer(AnalysisBase):
             try:
                 # Check for recent similar sweep to avoid duplicates
                 cursor.execute("""
-                    SELECT id FROM icmp_sweep_events
+                    SELECT id FROM x_icmp_sweep_events
                     WHERE src_ip = ? AND end_time > ?
                     ORDER BY end_time DESC LIMIT 1
                 """, (src_ip, current_time - 300))  # Look for events in the last 5 minutes
@@ -471,7 +471,7 @@ class ICMPAnalyzer(AnalysisBase):
                 if not existing_sweep:
                     # Create new sweep event
                     cursor.execute("""
-                        INSERT INTO icmp_sweep_events
+                        INSERT INTO x_icmp_sweep_events
                         (src_ip, target_count, scanned_subnets, start_time, end_time, 
                          sweep_pattern, likely_tool, timing_score, response_rate, sequence_behavior)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -525,7 +525,7 @@ class ICMPAnalyzer(AnalysisBase):
             try:
                 # Check for recent tunnel alert to avoid duplicates
                 cursor.execute("""
-                    SELECT id FROM icmp_flood_events
+                    SELECT id FROM x_icmp_flood_events
                     WHERE src_ip = ? AND dst_ip = ? AND event_type = 'confirmed_tunnel' AND end_time > ?
                     ORDER BY end_time DESC LIMIT 1
                 """, (src_ip, dst_ip, current_time - 600))  # Last 10 minutes
@@ -550,7 +550,7 @@ class ICMPAnalyzer(AnalysisBase):
                     
                     # Record confirmed tunnel event
                     cursor.execute("""
-                        INSERT INTO icmp_flood_events
+                        INSERT INTO x_icmp_flood_events
                         (src_ip, dst_ip, packet_count, average_size, size_variation, start_time, end_time, 
                          event_type, timing_pattern, sequence_pattern, burst_pattern, tunnel_probability,
                          likely_tool, interval_avg, interval_std)
@@ -587,7 +587,7 @@ class ICMPAnalyzer(AnalysisBase):
             # Check if profile exists
             cursor.execute("""
                 SELECT total_packets, avg_packet_size, usual_targets, usual_icmp_types, timing_pattern
-                FROM icmp_behavior_patterns
+                FROM x_icmp_behavior_patterns
                 WHERE src_ip = ?
             """, (src_ip,))
             
@@ -635,7 +635,7 @@ class ICMPAnalyzer(AnalysisBase):
                 
                 # Update profile
                 cursor.execute("""
-                    UPDATE icmp_behavior_patterns
+                    UPDATE x_icmp_behavior_patterns
                     SET last_seen = ?,
                         total_packets = ?,
                         avg_packet_size = ?,
@@ -681,7 +681,7 @@ class ICMPAnalyzer(AnalysisBase):
                 flags = "new_host"
                 
                 cursor.execute("""
-                    INSERT INTO icmp_behavior_patterns
+                    INSERT INTO x_icmp_behavior_patterns
                     (src_ip, first_seen, last_seen, total_packets, avg_packet_size, usual_targets,
                      usual_icmp_types, timing_pattern, sequence_pattern, behavior_profile, behavioral_score, flags)
                     VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1100,7 +1100,7 @@ class ICMPAnalyzer(AnalysisBase):
             cursor.execute("""
                 SELECT id, src_ip, dst_ip, packet_count, start_time, end_time, event_type,
                       average_size, timing_pattern, likely_tool
-                FROM icmp_flood_events
+                FROM x_icmp_flood_events
                 WHERE reported = 0 AND end_time < ?
                 ORDER BY packet_count DESC
                 LIMIT 20
@@ -1112,7 +1112,7 @@ class ICMPAnalyzer(AnalysisBase):
                 event_id, src_ip, dst_ip, packet_count, start_time, end_time, event_type, avg_size, timing_pattern, likely_tool = event
                 
                 # Mark as reported
-                cursor.execute("UPDATE icmp_flood_events SET reported = 1 WHERE id = ?", (event_id,))
+                cursor.execute("UPDATE x_icmp_flood_events SET reported = 1 WHERE id = ?", (event_id,))
                 
                 # Log summary of the event
                 duration = end_time - start_time
@@ -1125,7 +1125,7 @@ class ICMPAnalyzer(AnalysisBase):
             # Also report on ping sweeps
             cursor.execute("""
                 SELECT id, src_ip, target_count, sweep_pattern, likely_tool, timing_score, sequence_behavior
-                FROM icmp_sweep_events
+                FROM x_icmp_sweep_events
                 WHERE reported = 0 AND end_time < ?
                 ORDER BY target_count DESC
                 LIMIT 10
@@ -1137,7 +1137,7 @@ class ICMPAnalyzer(AnalysisBase):
                 event_id, src_ip, target_count, sweep_pattern, likely_tool, timing_score, sequence_behavior = event
                 
                 # Mark as reported
-                cursor.execute("UPDATE icmp_sweep_events SET reported = 1 WHERE id = ?", (event_id,))
+                cursor.execute("UPDATE x_icmp_sweep_events SET reported = 1 WHERE id = ?", (event_id,))
                 
                 # Log summary of the sweep
                 logger.info(f"ICMP sweep summary: {src_ip} scanned {target_count} targets, pattern: {sweep_pattern}")
@@ -1146,7 +1146,7 @@ class ICMPAnalyzer(AnalysisBase):
             # Analyze behavior patterns
             cursor.execute("""
                 SELECT src_ip, behavior_profile, behavioral_score, flags, total_packets
-                FROM icmp_behavior_patterns
+                FROM x_icmp_behavior_patterns
                 WHERE behavioral_score > 7 AND last_seen > ?
                 ORDER BY behavioral_score DESC
                 LIMIT 10

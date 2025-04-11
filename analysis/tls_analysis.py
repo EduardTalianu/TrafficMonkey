@@ -1,4 +1,4 @@
-# tls_analysis.py - Enhanced TLS/SSL traffic analysis
+# x_tls_analysis.py - Enhanced TLS/SSL traffic analysis
 import time
 import logging
 import socket
@@ -7,7 +7,7 @@ import re
 from collections import defaultdict
 import math
 
-logger = logging.getLogger('tls_analysis')
+logger = logging.getLogger('x_tls_analysis')
 
 class TLSAnalyzer(AnalysisBase):
     """Advanced TLS/SSL traffic analyzer with certificate and cipher analysis"""
@@ -56,7 +56,7 @@ class TLSAnalyzer(AnalysisBase):
         try:
             # TLS analysis results table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS tls_analysis (
+                CREATE TABLE IF NOT EXISTS x_tls_analysis (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     connection_key TEXT UNIQUE,
                     server_name TEXT,
@@ -80,7 +80,7 @@ class TLSAnalyzer(AnalysisBase):
             
             # Certificate analysis table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS tls_certificate_analysis (
+                CREATE TABLE IF NOT EXISTS x_tls_certificate_analysis (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     connection_key TEXT,
                     server_name TEXT,
@@ -106,7 +106,7 @@ class TLSAnalyzer(AnalysisBase):
             
             # JA3 fingerprint table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS tls_ja3_fingerprints (
+                CREATE TABLE IF NOT EXISTS x_tls_ja3_fingerprints (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ja3_hash TEXT,
                     ja3_string TEXT,
@@ -124,7 +124,7 @@ class TLSAnalyzer(AnalysisBase):
             
             # Server analysis table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS tls_server_analysis (
+                CREATE TABLE IF NOT EXISTS x_tls_server_analysis (
                     server_name TEXT PRIMARY KEY,
                     supported_protocols TEXT,
                     preferred_cipher TEXT,
@@ -140,19 +140,19 @@ class TLSAnalyzer(AnalysisBase):
             """)
             
             # Create indices
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_analysis_server ON tls_analysis(server_name)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_analysis_score ON tls_analysis(suspicious_score DESC)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_analysis_security ON tls_analysis(security_level)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_tls_analysis_server ON x_tls_analysis(server_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_tls_analysis_score ON x_tls_analysis(suspicious_score DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_tls_analysis_security ON x_tls_analysis(security_level)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_cert_server ON tls_certificate_analysis(server_name)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_cert_issuer ON tls_certificate_analysis(issuer_cn)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_cert_score ON tls_certificate_analysis(security_score)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_cert_server ON x_tls_certificate_analysis(server_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_cert_issuer ON x_tls_certificate_analysis(issuer_cn)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_cert_score ON x_tls_certificate_analysis(security_score)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_ja3_hash ON tls_ja3_fingerprints(ja3_hash)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_ja3_known ON tls_ja3_fingerprints(is_known)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_ja3_hash ON x_tls_ja3_fingerprints(ja3_hash)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_ja3_known ON x_tls_ja3_fingerprints(is_known)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_server_name ON tls_server_analysis(server_name)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_server_score ON tls_server_analysis(security_score)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_server_name ON x_tls_server_analysis(server_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tls_server_score ON x_tls_server_analysis(security_score)")
             
             self.analysis_manager.analysis1_conn.commit()
             logger.info("TLS analysis tables initialized with enhanced schema")
@@ -347,13 +347,13 @@ class TLSAnalyzer(AnalysisBase):
         
         try:
             # Check if connection exists in analysis
-            cursor.execute("SELECT first_seen FROM tls_analysis WHERE connection_key = ?", (connection_key,))
+            cursor.execute("SELECT first_seen FROM x_tls_analysis WHERE connection_key = ?", (connection_key,))
             result = cursor.fetchone()
             
             if result:
                 # Update existing connection
                 cursor.execute("""
-                    UPDATE tls_analysis
+                    UPDATE x_tls_analysis
                     SET server_name = ?,
                         suspicious_score = ?,
                         cipher_issues = ?,
@@ -391,7 +391,7 @@ class TLSAnalyzer(AnalysisBase):
             else:
                 # Insert new connection analysis
                 cursor.execute("""
-                    INSERT INTO tls_analysis
+                    INSERT INTO x_tls_analysis
                     (connection_key, server_name, suspicious_score, cipher_issues, 
                      version_issues, port_issues, first_seen, last_seen, detection_details,
                      client_random, cipher_suite, tls_version, security_level,
@@ -529,7 +529,7 @@ class TLSAnalyzer(AnalysisBase):
         try:
             # Check if we've already analyzed this certificate
             cursor.execute("""
-                SELECT id FROM tls_certificate_analysis
+                SELECT id FROM x_tls_certificate_analysis
                 WHERE server_name = ? AND subject_cn = ? AND issuer_cn = ?
             """, (server_name, subject_cn, issuer_cn))
             
@@ -541,7 +541,7 @@ class TLSAnalyzer(AnalysisBase):
                 # Update existing certificate analysis
                 cert_id = result[0]
                 cursor.execute("""
-                    UPDATE tls_certificate_analysis
+                    UPDATE x_tls_certificate_analysis
                     SET connection_key = ?,
                         valid_from = ?,
                         valid_to = ?,
@@ -575,7 +575,7 @@ class TLSAnalyzer(AnalysisBase):
             else:
                 # Insert new certificate analysis
                 cursor.execute("""
-                    INSERT INTO tls_certificate_analysis
+                    INSERT INTO x_tls_certificate_analysis
                     (connection_key, server_name, subject_cn, issuer_cn, valid_from, valid_to,
                      key_type, key_size, signature_algorithm, is_expired, is_self_signed,
                      is_wildcard, san_entries, domain_match, security_score, first_seen, last_seen)
@@ -611,7 +611,7 @@ class TLSAnalyzer(AnalysisBase):
         
         try:
             # Check if fingerprint exists
-            cursor.execute("SELECT count, client_ips, destinations FROM tls_ja3_fingerprints WHERE ja3_hash = ?", (ja3_hash,))
+            cursor.execute("SELECT count, client_ips, destinations FROM x_tls_ja3_fingerprints WHERE ja3_hash = ?", (ja3_hash,))
             result = cursor.fetchone()
             
             if result:
@@ -637,7 +637,7 @@ class TLSAnalyzer(AnalysisBase):
                     destinations = destinations[-100:]
                 
                 cursor.execute("""
-                    UPDATE tls_ja3_fingerprints
+                    UPDATE x_tls_ja3_fingerprints
                     SET count = count + 1,
                         last_seen = ?,
                         client_ips = ?,
@@ -652,7 +652,7 @@ class TLSAnalyzer(AnalysisBase):
             else:
                 # Insert new JA3 fingerprint
                 cursor.execute("""
-                    INSERT INTO tls_ja3_fingerprints
+                    INSERT INTO x_tls_ja3_fingerprints
                     (ja3_hash, count, first_seen, last_seen, client_ips, destinations)
                     VALUES (?, 1, ?, ?, ?, ?)
                 """, (
@@ -671,7 +671,7 @@ class TLSAnalyzer(AnalysisBase):
         """Update TLS server behavior analysis"""
         try:
             # Check if server exists
-            cursor.execute("SELECT supported_protocols, preferred_cipher FROM tls_server_analysis WHERE server_name = ?", (server_name,))
+            cursor.execute("SELECT supported_protocols, preferred_cipher FROM x_tls_server_analysis WHERE server_name = ?", (server_name,))
             result = cursor.fetchone()
             
             # Parse TLS extensions
@@ -717,7 +717,7 @@ class TLSAnalyzer(AnalysisBase):
                 )
                 
                 cursor.execute("""
-                    UPDATE tls_server_analysis
+                    UPDATE x_tls_server_analysis
                     SET supported_protocols = ?,
                         preferred_cipher = ?,
                         supports_alpn = ?,
@@ -741,7 +741,7 @@ class TLSAnalyzer(AnalysisBase):
                 )
                 
                 cursor.execute("""
-                    INSERT INTO tls_server_analysis
+                    INSERT INTO x_tls_server_analysis
                     (server_name, supported_protocols, preferred_cipher, uses_sni,
                      supports_alpn, alpn_protocols, first_seen, last_seen, security_score)
                     VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
@@ -895,41 +895,202 @@ class TLSAnalyzer(AnalysisBase):
             return False
     
     def _resolve_domain_names(self):
-        """Resolve IP addresses to domain names for TLS connections"""
+        """Attempt reverse DNS lookup for server names that are IP addresses."""
+        cursor = None
+        updates = 0
+        processed = 0
         try:
             cursor = self.analysis_manager.get_cursor()
-            
-            # Get all TLS connections with server names that look like IP addresses
+
+            # Get TLS connections where server_name is likely an IP address
+            # Limit the query to avoid locking or long processing times
             cursor.execute("""
                 SELECT id, server_name, connection_key
-                FROM tls_analysis
-                WHERE server_name LIKE '%\\.%\\.%\\.%' 
-                OR server_name IS NULL
-                LIMIT 100
-            """)
-            
+                FROM x_tls_analysis
+                WHERE (server_name GLOB '*.*.*.*' OR server_name GLOB '*:*:*:*:*:*:*:*') -- Basic IP check
+                  AND last_seen > ? -- Only check recently seen connections
+                LIMIT 200
+            """, (time.time() - 86400,)) # Check connections seen in the last day
+
             rows = cursor.fetchall()
-            updates = 0
-            
+            processed = len(rows)
+
             for row in rows:
-                tls_id, server_name, connection_key = row
-                
-                # Extract destination IP from connection key
-                try:
-                    dst_ip = connection_key.split('->')[1].split(':')[0]
-                except IndexError:
+                tls_id, server_name_ip, connection_key = row
+
+                # Double check if it's actually an IP
+                if not self.analysis_manager._is_ip_address(server_name_ip):
                     continue
-                    
-                # Skip if we already have a non-IP server name
-                if server_name and not self.analysis_manager._is_ip_address(server_name):
-                    continue
-                    
+
                 # Try reverse DNS lookup
                 try:
-                    hostname, _, _ = socket.gethostbyaddr(dst_ip)
-                    if hostname and hostname != dst_ip and not self.analysis_manager._is_ip_address(hostname):
+                    # Use a timeout for DNS lookups
+                    socket.setdefaulttimeout(2) # 2 second timeout
+                    hostname, _, _ = socket.gethostbyaddr(server_name_ip)
+                    socket.setdefaulttimeout(None) # Reset timeout
+
+                    # Check if lookup returned a valid, different hostname
+                    if hostname and hostname != server_name_ip and not self.analysis_manager._is_ip_address(hostname):
                         # Update the server name in the database
                         cursor.execute("""
-                            UPDATE tls_analysis
+                            UPDATE x_tls_analysis
                             SET server_name = ?
-                            WHERE id = ?
+                            WHERE id = ? AND server_name = ?
+                        """, (hostname, tls_id, server_name_ip)) # Ensure we only update the correct record
+                        updates += 1
+                        logger.debug(f"Resolved {server_name_ip} to {hostname} for TLS record {tls_id}")
+
+                except (socket.herror, socket.gaierror, socket.timeout) as e:
+                    # Handle lookup failures gracefully
+                    logger.debug(f"Reverse DNS lookup failed for {server_name_ip}: {e}")
+                except Exception as e:
+                    logger.warning(f"Unexpected error during reverse DNS lookup for {server_name_ip}: {e}")
+
+            if updates > 0:
+                self.analysis_manager.analysis1_conn.commit()
+            logger.info(f"Attempted reverse DNS lookup for {processed} TLS records, updated {updates} hostnames.")
+
+        except Exception as e:
+            logger.error(f"Error resolving domain names for TLS analysis: {e}", exc_info=True)
+            if self.analysis_manager and self.analysis_manager.analysis1_conn:
+                 self.analysis_manager.analysis1_conn.rollback()
+        finally:
+            socket.setdefaulttimeout(None) # Ensure timeout is reset
+            if cursor:
+                cursor.close()
+
+
+    def _check_certificate_expiration(self):
+        """Check for certificates expiring within a defined window (e.g., 30 days)."""
+        cursor = None
+        expiring_count = 0
+        try:
+            cursor = self.analysis_manager.get_cursor()
+            expiration_window = time.time() + (86400 * 30) # 30 days from now
+            current_time = time.time()
+
+            cursor.execute("""
+                SELECT server_name, subject_cn, issuer_cn, valid_to
+                FROM x_tls_certificate_analysis
+                WHERE valid_to BETWEEN ? AND ?
+                  AND is_expired = 0 -- Only check non-expired certs
+                ORDER BY valid_to ASC
+                LIMIT 50 -- Limit results per run
+            """, (current_time, expiration_window))
+
+            expiring_certs = cursor.fetchall()
+            expiring_count = len(expiring_certs)
+
+            for cert in expiring_certs:
+                server_name, subject_cn, issuer_cn, valid_to = cert
+                days_left = (valid_to - current_time) / 86400
+                logger.warning(f"TLS Certificate expiring soon ({days_left:.1f} days): "
+                               f"Server='{server_name}', Subject='{subject_cn}', Issuer='{issuer_cn}'")
+                # Potential action: Generate an alert
+
+            logger.info(f"Checked for certificate expiration, found {expiring_count} certificates expiring within 30 days.")
+
+        except Exception as e:
+            logger.error(f"Error checking certificate expiration: {e}", exc_info=True)
+        finally:
+            if cursor:
+                cursor.close()
+
+    def _analyze_server_security(self):
+        """Analyze overall server security based on stored metrics."""
+        cursor = None
+        low_score_count = 0
+        try:
+            cursor = self.analysis_manager.get_cursor()
+            low_score_threshold = 4.0 # Servers scoring below this are flagged
+
+            cursor.execute("""
+                SELECT server_name, security_score, supported_protocols, preferred_cipher, last_seen
+                FROM x_tls_server_analysis
+                WHERE security_score < ?
+                  AND last_seen > ? -- Only analyze recently active servers
+                ORDER BY security_score ASC
+                LIMIT 50 -- Limit results per run
+            """, (low_score_threshold, time.time() - 86400 * 7)) # Active in last 7 days
+
+            insecure_servers = cursor.fetchall()
+            low_score_count = len(insecure_servers)
+
+            for server in insecure_servers:
+                server_name, score, protocols, cipher, last_seen = server
+                logger.warning(f"Low TLS security score ({score:.1f}/10) for server: '{server_name}'. "
+                               f"Protocols: {protocols}, Cipher: {cipher}, Last Seen: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_seen))}")
+                # Potential action: Generate an alert or increase scrutiny
+
+            logger.info(f"Analyzed server security, found {low_score_count} servers with score < {low_score_threshold}.")
+
+        except Exception as e:
+            logger.error(f"Error analyzing server security: {e}", exc_info=True)
+        finally:
+            if cursor:
+                cursor.close()
+
+    def _analyze_unusual_fingerprints(self):
+        """Analyze JA3 fingerprints for anomalies (e.g., unknown, low count, suspicious destinations)."""
+        cursor = None
+        unusual_count = 0
+        try:
+            cursor = self.analysis_manager.get_cursor()
+
+            # Find JA3 fingerprints that are not marked as known and have been seen recently
+            cursor.execute("""
+                SELECT ja3_hash, ja3_string, count, client_ips, destinations, first_seen, last_seen
+                FROM x_tls_ja3_fingerprints
+                WHERE is_known = 0
+                  AND last_seen > ? -- Seen in the last day
+                ORDER BY count ASC, last_seen DESC
+                LIMIT 100 -- Limit results per run
+            """, (time.time() - 86400,))
+
+            fingerprints = cursor.fetchall()
+            unusual_count = len(fingerprints)
+
+            for fp in fingerprints:
+                ja3_hash, ja3_string, count, clients_json, dests_json, first_seen, last_seen = fp
+                try:
+                    clients = json.loads(clients_json)
+                    destinations = json.loads(dests_json)
+                except json.JSONDecodeError:
+                    clients = []
+                    destinations = []
+
+                # Simple heuristics for unusualness: low count, high number of destinations for low count
+                is_suspicious = False
+                if count < 5:
+                    is_suspicious = True
+                    reason = "very low count"
+                elif len(destinations) > count * 2 and count < 20: # Many destinations relative to count
+                    is_suspicious = True
+                    reason = "high destination diversity for count"
+                elif len(clients) > 10 and count < 50: # Many clients for relatively low count
+                     is_suspicious = True
+                     reason = "high client diversity for count"
+
+                if is_suspicious:
+                    logger.info(f"Potentially unusual JA3 fingerprint: {ja3_hash} (Reason: {reason}). "
+                                f"Count: {count}, Clients: {len(clients)}, Destinations: {len(destinations)}. "
+                                f"First Seen: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(first_seen))}, "
+                                f"Last Seen: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_seen))}")
+                    # Log JA3 string if available for easier identification
+                    if ja3_string:
+                        logger.info(f"  JA3 String: {ja3_string}")
+                    # Log sample destinations
+                    logger.info(f"  Sample Destinations: {destinations[:5]}")
+
+            logger.info(f"Analyzed JA3 fingerprints, found {unusual_count} potentially unusual unknown fingerprints.")
+
+        except Exception as e:
+            logger.error(f"Error analyzing unusual JA3 fingerprints: {e}", exc_info=True)
+        finally:
+            if cursor:
+                cursor.close()
+
+    def cleanup(self):
+        """Clean up resources (if any)"""
+        logger.info("Cleaning up TLS Analyzer resources.")
+        # No specific resources to clean in this version (caches are managed implicitly or by DB)

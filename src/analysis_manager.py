@@ -162,11 +162,14 @@ class AnalysisManager:
         self.queue_running = True
         self.queue_thread = threading.Thread(target=self._process_queue, daemon=True)
         self.queue_thread.start()
-        
-        # Analysis plugins
+
+        # Initialize analysis plugins properties
         self.analysis_plugins = []
         self.analysis_plugins_dir = os.path.join(app_root, "analysis")
         os.makedirs(self.analysis_plugins_dir, exist_ok=True)
+
+        # Now load the plugins
+        self.load_analysis_plugins()
         
                 
         # Start periodic analysis thread

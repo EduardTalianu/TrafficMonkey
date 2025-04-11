@@ -1,11 +1,11 @@
-# dns_analysis.py - Analyzes DNS traffic patterns with enhanced analytics
+# x_dns_analysis.py - Analyzes DNS traffic patterns with enhanced analytics
 import time
 import math
 import logging
 import json
 from collections import Counter
 
-logger = logging.getLogger('dns_analysis')
+logger = logging.getLogger('x_dns_analysis')
 
 class DNSAnalyzer(AnalysisBase):
     """Analyzes DNS queries for potential C&C, DGA, and other suspicious patterns with advanced analytics"""
@@ -37,7 +37,7 @@ class DNSAnalyzer(AnalysisBase):
         try:
             # DNS analysis results table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS dns_analysis (
+                CREATE TABLE IF NOT EXISTS x_dns_analysis (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     domain TEXT UNIQUE,
                     entropy REAL,
@@ -61,7 +61,7 @@ class DNSAnalyzer(AnalysisBase):
             
             # Domain popularity tracking
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS dns_domain_popularity (
+                CREATE TABLE IF NOT EXISTS x_dns_domain_popularity (
                     domain TEXT PRIMARY KEY,
                     hourly_counts TEXT,  -- JSON array of hourly query counts
                     daily_counts TEXT,   -- JSON array of daily query counts
@@ -84,13 +84,13 @@ class DNSAnalyzer(AnalysisBase):
             """)
             
             # Create indices
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dns_analysis_domain ON dns_analysis(domain)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dns_analysis_score ON dns_analysis(score DESC)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dns_analysis_classification ON dns_analysis(classification)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dns_analysis_tld ON dns_analysis(tld)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dns_analysis_dga ON dns_analysis(is_dga_candidate)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_dns_analysis_domain ON x_dns_analysis(domain)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_dns_analysis_score ON x_dns_analysis(score DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_dns_analysis_classification ON x_dns_analysis(classification)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_dns_analysis_tld ON x_dns_analysis(tld)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_dns_analysis_dga ON x_dns_analysis(is_dga_candidate)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dns_popularity_domain ON dns_domain_popularity(domain)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dns_popularity_domain ON x_dns_domain_popularity(domain)")
             
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_dns_client_patterns_periodic ON dns_client_patterns(periodic_score DESC)")
             
@@ -198,14 +198,14 @@ class DNSAnalyzer(AnalysisBase):
         
         try:
             # Check if domain exists
-            cursor.execute("SELECT query_count, first_seen FROM dns_analysis WHERE domain = ?", (query_name,))
+            cursor.execute("SELECT query_count, first_seen FROM x_dns_analysis WHERE domain = ?", (query_name,))
             result = cursor.fetchone()
             
             if result:
                 # Update existing domain record
                 query_count, first_seen = result
                 cursor.execute("""
-                    UPDATE dns_analysis
+                    UPDATE x_dns_analysis
                     SET query_count = query_count + 1,
                         entropy = ?,
                         max_consonant_seq = ?,
@@ -227,7 +227,7 @@ class DNSAnalyzer(AnalysisBase):
             else:
                 # Insert new domain record
                 cursor.execute("""
-                    INSERT INTO dns_analysis
+                    INSERT INTO x_dns_analysis
                     (domain, entropy, max_consonant_seq, query_count, first_seen, last_seen, 
                      score, classification, tld, domain_length, digit_ratio, 
                      has_repetitive_patterns, randomness_score, is_dga_candidate, parent_domain)
@@ -251,7 +251,7 @@ class DNSAnalyzer(AnalysisBase):
         current_hour = int(timestamp / 3600) * 3600  # Round to nearest hour
         
         # Check if domain exists in popularity tracking
-        cursor.execute("SELECT hourly_counts, daily_counts, unique_clients FROM dns_domain_popularity WHERE domain = ?", (domain,))
+        cursor.execute("SELECT hourly_counts, daily_counts, unique_clients FROM x_dns_domain_popularity WHERE domain = ?", (domain,))
         result = cursor.fetchone()
         
         if result:
@@ -296,7 +296,7 @@ class DNSAnalyzer(AnalysisBase):
             
             # Update popularity record
             cursor.execute("""
-                UPDATE dns_domain_popularity
+                UPDATE x_dns_domain_popularity
                 SET hourly_counts = ?,
                     daily_counts = ?,
                     unique_clients = ?,
@@ -315,7 +315,7 @@ class DNSAnalyzer(AnalysisBase):
             daily_counts = {str(int(timestamp / 86400) * 86400): 1}
             
             cursor.execute("""
-                INSERT INTO dns_domain_popularity
+                INSERT INTO x_dns_domain_popularity
                 (domain, hourly_counts, daily_counts, unique_clients, last_updated)
                 VALUES (?, ?, ?, 1, ?)
             """, (
@@ -448,7 +448,7 @@ class DNSAnalyzer(AnalysisBase):
         """Calculate domain query trends over time for anomaly detection"""
         try:
             # Get domains with popularity data
-            cursor.execute("SELECT domain, hourly_counts, daily_counts FROM dns_domain_popularity")
+            cursor.execute("SELECT domain, hourly_counts, daily_counts FROM x_dns_domain_popularity")
             domains = cursor.fetchall()
             
             for domain, hourly_counts_json, daily_counts_json in domains:
@@ -483,9 +483,9 @@ class DNSAnalyzer(AnalysisBase):
                     sudden_appearance = trend_factor > 3 and historical_avg < 1
                     sudden_disappearance = trend_factor < 0.3 and historical_avg > 1
                     
-                    # Update trend factor in dns_analysis
+                    # Update trend factor in x_dns_analysis
                     cursor.execute("""
-                        UPDATE dns_analysis
+                        UPDATE x_dns_analysis
                         SET trend_factor = ?
                         WHERE domain = ?
                     """, (trend_factor, domain))
@@ -541,7 +541,7 @@ class DNSAnalyzer(AnalysisBase):
             # Find DGA candidate domains
             cursor.execute("""
                 SELECT domain, entropy, score
-                FROM dns_analysis
+                FROM x_dns_analysis
                 WHERE is_dga_candidate = 1
                 AND last_seen > ?
                 ORDER BY score DESC

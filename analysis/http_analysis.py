@@ -1,4 +1,4 @@
-# http_analysis.py - Enhanced HTTP traffic analysis with advanced metrics
+# x_http_analysis.py - Enhanced HTTP traffic analysis with advanced metrics
 import time
 import logging
 import json
@@ -95,7 +95,7 @@ class HTTPAnalyzer(AnalysisBase):
         try:
             # HTTP analysis results table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS http_analysis (
+                CREATE TABLE IF NOT EXISTS x_http_analysis(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     connection_key TEXT,
                     host TEXT,
@@ -119,7 +119,7 @@ class HTTPAnalyzer(AnalysisBase):
             
             # HTTP client behavior profiles
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS http_client_profiles (
+                CREATE TABLE IF NOT EXISTS x_http_client_profiles (
                     client_ip TEXT PRIMARY KEY,
                     first_seen REAL,
                     last_seen REAL,
@@ -142,7 +142,7 @@ class HTTPAnalyzer(AnalysisBase):
             
             # HTTP host technology fingerprints
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS http_host_technologies (
+                CREATE TABLE IF NOT EXISTS x_http_host_technologies (
                     host TEXT PRIMARY KEY,
                     first_seen REAL,
                     last_seen REAL,
@@ -158,7 +158,7 @@ class HTTPAnalyzer(AnalysisBase):
             
             # HTTP parameter analysis
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS http_parameter_analysis (
+                CREATE TABLE IF NOT EXISTS x_http_parameter_analysis(
                     parameter_name TEXT,
                     host TEXT,
                     data_type TEXT,
@@ -176,12 +176,12 @@ class HTTPAnalyzer(AnalysisBase):
             """)
             
             # Create indices
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_analysis_host ON http_analysis(host)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_analysis_score ON http_analysis(suspicious_score DESC)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_analysis_attack ON http_analysis(attack_type)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_analysis_host ON x_http_analysis(host)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_analysis_score ON x_http_analysis(suspicious_score DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_analysis_attack ON x_http_analysis(attack_type)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_client_score ON http_client_profiles(suspicious_score DESC)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_client_auto ON http_client_profiles(automated_score DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_client_score ON x_http_client_profiles(suspicious_score DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_client_auto ON x_http_client_profiles(automated_score DESC)")
             
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_host_tech ON http_host_technologies(host)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_host_security ON http_host_technologies(security_score)")
@@ -367,7 +367,7 @@ class HTTPAnalyzer(AnalysisBase):
             cursor.execute("""
                 SELECT id, suspicious_score, request_count, status_codes, 
                        response_time_avg, response_size_avg
-                FROM http_analysis
+                FROM x_http_analysis
                 WHERE host = ? AND uri = ? AND method = ?
             """, (host, uri, method))
             
@@ -388,7 +388,7 @@ class HTTPAnalyzer(AnalysisBase):
                 status_codes = json.loads(status_codes_json) if status_codes_json else {}
                 
                 cursor.execute("""
-                    UPDATE http_analysis
+                    UPDATE x_http_analysis
                     SET last_seen = ?,
                         request_count = request_count + 1,
                         suspicious_score = ?,
@@ -407,7 +407,7 @@ class HTTPAnalyzer(AnalysisBase):
             else:
                 # Insert new record
                 cursor.execute("""
-                    INSERT INTO http_analysis
+                    INSERT INTO x_http_analysis
                     (connection_key, host, uri, method, suspicious_score, user_agent, 
                      detected_patterns, first_seen, last_seen, parameters, 
                      attack_type, attack_confidence, has_credentials)
@@ -440,9 +440,9 @@ class HTTPAnalyzer(AnalysisBase):
         cursor = self.analysis_manager.get_cursor()
         
         try:
-            # Update status code in the http_analysis table
+            # Update status code in the x_http_analysistable
             cursor.execute("""
-                SELECT id, status_codes FROM http_analysis 
+                SELECT id, status_codes FROM x_http_analysis
                 WHERE connection_key = ? OR (host = ? AND uri = ?)
                 ORDER BY last_seen DESC LIMIT 1
             """, (connection_key, host, uri or "/"))
@@ -471,7 +471,7 @@ class HTTPAnalyzer(AnalysisBase):
                 
                 # Update record
                 cursor.execute("""
-                    UPDATE http_analysis
+                    UPDATE x_http_analysis
                     SET status_codes = ?
                     WHERE id = ?
                 """, (json.dumps(status_codes), record_id))
@@ -482,7 +482,7 @@ class HTTPAnalyzer(AnalysisBase):
             # Update client profile with response data
             if src_ip:
                 cursor.execute("""
-                    SELECT client_ip, status_codes_received FROM http_client_profiles
+                    SELECT client_ip, status_codes_received FROM x_http_client_profiles
                     WHERE client_ip = ?
                 """, (src_ip,))
                 
@@ -513,7 +513,7 @@ class HTTPAnalyzer(AnalysisBase):
                     
                     # Update client profile
                     cursor.execute("""
-                        UPDATE http_client_profiles
+                        UPDATE x_http_client_profiles
                         SET status_codes_received = ?,
                             error_ratio = ?,
                             last_seen = ?
@@ -535,7 +535,7 @@ class HTTPAnalyzer(AnalysisBase):
                 SELECT requests_count, unique_hosts, unique_paths, user_agents, 
                        methods_used, path_depth_avg, parameter_use_ratio,
                        first_seen, last_seen, automated_score
-                FROM http_client_profiles
+                FROM x_http_client_profiles
                 WHERE client_ip = ?
             """, (client_ip,))
             
@@ -559,7 +559,7 @@ class HTTPAnalyzer(AnalysisBase):
                 # Update unique hosts set
                 cursor.execute("""
                     SELECT COUNT(*) FROM (
-                        SELECT DISTINCT host FROM http_analysis
+                        SELECT DISTINCT host FROM x_http_analysis
                         WHERE connection_key LIKE ? || '%'
                     )
                 """, (client_ip,))
@@ -568,7 +568,7 @@ class HTTPAnalyzer(AnalysisBase):
                 # Update unique paths set
                 cursor.execute("""
                     SELECT COUNT(*) FROM (
-                        SELECT DISTINCT uri FROM http_analysis
+                        SELECT DISTINCT uri FROM x_http_analysis
                         WHERE connection_key LIKE ? || '%'
                     )
                 """, (client_ip,))
@@ -602,7 +602,7 @@ class HTTPAnalyzer(AnalysisBase):
                     
                     # Get previous average interval
                     cursor.execute("""
-                        SELECT average_request_interval FROM http_client_profiles
+                        SELECT average_request_interval FROM x_http_client_profiles
                         WHERE client_ip = ?
                     """, (client_ip,))
                     prev_avg = cursor.fetchone()[0] or 0
@@ -635,7 +635,7 @@ class HTTPAnalyzer(AnalysisBase):
                 
                 # Update client profile
                 cursor.execute("""
-                    UPDATE http_client_profiles
+                    UPDATE x_http_client_profiles
                     SET requests_count = ?,
                         unique_hosts = ?,
                         unique_paths = ?,
@@ -668,7 +668,7 @@ class HTTPAnalyzer(AnalysisBase):
                 session_entropy = 0
                 
                 cursor.execute("""
-                    INSERT INTO http_client_profiles
+                    INSERT INTO x_http_client_profiles
                     (client_ip, first_seen, last_seen, requests_count, unique_hosts,
                      unique_paths, user_agents, methods_used, average_request_interval,
                      path_depth_avg, parameter_use_ratio, automated_score,
@@ -731,7 +731,7 @@ class HTTPAnalyzer(AnalysisBase):
                     
                     # Weighted average for avg_length
                     cursor.execute("""
-                        SELECT COUNT(*) FROM http_analysis
+                        SELECT COUNT(*) FROM x_http_analysis
                         WHERE host = ? AND parameters LIKE ?
                     """, (host, f'%"{param_name}"%'))
                     
@@ -1031,7 +1031,7 @@ class HTTPAnalyzer(AnalysisBase):
         try:
             # Get unique paths visited by this client
             cursor.execute("""
-                SELECT uri FROM http_analysis
+                SELECT uri FROM x_http_analysis
                 WHERE connection_key LIKE ? || '%'
                 ORDER BY last_seen DESC
                 LIMIT 50
@@ -1177,7 +1177,7 @@ class HTTPAnalyzer(AnalysisBase):
             # Get hosts with significant traffic
             cursor.execute("""
                 SELECT host, COUNT(*) as request_count
-                FROM http_analysis
+                FROM x_http_analysis
                 GROUP BY host
                 HAVING request_count > 10
                 ORDER BY request_count DESC
@@ -1190,7 +1190,7 @@ class HTTPAnalyzer(AnalysisBase):
                 # Get paths for this host
                 cursor.execute("""
                     SELECT uri, COUNT(*) as count
-                    FROM http_analysis
+                    FROM x_http_analysis
                     WHERE host = ?
                     GROUP BY uri
                     ORDER BY count DESC
@@ -1238,7 +1238,7 @@ class HTTPAnalyzer(AnalysisBase):
             # Get top suspicious requests
             cursor.execute("""
                 SELECT host, uri, method, suspicious_score, detected_patterns, attack_type, request_count
-                FROM http_analysis 
+                FROM x_http_analysis
                 WHERE suspicious_score > 3
                 ORDER BY suspicious_score DESC, request_count DESC
                 LIMIT 50
@@ -1272,7 +1272,7 @@ class HTTPAnalyzer(AnalysisBase):
             cursor.execute("""
                 SELECT client_ip, automated_score, suspicious_score, profile_type, 
                        requests_count, unique_hosts, unique_paths, session_entropy
-                FROM http_client_profiles
+                FROM x_http_client_profiles
                 WHERE automated_score > 7 OR suspicious_score > 5
                 ORDER BY suspicious_score DESC
                 LIMIT 20

@@ -1,11 +1,11 @@
-# arp_analysis.py - Enhanced ARP traffic analysis for spoofing detection
+# x_arp_analysis.py - Enhanced ARP traffic analysis for spoofing detection
 import time
 import logging
 from collections import defaultdict
 import json
 import math
 
-logger = logging.getLogger('arp_analysis')
+logger = logging.getLogger('x_arp_analysis')
 
 class ARPAnalyzer(AnalysisBase):
     """Advanced ARP traffic analyzer with enhanced spoofing and poisoning detection"""
@@ -38,7 +38,7 @@ class ARPAnalyzer(AnalysisBase):
         try:
             # ARP analysis results table with enhanced schema
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS arp_analysis (
+                CREATE TABLE IF NOT EXISTS x_arp_analysis (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ip_address TEXT,
                     mac_address TEXT,
@@ -58,7 +58,7 @@ class ARPAnalyzer(AnalysisBase):
             
             # ARP host tracking table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS arp_host_tracking (
+                CREATE TABLE IF NOT EXISTS x_arp_host_tracking (
                     ip_address TEXT PRIMARY KEY,
                     primary_mac TEXT,
                     all_observed_macs TEXT,
@@ -76,7 +76,7 @@ class ARPAnalyzer(AnalysisBase):
             
             # ARP activities and behavioral patterns
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS arp_behavior_patterns (
+                CREATE TABLE IF NOT EXISTS x_arp_behavior_patterns (
                     mac_address TEXT PRIMARY KEY,
                     first_seen REAL,
                     last_seen REAL,
@@ -93,18 +93,18 @@ class ARPAnalyzer(AnalysisBase):
             """)
             
             # Create indices
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_analysis_ip ON arp_analysis(ip_address)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_analysis_mac ON arp_analysis(mac_address)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_analysis_time ON arp_analysis(detection_time)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_analysis_active ON arp_analysis(active)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_arp_analysis_ip ON x_arp_analysis(ip_address)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_arp_analysis_mac ON x_arp_analysis(mac_address)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_arp_analysis_time ON x_arp_analysis(detection_time)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_arp_analysis_active ON x_arp_analysis(active)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_host_ip ON arp_host_tracking(ip_address)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_host_mac ON arp_host_tracking(primary_mac)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_host_gateway ON arp_host_tracking(is_gateway)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_host_ip ON x_arp_host_tracking(ip_address)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_host_mac ON x_arp_host_tracking(primary_mac)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_host_gateway ON x_arp_host_tracking(is_gateway)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_behavior_mac ON arp_behavior_patterns(mac_address)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_behavior_score ON arp_behavior_patterns(behavioral_score)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_behavior_anomaly ON arp_behavior_patterns(is_anomalous)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_behavior_mac ON x_arp_behavior_patterns(mac_address)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_behavior_score ON x_arp_behavior_patterns(behavioral_score)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_arp_behavior_anomaly ON x_arp_behavior_patterns(is_anomalous)")
             
             self.analysis_manager.analysis1_conn.commit()
             logger.info("ARP analysis tables initialized with enhanced schema")
@@ -268,7 +268,7 @@ class ARPAnalyzer(AnalysisBase):
                 try:
                     # Check if we've already recorded this spoofing attempt
                     cursor.execute("""
-                        SELECT id, confidence_score FROM arp_analysis
+                        SELECT id, confidence_score FROM x_arp_analysis
                         WHERE ip_address = ? AND mac_address = ? AND original_mac = ? AND resolved = 0
                     """, (ip, mac, original_mac))
                     
@@ -281,7 +281,7 @@ class ARPAnalyzer(AnalysisBase):
                         new_confidence = max(confidence, old_confidence)
                         
                         cursor.execute("""
-                            UPDATE arp_analysis
+                            UPDATE x_arp_analysis
                             SET confidence_score = ?,
                                 change_frequency = ?,
                                 is_gateway = ?,
@@ -303,7 +303,7 @@ class ARPAnalyzer(AnalysisBase):
                         notes = f"Potential ARP spoofing: IP {ip} changed from MAC {original_mac} to {mac}"
                         
                         cursor.execute("""
-                            INSERT INTO arp_analysis
+                            INSERT INTO x_arp_analysis
                             (ip_address, mac_address, original_mac, detection_time, notes, 
                              confidence_score, change_frequency, is_gateway, vendor_mismatch,
                              attack_type, affected_hosts)
@@ -336,7 +336,7 @@ class ARPAnalyzer(AnalysisBase):
             # Check if host exists
             cursor.execute("""
                 SELECT primary_mac, all_observed_macs, request_count, response_count, stability_score
-                FROM arp_host_tracking
+                FROM x_arp_host_tracking
                 WHERE ip_address = ?
             """, (ip,))
             
@@ -375,14 +375,14 @@ class ARPAnalyzer(AnalysisBase):
                 
                 # Check if this is a known spoofed IP
                 cursor.execute("""
-                    SELECT COUNT(*) FROM arp_analysis
+                    SELECT COUNT(*) FROM x_arp_analysis
                     WHERE ip_address = ? AND confidence_score > 0.7 AND resolved = 0
                 """, (ip,))
                 
                 known_spoofed = cursor.fetchone()[0] > 0
                 
                 cursor.execute("""
-                    UPDATE arp_host_tracking
+                    UPDATE x_arp_host_tracking
                     SET primary_mac = ?,
                         all_observed_macs = ?,
                         last_seen = ?,
@@ -418,7 +418,7 @@ class ARPAnalyzer(AnalysisBase):
                 vendor = self.mac_vendor_cache.get(mac[:8], "Unknown")
                 
                 cursor.execute("""
-                    INSERT INTO arp_host_tracking
+                    INSERT INTO x_arp_host_tracking
                     (ip_address, primary_mac, all_observed_macs, first_seen, last_seen,
                      request_count, response_count, is_gateway, vendor, host_type)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -447,7 +447,7 @@ class ARPAnalyzer(AnalysisBase):
             # Check if behavior pattern exists
             cursor.execute("""
                 SELECT associated_ips, request_pattern, gratuitous_count, behavioral_score
-                FROM arp_behavior_patterns
+                FROM x_arp_behavior_patterns
                 WHERE mac_address = ?
             """, (mac,))
             
@@ -497,7 +497,7 @@ class ARPAnalyzer(AnalysisBase):
                 is_anomalous = behavioral_score > 7
                 
                 cursor.execute("""
-                    UPDATE arp_behavior_patterns
+                    UPDATE x_arp_behavior_patterns
                     SET last_seen = ?,
                         associated_ips = ?,
                         ip_count = ?,
@@ -536,7 +536,7 @@ class ARPAnalyzer(AnalysisBase):
                     gratuitous_count = 0
                 
                 cursor.execute("""
-                    INSERT INTO arp_behavior_patterns
+                    INSERT INTO x_arp_behavior_patterns
                     (mac_address, first_seen, last_seen, associated_ips, ip_count,
                      request_pattern, gratuitous_count, behavioral_score, vendor,
                      mac_oui, behavior_type, is_anomalous)
@@ -809,7 +809,7 @@ class ARPAnalyzer(AnalysisBase):
             cursor.execute("""
                 SELECT id, ip_address, mac_address, original_mac, confidence_score, 
                        attack_type, is_gateway, detection_time
-                FROM arp_analysis
+                FROM x_arp_analysis
                 WHERE resolved = 0 AND active = 1
                 ORDER BY confidence_score DESC, detection_time DESC
                 LIMIT 20
@@ -831,7 +831,7 @@ class ARPAnalyzer(AnalysisBase):
                     if ip in self.arp_cache and mac in self.arp_cache[ip]:
                         # Still active, update last seen time
                         cursor.execute("""
-                            UPDATE arp_analysis
+                            UPDATE x_arp_analysis
                             SET active = 1
                             WHERE id = ?
                         """, (id,))
@@ -839,7 +839,7 @@ class ARPAnalyzer(AnalysisBase):
                         # No longer active, mark as inactive
                         if current_time - detection_time > 1800:  # 30 minutes without seeing the MAC
                             cursor.execute("""
-                                UPDATE arp_analysis
+                                UPDATE x_arp_analysis
                                 SET active = 0
                                 WHERE id = ?
                             """, (id,))
@@ -848,7 +848,7 @@ class ARPAnalyzer(AnalysisBase):
             # Find hosts with unusual behavioral patterns
             cursor.execute("""
                 SELECT mac_address, behavior_type, behavioral_score, ip_count, gratuitous_count
-                FROM arp_behavior_patterns
+                FROM x_arp_behavior_patterns
                 WHERE behavioral_score > 6 AND last_seen > ?
                 ORDER BY behavioral_score DESC
                 LIMIT 10
@@ -882,7 +882,7 @@ class ARPAnalyzer(AnalysisBase):
                     COUNT(*) as total_hosts,
                     SUM(CASE WHEN stability_score > 0.8 THEN 1 ELSE 0 END) as stable_hosts,
                     SUM(CASE WHEN stability_score < 0.5 THEN 1 ELSE 0 END) as unstable_hosts
-                FROM arp_host_tracking
+                FROM x_arp_host_tracking
                 WHERE last_seen > ?
             """, (current_time - 86400,))  # Last 24 hours
             
@@ -901,7 +901,7 @@ class ARPAnalyzer(AnalysisBase):
                     SUM(CASE WHEN behavioral_score > 8 THEN 1 ELSE 0 END) as highly_suspicious,
                     SUM(CASE WHEN behavioral_score > 6 AND behavioral_score <= 8 THEN 1 ELSE 0 END) as suspicious,
                     SUM(CASE WHEN behavioral_score > 4 AND behavioral_score <= 6 THEN 1 ELSE 0 END) as unusual
-                FROM arp_behavior_patterns
+                FROM x_arp_behavior_patterns
                 WHERE last_seen > ?
             """, (current_time - 86400,))  # Last 24 hours
             

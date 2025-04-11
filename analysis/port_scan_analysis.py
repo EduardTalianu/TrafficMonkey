@@ -65,7 +65,7 @@ class PortScanAnalyzer(AnalysisBase):
         try:
             # Port scan events table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS port_scan_events (
+                CREATE TABLE IF NOT EXISTS x_port_scan_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     src_ip TEXT,
                     scan_type TEXT,
@@ -88,7 +88,7 @@ class PortScanAnalyzer(AnalysisBase):
             
             # Scanner profile table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS port_scanner_profiles (
+                CREATE TABLE IF NOT EXISTS x_port_scanner_profiles (
                     scanner_ip TEXT PRIMARY KEY,
                     first_seen REAL,
                     last_seen REAL,
@@ -108,7 +108,7 @@ class PortScanAnalyzer(AnalysisBase):
             
             # Target vulnerability tracking
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS port_scan_targets (
+                CREATE TABLE IF NOT EXISTS x_port_scan_targets (
                     target_ip TEXT PRIMARY KEY,
                     first_scanned REAL,
                     last_scanned REAL,
@@ -125,16 +125,16 @@ class PortScanAnalyzer(AnalysisBase):
             """)
             
             # Create indices
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_portscan_src ON port_scan_events(src_ip)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_portscan_time ON port_scan_events(start_time)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_portscan_type ON port_scan_events(scan_type)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_portscan_sophistication ON port_scan_events(scan_sophistication DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_portscan_src ON x_port_scan_events(src_ip)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_portscan_time ON x_port_scan_events(start_time)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_portscan_type ON x_port_scan_events(scan_type)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_portscan_sophistication ON x_port_scan_events(scan_sophistication DESC)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scanner_profiles_seen ON port_scanner_profiles(last_seen DESC)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scanner_profiles_total ON port_scanner_profiles(total_scans DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scanner_profiles_seen ON x_port_scanner_profiles(last_seen DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scanner_profiles_total ON x_port_scanner_profiles(total_scans DESC)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scan_targets_count ON port_scan_targets(scan_count DESC)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scan_targets_vuln ON port_scan_targets(vulnerability_score DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scan_targets_count ON x_port_scan_targets(scan_count DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scan_targets_vuln ON x_port_scan_targets(vulnerability_score DESC)")
             
             self.analysis_manager.analysis1_conn.commit()
             logger.info("Port scan analysis tables initialized with enhanced schema")
@@ -942,7 +942,7 @@ class PortScanAnalyzer(AnalysisBase):
         
         try:
             # Check if target exists
-            cursor.execute("SELECT ports_probed, open_ports FROM port_scan_targets WHERE target_ip = ?", (target_ip,))
+            cursor.execute("SELECT ports_probed, open_ports FROM x_port_scan_targets WHERE target_ip = ?", (target_ip,))
             result = cursor.fetchone()
             
             if result:
@@ -972,14 +972,14 @@ class PortScanAnalyzer(AnalysisBase):
                 
                 # Update scanner count
                 cursor.execute("""
-                    SELECT COUNT(DISTINCT src_ip) FROM port_scan_events
-                    WHERE id IN (SELECT id FROM port_scan_events WHERE ports_scanned LIKE ?)
+                    SELECT COUNT(DISTINCT src_ip) FROM x_port_scan_events
+                    WHERE id IN (SELECT id FROM x_port_scan_events WHERE ports_scanned LIKE ?)
                 """, (f'%{port}%',))
                 
                 scanner_count = cursor.fetchone()[0] or 1
                 
                 cursor.execute("""
-                    UPDATE port_scan_targets
+                    UPDATE x_port_scan_targets
                     SET last_scanned = ?,
                         scan_count = scan_count + 1,
                         scanner_count = ?,
@@ -1006,7 +1006,7 @@ class PortScanAnalyzer(AnalysisBase):
                 exposure_profile = self._determine_exposure_profile(open_ports)
                 
                 cursor.execute("""
-                    INSERT INTO port_scan_targets
+                    INSERT INTO x_port_scan_targets
                     (target_ip, first_scanned, last_scanned, ports_probed, open_ports,
                      vulnerability_score, exposure_profile)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1121,7 +1121,7 @@ class PortScanAnalyzer(AnalysisBase):
             categories_json = json.dumps(target_categories) if target_categories else "{}"
             
             cursor.execute("""
-                INSERT INTO port_scan_events
+                INSERT INTO x_port_scan_events
                 (src_ip, scan_type, target_count, port_count, start_time, end_time, rate,
                 ports_scanned, port_sequence, response_rate, scan_pattern, likely_tool,
                 scan_sophistication, stealth_score, target_categories)
@@ -1168,7 +1168,7 @@ class PortScanAnalyzer(AnalysisBase):
             cursor.execute("""
                 SELECT preferred_scan_types, usual_ports, sophistication_level, 
                        noise_level, scan_count_history, average_rate
-                FROM port_scanner_profiles
+                FROM x_port_scanner_profiles
                 WHERE scanner_ip = ?
             """, (src_ip,))
             
@@ -1229,7 +1229,7 @@ class PortScanAnalyzer(AnalysisBase):
                 )
                 
                 cursor.execute("""
-                    UPDATE port_scanner_profiles
+                    UPDATE x_port_scanner_profiles
                     SET last_seen = ?,
                         total_scans = total_scans + 1,
                         preferred_scan_types = ?,
@@ -1266,7 +1266,7 @@ class PortScanAnalyzer(AnalysisBase):
                 )
                 
                 cursor.execute("""
-                    INSERT INTO port_scanner_profiles
+                    INSERT INTO x_port_scanner_profiles
                     (scanner_ip, first_seen, last_seen, total_scans, preferred_scan_types,
                      usual_ports, port_sequence_patterns, sophistication_level, noise_level,
                      scan_count_history, average_rate, source_reputation)
@@ -1379,7 +1379,7 @@ class PortScanAnalyzer(AnalysisBase):
             # Get scan counts by type
             cursor.execute("""
                 SELECT scan_type, COUNT(*) 
-                FROM port_scan_events 
+                FROM x_port_scan_events 
                 WHERE start_time > ?
                 GROUP BY scan_type
             """, (one_day_ago,))
@@ -1397,7 +1397,7 @@ class PortScanAnalyzer(AnalysisBase):
             # Get most sophisticated scanners
             cursor.execute("""
                 SELECT scanner_ip, sophistication_level, source_reputation, total_scans
-                FROM port_scanner_profiles
+                FROM x_port_scanner_profiles
                 WHERE last_seen > ?
                 ORDER BY sophistication_level DESC
                 LIMIT 5
@@ -1426,7 +1426,7 @@ class PortScanAnalyzer(AnalysisBase):
             # Get most vulnerable targets
             cursor.execute("""
                 SELECT target_ip, vulnerability_score, exposure_profile, scan_count, scanner_count
-                FROM port_scan_targets
+                FROM x_port_scan_targets
                 WHERE last_scanned > ? AND vulnerability_score > 5
                 ORDER BY vulnerability_score DESC
                 LIMIT 10
@@ -1455,7 +1455,7 @@ class PortScanAnalyzer(AnalysisBase):
             # Get scanner profiles
             cursor.execute("""
                 SELECT scanner_ip, preferred_scan_types, usual_ports, source_reputation
-                FROM port_scanner_profiles
+                FROM x_port_scanner_profiles
                 WHERE last_seen > ?
                 ORDER BY total_scans DESC
                 LIMIT 20
