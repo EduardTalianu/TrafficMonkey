@@ -584,14 +584,33 @@ class AnalysisManager:
         try:
             cursor = self.analysis1_conn.cursor()
             current_time = time.time()
+            
+            # Check if we're in a transaction
+            in_transaction = False
+            try:
+                cursor.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+                cursor.fetchone()
+                # If we get here, we can execute queries, so either not in transaction
+                # or already in a transaction that hasn't been committed
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e):
+                    in_transaction = True
+            
             cursor.execute("""
                 INSERT OR REPLACE INTO x_port_scans
                 (src_ip, dst_ip, dst_port, timestamp)
                 VALUES (?, ?, ?, ?)
             """, (src_ip, dst_ip, dst_port, current_time))
-            self.analysis1_conn.commit()
+            
+            # Only commit if we're not in a transaction
+            if not in_transaction:
+                self.analysis1_conn.commit()
+                
             cursor.close()
             return True
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error in add_port_scan_data: {e}")
+            return False
         except Exception as e:
             logger.error(f"Error updating port scan data: {e}")
             return False
@@ -767,54 +786,93 @@ class AnalysisManager:
             return False
         
     def update_threat_intel(self, ip_address, threat_data):
-        """Update threat intelligence data for an IP with extended column support"""
+        """Update threat intelligence data for an IP with extended column support and throttling"""
         try:
-            cursor = self.analysis1_conn.cursor()
+            # Add throttling based on IP address
+            current_time = time.time()
             
-            # Extract the basic threat intel data
-            score = threat_data.get('score', 0)
-            threat_type = threat_data.get('type')
-            confidence = threat_data.get('confidence', 0)
-            source = threat_data.get('source')
-            first_seen = threat_data.get('first_seen') or time.time()
-            details = json.dumps(threat_data.get('details', {}))
+            # Initialize threat intel cache if it doesn't exist
+            if not hasattr(self, '_threat_intel_cache'):
+                self._threat_intel_cache = {}
+                
+            # Check if this IP was recently updated (within last 300 seconds)
+            if ip_address in self._threat_intel_cache:
+                last_update = self._threat_intel_cache[ip_address]
+                if current_time - last_update < 300:  # 300-second throttle window
+                    logger.debug(f"Throttling threat intel update for {ip_address} (updated less than 5 minutes ago)")
+                    return True
             
-            # Extract extended columns if present
-            protocol = threat_data.get('protocol')
-            destination_ip = threat_data.get('destination_ip')
-            destination_port = threat_data.get('destination_port')
-            bytes_transferred = threat_data.get('bytes_transferred')
-            detection_method = threat_data.get('detection_method')
-            encoding_type = threat_data.get('encoding_type')
-            packet_count = threat_data.get('packet_count')
-            timing_variance = threat_data.get('timing_variance')
+            # Update the cache with the current time
+            self._threat_intel_cache[ip_address] = current_time
             
-            # Update existing record or insert new one with all fields
-            cursor.execute("""
-                INSERT OR REPLACE INTO x_ip_threat_intel
-                (ip_address, threat_score, threat_type, confidence, source, first_seen, 
-                last_seen, details, protocol, destination_ip, destination_port, 
-                bytes_transferred, detection_method, encoding_type, packet_count, 
-                timing_variance)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                ip_address, score, threat_type, confidence, source, first_seen, 
-                details, protocol, destination_ip, destination_port, 
-                bytes_transferred, detection_method, encoding_type, packet_count, 
-                timing_variance
-            ))
+            # Clean old cache entries periodically to prevent memory leaks
+            if len(self._threat_intel_cache) > 1000:
+                cutoff_time = current_time - 1800
+                self._threat_intel_cache = {k: v for k, v in self._threat_intel_cache.items() 
+                                        if v > cutoff_time}
             
-            # If this is an existing record, increment the alert count
-            cursor.execute("""
-                UPDATE x_ip_threat_intel 
-                SET alert_count = alert_count + 1
-                WHERE ip_address = ? AND alert_count IS NOT NULL
-            """, (ip_address,))
-            
-            self.analysis1_conn.commit()
-            cursor.close()
-            logger.info(f"Updated threat intel for {ip_address} with extended data")
+            # Use the sync_lock to ensure thread safety
+            with self.sync_lock:
+                cursor = self.analysis1_conn.cursor()
+                
+                # Extract the basic threat intel data
+                score = threat_data.get('score', 0)
+                threat_type = threat_data.get('type')
+                confidence = threat_data.get('confidence', 0)
+                source = threat_data.get('source')
+                first_seen = threat_data.get('first_seen') or time.time()
+                details = json.dumps(threat_data.get('details', {}))
+                
+                # Extract extended columns if present
+                protocol = threat_data.get('protocol')
+                destination_ip = threat_data.get('destination_ip')
+                destination_port = threat_data.get('destination_port')
+                bytes_transferred = threat_data.get('bytes_transferred')
+                detection_method = threat_data.get('detection_method')
+                encoding_type = threat_data.get('encoding_type')
+                packet_count = threat_data.get('packet_count')
+                timing_variance = threat_data.get('timing_variance')
+                
+                # Begin transaction
+                cursor.execute("BEGIN TRANSACTION")
+                
+                try:
+                    # Update existing record or insert new one with all fields
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO x_ip_threat_intel
+                        (ip_address, threat_score, threat_type, confidence, source, first_seen, 
+                        last_seen, details, protocol, destination_ip, destination_port, 
+                        bytes_transferred, detection_method, encoding_type, packet_count, 
+                        timing_variance)
+                        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        ip_address, score, threat_type, confidence, source, first_seen, 
+                        details, protocol, destination_ip, destination_port, 
+                        bytes_transferred, detection_method, encoding_type, packet_count, 
+                        timing_variance
+                    ))
+                    
+                    # If this is an existing record, increment the alert count
+                    cursor.execute("""
+                        UPDATE x_ip_threat_intel 
+                        SET alert_count = alert_count + 1
+                        WHERE ip_address = ? AND alert_count IS NOT NULL
+                    """, (ip_address,))
+                    
+                    # Commit the transaction
+                    self.analysis1_conn.commit()
+                    logger.info(f"Updated threat intel for {ip_address} with extended data")
+                except Exception as e:
+                    # Rollback the transaction if anything goes wrong
+                    self.analysis1_conn.rollback()
+                    raise e
+                finally:
+                    cursor.close()
+                    
             return True
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error in update_threat_intel: {e}")
+            return False
         except Exception as e:
             logger.error(f"Error updating threat intel: {e}")
             return False

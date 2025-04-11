@@ -529,8 +529,6 @@ class GeoLocationSubtab(SubtabBase):
             # Log success
             self.update_output(f"Stored geolocation data for {ip} in database")
             
-            # Verify data was stored by querying it back
-            self._verify_geolocation_storage(ip)
         except Exception as e:
             self.update_output(f"Error storing geolocation in database: {e}")
             import traceback

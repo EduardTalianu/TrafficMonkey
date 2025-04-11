@@ -1328,7 +1328,7 @@ class PortScanAnalyzer(AnalysisBase):
             reputation = "security_tool_user"
         elif high_volume and frequent_scanning and noise_level > 7:
             reputation = "aggressive_scanner"
-        elif sophisticated > 8 and stealth_score > 0.8:
+        elif sophistication > 8 and stealth_score > 0.8:
             reputation = "advanced_threat_actor"
         elif noise_level < 3 and sophistication > 6:
             reputation = "stealthy_reconnaissance"

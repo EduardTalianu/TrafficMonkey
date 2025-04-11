@@ -183,10 +183,10 @@ class HTTPAnalyzer(AnalysisBase):
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_client_score ON x_http_client_profiles(suspicious_score DESC)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_client_auto ON x_http_client_profiles(automated_score DESC)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_host_tech ON http_host_technologies(host)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_host_security ON http_host_technologies(security_score)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_host_tech ON x_http_host_technologies(host)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_host_security ON x_http_host_technologies(security_score)")
             
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_param_sensitive ON http_parameter_analysis(is_sensitive)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_http_param_sensitive ON x_http_parameter_analysis(is_sensitive)")
             
             self.analysis_manager.analysis1_conn.commit()
             logger.info("HTTP analysis tables initialized with enhanced schema")
@@ -715,7 +715,7 @@ class HTTPAnalyzer(AnalysisBase):
                 # Check if parameter exists
                 cursor.execute("""
                     SELECT parameter_name, data_type, min_length, max_length, avg_length, unique_values
-                    FROM http_parameter_analysis
+                    FROM x_http_parameter_analysis
                     WHERE parameter_name = ? AND host = ?
                 """, (param_name, host))
                 
@@ -739,7 +739,7 @@ class HTTPAnalyzer(AnalysisBase):
                     new_avg = ((old_avg * (param_count - 1)) + avg_length) / param_count
                     
                     cursor.execute("""
-                        UPDATE http_parameter_analysis
+                        UPDATE x_http_parameter_analysis
                         SET min_length = ?,
                             max_length = ?,
                             avg_length = ?,
@@ -757,7 +757,7 @@ class HTTPAnalyzer(AnalysisBase):
                 else:
                     # Insert new parameter
                     cursor.execute("""
-                        INSERT INTO http_parameter_analysis
+                        INSERT INTO x_http_parameter_analysis
                         (parameter_name, host, data_type, min_length, max_length, 
                          avg_length, unique_values, entropy, is_pii, is_sensitive, 
                          first_seen, last_seen)
@@ -777,7 +777,7 @@ class HTTPAnalyzer(AnalysisBase):
             # Check if host exists
             cursor.execute("""
                 SELECT technologies, server_headers, security_headers
-                FROM http_host_technologies
+                FROM x_http_host_technologies
                 WHERE host = ?
             """, (host,))
             
@@ -840,7 +840,7 @@ class HTTPAnalyzer(AnalysisBase):
                         existing_security_headers[header] = True
                 
                 cursor.execute("""
-                    UPDATE http_host_technologies
+                    UPDATE x_http_host_technologies
                     SET technologies = ?,
                         server_headers = ?,
                         security_headers = ?,
@@ -858,7 +858,7 @@ class HTTPAnalyzer(AnalysisBase):
             else:
                 # Create new host profile
                 cursor.execute("""
-                    INSERT INTO http_host_technologies
+                    INSERT INTO x_http_host_technologies
                     (host, first_seen, last_seen, technologies, server_headers,
                      security_headers, security_score)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1296,7 +1296,7 @@ class HTTPAnalyzer(AnalysisBase):
             # Find sensitive parameters
             cursor.execute("""
                 SELECT parameter_name, host, data_type, avg_length, entropy, is_pii
-                FROM http_parameter_analysis
+                FROM x_http_parameter_analysis
                 WHERE is_sensitive = 1 OR is_pii = 1
                 ORDER BY entropy DESC
                 LIMIT 30
