@@ -209,20 +209,16 @@ class NTLMHashCollectorRule(Rule):
                     "4. Consider using more secure authentication mechanisms"
                 )
             
-            # Add to red findings using red_report_manager
-            if hasattr(self, 'analysis_manager') and self.analysis_manager and hasattr(self.analysis_manager, 'red_report_manager'):
-                self.analysis_manager.red_report_manager.add_red_finding(
-                    src_ip=src_ip,
-                    dst_ip=dst_ip,
-                    rule_name=self.name,
-                    description=description,
-                    severity=severity,
-                    details=details,
-                    connection_key=connection_key,
-                    remediation=remediation
-                )
-            else:
-                logging.warning("Cannot add red finding: red_report_manager not available")
+            # Add to red findings directly
+            self.add_red_finding(
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                description=description,
+                severity=severity,
+                details=details,
+                connection_key=connection_key,
+                remediation=remediation
+            )
             
         except Exception as e:
             logging.error(f"Error adding NTLM hash to red findings: {e}")

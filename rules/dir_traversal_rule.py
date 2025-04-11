@@ -220,10 +220,10 @@ class DirectoryTraversalFinderRule(Rule):
         try:
             # Create suitable description
             description = f"Directory traversal pattern detected on {host or dst_ip}"
-            
+
             # Determine severity - traversal patterns are high risk
             severity = "high"
-            
+
             # Create detailed information
             details = {
                 "host": host or dst_ip,
@@ -234,7 +234,7 @@ class DirectoryTraversalFinderRule(Rule):
                 "technique": "Path Traversal (MITRE ATT&CK T1083)",
                 "target": f"http{'s' if uri.startswith('https://') else ''}://{host or dst_ip}{uri}"
             }
-            
+
             # Add potential target files
             target_files = [
                 "/etc/passwd",
@@ -246,7 +246,7 @@ class DirectoryTraversalFinderRule(Rule):
                 "../../.env"
             ]
             details["potential_targets"] = target_files
-            
+
             # Create remediation guidance
             remediation = (
                 "Directory traversal was detected in HTTP requests. This could lead to unauthorized access to files outside intended directories.\n\n"
@@ -258,22 +258,20 @@ class DirectoryTraversalFinderRule(Rule):
                 "5. Consider using a Web Application Firewall to block common traversal attacks\n"
                 "6. Use frameworks and libraries that handle file paths securely"
             )
-            
-            # Add to red findings
-            if hasattr(self, 'analysis_manager') and self.analysis_manager and hasattr(self.analysis_manager, 'red_report_manager'):
-                self.analysis_manager.red_report_manager.add_red_finding(
-                    src_ip=src_ip,
-                    dst_ip=dst_ip,
-                    rule_name=self.name,
-                    description=description,
-                    severity=severity,
-                    details=details,
-                    connection_key=connection_key,
-                    remediation=remediation
-                )
-            else:
-                logging.warning("Cannot add red finding: red_report_manager not available")
-            
+
+            # --- CORRECTED CALL ---
+            # Add to red findings using the rule's own method
+            self.add_red_finding(
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                description=description,
+                severity=severity,
+                details=details,
+                connection_key=connection_key,
+                remediation=remediation
+            )
+            # --- END CORRECTION ---
+
         except Exception as e:
             logging.error(f"Error adding traversal to red findings: {e}")
     
@@ -282,12 +280,12 @@ class DirectoryTraversalFinderRule(Rule):
         try:
             # Create suitable description
             description = f"Sensitive file ({extension}) accessed on {host or dst_ip}"
-            
+
             # Determine severity based on file type
             severity = "medium"
             if extension in ['.env', '.config', 'passwd', 'shadow', '.db', '.key', '.pem']:
                 severity = "high"  # These are highly sensitive
-            
+
             # Create detailed information
             details = {
                 "host": host or dst_ip,
@@ -299,7 +297,7 @@ class DirectoryTraversalFinderRule(Rule):
                 "technique": "File and Directory Discovery (MITRE ATT&CK T1083)",
                 "target": f"http{'s' if uri.startswith('https://') else ''}://{host or dst_ip}{uri}"
             }
-            
+
             # Add file-specific details
             if extension == '.env':
                 details["sensitivity"] = "Contains environment variables including API keys and database credentials"
@@ -313,7 +311,7 @@ class DirectoryTraversalFinderRule(Rule):
                 details["sensitivity"] = "May contain sensitive information, debug data, or stack traces"
             elif extension in ['.bak', '.old']:
                 details["sensitivity"] = "Backup files may contain sensitive data or different security controls"
-            
+
             # Create remediation guidance
             remediation = (
                 f"A sensitive file with extension {extension} was successfully accessed via HTTP.\n\n"
@@ -325,22 +323,20 @@ class DirectoryTraversalFinderRule(Rule):
                 "5. Review the accessed file for sensitive information exposure\n"
                 "6. Consider using environment variables instead of configuration files for secrets"
             )
-            
-            # Add to red findings
-            if hasattr(self, 'analysis_manager') and self.analysis_manager and hasattr(self.analysis_manager, 'red_report_manager'):
-                self.analysis_manager.red_report_manager.add_red_finding(
-                    src_ip=src_ip,
-                    dst_ip=dst_ip,
-                    rule_name=self.name,
-                    description=description,
-                    severity=severity,
-                    details=details,
-                    connection_key=connection_key,
-                    remediation=remediation
-                )
-            else:
-                logging.warning("Cannot add red finding: red_report_manager not available")
-            
+
+            # --- CORRECTED CALL ---
+            # Add to red findings using the rule's own method
+            self.add_red_finding(
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                description=description,
+                severity=severity,
+                details=details,
+                connection_key=connection_key,
+                remediation=remediation
+            )
+            # --- END CORRECTION ---
+
         except Exception as e:
             logging.error(f"Error adding sensitive file to red findings: {e}")
     
@@ -349,10 +345,10 @@ class DirectoryTraversalFinderRule(Rule):
         try:
             # Create suitable description
             description = f"Potential file inclusion parameter detected on {host or dst_ip}"
-            
+
             # Determine severity - file inclusion is high risk
             severity = "high"
-            
+
             # Create detailed information
             details = {
                 "host": host or dst_ip,
@@ -364,7 +360,7 @@ class DirectoryTraversalFinderRule(Rule):
                 "technique": "Server-Side Include (MITRE ATT&CK T1505.002)",
                 "target": f"http{'s' if uri.startswith('https://') else ''}://{host or dst_ip}{uri}"
             }
-            
+
             # Add potential attack vectors
             vectors = [
                 "Local File Inclusion (LFI)",
@@ -373,7 +369,7 @@ class DirectoryTraversalFinderRule(Rule):
                 "Code Execution via file inclusion"
             ]
             details["attack_vectors"] = vectors
-            
+
             # Add payload examples
             payloads = [
                 f"{param_name}=../../../etc/passwd",
@@ -383,7 +379,7 @@ class DirectoryTraversalFinderRule(Rule):
                 f"{param_name}=php://filter/convert.base64-encode/resource=index.php"
             ]
             details["example_payloads"] = payloads
-            
+
             # Create remediation guidance
             remediation = (
                 f"A potential file inclusion parameter '{param_name}' was detected in HTTP requests.\n\n"
@@ -395,22 +391,20 @@ class DirectoryTraversalFinderRule(Rule):
                 "5. Disable allow_url_include in PHP configurations\n"
                 "6. Consider implementing a Web Application Firewall to block common inclusion attacks"
             )
-            
-            # Add to red findings
-            if hasattr(self, 'analysis_manager') and self.analysis_manager and hasattr(self.analysis_manager, 'red_report_manager'):
-                self.analysis_manager.red_report_manager.add_red_finding(
-                    src_ip=src_ip,
-                    dst_ip=dst_ip,
-                    rule_name=self.name,
-                    description=description,
-                    severity=severity,
-                    details=details,
-                    connection_key=connection_key,
-                    remediation=remediation
-                )
-            else:
-                logging.warning("Cannot add red finding: red_report_manager not available")
-            
+
+            # --- CORRECTED CALL ---
+            # Add to red findings using the rule's own method
+            self.add_red_finding(
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                description=description,
+                severity=severity,
+                details=details,
+                connection_key=connection_key,
+                remediation=remediation
+            )
+            # --- END CORRECTION ---
+
         except Exception as e:
             logging.error(f"Error adding file parameter to red findings: {e}")
     

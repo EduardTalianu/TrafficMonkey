@@ -11,6 +11,7 @@ import random
 from collections import defaultdict
 from dotenv import load_dotenv
 import json
+from collections import defaultdict, Counter
 
 # Required for system tray and notifications
 import pystray
@@ -39,12 +40,18 @@ logger = logging.getLogger('traffic_analyzer')
 load_dotenv()
 
 class Rule:
-    """Base class for all rules with dual-database support"""
+    """Base class for all rules with dual-database support and integrated red team reporting"""
     def __init__(self, name, description):
         self.name = name
         self.description = description
         self.enabled = True
         self.db_manager = None  # Will be set by RuleLoader
+        self.app_root = None  # Will be set by RuleLoader
+        self.analysis_manager = None # ADD THIS: Will be set by RuleLoader
+        self.app_root = None  # Will be set by RuleLoader
+        
+        # Set up red folder if needed
+        self.red_dir = None
     
     def analyze(self, db_cursor):
         """
@@ -73,30 +80,263 @@ class Rule:
     def add_alert(self, ip_address, alert_message):
         """
         Add an alert for an IP address
-        This will be stored in analysis_1.db
+        This will be stored in the alerts table
         """
-        if self.db_manager and hasattr(self.db_manager, 'analysis_manager'):
-            # Use analysis manager to add alert
-            return self.db_manager.analysis_manager.add_alert(ip_address, alert_message, self.name)
-        
-        # Fallback to old method if analysis_manager not available
-        elif self.db_manager:
+        if self.db_manager:
             return self.db_manager.queue_alert(ip_address, alert_message, self.name)
-        
         return False
+    
+    def _ensure_red_dir(self):
+        """Ensure the red directory exists"""
+        if not self.red_dir and self.app_root:
+            import os
+            self.red_dir = os.path.join(self.app_root, "red")
+            os.makedirs(self.red_dir, exist_ok=True)
+    
+    def _ensure_x_red_table(self, conn):
+        """Ensure the x_red table exists in the database"""
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS x_red (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL,
+                    src_ip TEXT,
+                    dst_ip TEXT,
+                    rule_name TEXT,
+                    severity TEXT,
+                    description TEXT,
+                    details TEXT,
+                    connection_key TEXT,
+                    remediation TEXT
+                )
+            """)
+            
+            # Create indices for better query performance
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_red_timestamp ON x_red(timestamp)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_red_src_ip ON x_red(src_ip)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_red_dst_ip ON x_red(dst_ip)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_red_rule ON x_red(rule_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_red_severity ON x_red(severity)")
+            
+            conn.commit()
+            return True
+        except Exception as e:
+            import logging
+            logging.error(f"Error ensuring x_red table exists: {e}")
+            return False
+    
+    def add_red_finding(self, src_ip, dst_ip, description,
+                    severity="medium", details=None, connection_key=None, remediation=None):
+        """
+        Add a red team finding to both the database and a file
+        """
+        try:
+            import time
+            import json
+            import os
+            from datetime import datetime
+            import logging
+
+            # Ensure red directory exists
+            self._ensure_red_dir()
+
+            current_time = time.time()
+
+            # Convert details to JSON if it's a dict
+            details_json = None
+            if details:
+                if isinstance(details, dict):
+                    details_json = json.dumps(details)
+                else:
+                    details_json = str(details)
+
+            # 1. Store in x_red table using analysis_manager
+            # MODIFIED THIS SECTION
+            conn = None
+            if self.analysis_manager and hasattr(self.analysis_manager, 'analysis1_conn'):
+                conn = self.analysis_manager.analysis1_conn
+            elif self.db_manager and hasattr(self.db_manager, 'analysis_conn'):
+                 # Fallback to analysis.db if analysis_manager not available (less ideal)
+                 conn = self.db_manager.analysis_conn
+                 logging.warning("Using fallback analysis.db for red findings. analysis_manager might not be injected correctly.")
+
+            if conn:
+                # Ensure x_red table exists (safety check, should be created by AnalysisManager now)
+                self._ensure_x_red_table(conn)
+
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO x_red
+                    (timestamp, src_ip, dst_ip, rule_name, severity, description, details, connection_key, remediation)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (current_time, src_ip, dst_ip, self.name, severity, description, details_json, connection_key, remediation))
+                conn.commit()
+                cursor.close()
+            else:
+                logging.error("Could not get a database connection to store red finding.")
+
+
+            # 2. Store in red folder as a JSON file (No changes needed here)
+            if self.red_dir:
+                timestamp_str = datetime.fromtimestamp(current_time).strftime("%Y%m%d_%H%M%S")
+                safe_rule_name = self.name.replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')
+                safe_src_ip = src_ip.replace(':', '_') if src_ip else 'NA'
+                safe_dst_ip = dst_ip.replace(':', '_') if dst_ip else 'NA'
+
+                filename = f"{timestamp_str}_{safe_rule_name}_{safe_src_ip}_{safe_dst_ip}.json"
+                file_path = os.path.join(self.red_dir, filename)
+
+                report_data = {
+                    "timestamp": current_time,
+                    "timestamp_readable": datetime.fromtimestamp(current_time).strftime("%Y-%m-%d %H:%M:%S"),
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "rule_name": self.name,
+                    "severity": severity,
+                    "description": description,
+                    "details": details,
+                    "connection_key": connection_key,
+                    "remediation": remediation
+                }
+
+                with open(file_path, 'w') as f:
+                    json.dump(report_data, f, indent=4)
+
+                logging.info(f"Added red finding for {self.name} to both database and file: {filename}")
+
+            # Add a regular alert to make sure it's visible in the UI
+            # MODIFIED THIS: Use analysis_manager's add_alert if available
+            if self.analysis_manager:
+                self.analysis_manager.add_alert(src_ip, f"RED TEAM FINDING: {description} (Severity: {severity})", self.name)
+            elif self.db_manager: # Fallback
+                self.add_alert(src_ip, f"RED TEAM FINDING: {description} (Severity: {severity})")
+
+            return True
+
+        except Exception as e:
+            import logging
+            logging.error(f"Error adding red finding: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def get_recent_red_findings(self, limit=100):
+        """Get recent red findings from the database"""
+        # MODIFIED THIS SECTION
+        conn = None
+        if self.analysis_manager and hasattr(self.analysis_manager, 'analysis1_conn'):
+            # Prioritize analysis_1.db via analysis_manager
+            conn = self.analysis_manager.analysis1_conn
+        elif self.db_manager and hasattr(self.db_manager, 'analysis_conn'):
+            # Fallback to analysis.db
+            conn = self.db_manager.analysis_conn
+            logging.warning("Reading red findings from fallback analysis.db. analysis_manager might not be injected correctly.")
+        elif self.db_manager and hasattr(self.db_manager, 'capture_conn'):
+             # Further fallback to capture.db (least ideal)
+             conn = self.db_manager.capture_conn
+             logging.warning("Reading red findings from fallback capture.db.")
+
+        if not conn:
+            logging.error("Could not get a database connection to read red findings.")
+            return []
+
+        try:
+            cursor = conn.cursor()
+            # Ensure table exists before querying (important if relying on lazy creation, less so now)
+            self._ensure_x_red_table(conn)
+
+            cursor.execute("""
+                SELECT timestamp, src_ip, dst_ip, rule_name, severity, description
+                FROM x_red
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """, (limit,))
+
+            return cursor.fetchall()
+        except Exception as e:
+            import logging
+            logging.error(f"Error getting recent findings: {e}")
+            # If the table doesn't exist, this might fail.
+            if "no such table: x_red" in str(e):
+                 logging.warning("x_red table does not exist in the queried database.")
+            return []
+        finally:
+            if 'cursor' in locals() and cursor:
+                cursor.close()
+    
+    def clear_red_findings(self):
+        """Clear all red findings from both the database and folder"""
+        try:
+            import os
+            import sqlite3 # Import for exception handling
+
+            # Clear database
+            # MODIFIED THIS SECTION
+            conn = None
+            if self.analysis_manager and hasattr(self.analysis_manager, 'analysis1_conn'):
+                conn = self.analysis_manager.analysis1_conn
+            elif self.db_manager and hasattr(self.db_manager, 'analysis_conn'):
+                conn = self.db_manager.analysis_conn
+            elif self.db_manager and hasattr(self.db_manager, 'capture_conn'):
+                conn = self.db_manager.capture_conn
+
+            if conn:
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM x_red")
+                    conn.commit()
+                    cursor.close()
+                    logging.info("Cleared x_red table in the database.")
+                except sqlite3.OperationalError as e:
+                     if "no such table: x_red" in str(e):
+                         logging.warning("x_red table does not exist, nothing to clear.")
+                     else:
+                         raise e # Re-raise other operational errors
+            else:
+                logging.error("Could not get database connection to clear red findings.")
+
+
+            # Clear folder (delete all JSON files)
+            if self.red_dir and os.path.exists(self.red_dir):
+                for filename in os.listdir(self.red_dir):
+                    if filename.endswith('.json'):
+                        os.remove(os.path.join(self.red_dir, filename))
+                logging.info(f"Cleared JSON files from red directory: {self.red_dir}")
+
+            return True
+        except Exception as e:
+            import logging
+            logging.error(f"Error clearing red findings: {e}")
+            return False
 
 class RuleLoader:
     """Handles loading rule modules from the rules directory"""
     
-    def __init__(self, db_manager):
-        """Initialize the rule loader with a database manager"""
+    def __init__(self, db_manager, analysis_manager, app_root=None):
+        """
+        Initialize the rule loader with database and analysis managers, and app root.
+
+        Args:
+            db_manager: Instance of DatabaseManager.
+            analysis_manager: Instance of AnalysisManager.
+            app_root: Root directory of the application.
+        """
         self.rules = []
         self.db_manager = db_manager
-        
+        self.analysis_manager = analysis_manager # STORE analysis_manager
+
         # Root directory of the application
-        self.app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if app_root:
+            self.app_root = app_root
+        else:
+            # Try to determine app_root from db_manager or analysis_manager
+            self.app_root = getattr(db_manager, 'app_root', None) or \
+                            getattr(analysis_manager, 'app_root', None) or \
+                            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
         self.rules_dir = os.path.join(self.app_root, 'rules')
-        
+
         # Load all rules
         self.load_rules()
     
@@ -106,19 +346,26 @@ class RuleLoader:
         if not os.path.exists(self.rules_dir):
             os.makedirs(self.rules_dir, exist_ok=True)
             logger.warning(f"Rules directory created at {self.rules_dir}")
+            # Add default rules even if directory was just created
+            self._add_default_rules()
             return
-        
+
+        # Clear existing rules before loading
+        self.rules = []
+
         # Load rule files
         for filename in os.listdir(self.rules_dir):
             if filename.endswith('.py') and not filename.startswith('__'):
                 module_name = filename[:-3]  # Remove .py extension
                 module_path = os.path.join(self.rules_dir, filename)
-                
+
                 try:
                     # Create a custom namespace for the module
+                    # Inject necessary modules and managers
                     rule_namespace = {
                         'Rule': Rule,
-                        'db_manager': self.db_manager,  # Inject database manager
+                        'db_manager': self.db_manager,
+                        'analysis_manager': self.analysis_manager, # Inject analysis manager
                         'os': os,
                         'time': time,
                         'logging': logging,
@@ -126,43 +373,50 @@ class RuleLoader:
                         'requests': __import__('requests') if 'requests' in sys.modules else None,
                         'json': json,
                         'hashlib': __import__('hashlib') if 'hashlib' in sys.modules else None,
-                        'ipaddress': __import__('ipaddress') if 'ipaddress' in sys.modules else None
+                        'ipaddress': __import__('ipaddress') if 'ipaddress' in sys.modules else None,
+                        'defaultdict': defaultdict,
+                        'base64': __import__('base64') if 'base64' in sys.modules else None,
                     }
-                    
+
                     # Load the module content
-                    with open(module_path, 'r') as f:
+                    with open(module_path, 'r', encoding='utf-8') as f:
                         module_code = f.read()
-                    
+
                     # Execute the module code in the custom namespace
                     exec(module_code, rule_namespace)
-                    
+
                     # Find rule classes in the namespace (subclasses of Rule)
                     for name, obj in rule_namespace.items():
-                        if (isinstance(obj, type) and 
-                            issubclass(obj, Rule) and 
-                            obj != Rule and 
+                        if (isinstance(obj, type) and
+                            issubclass(obj, Rule) and
+                            obj != Rule and
                             hasattr(obj, '__init__')):
-                            
+
                             # Create an instance of the rule
                             rule_instance = obj()
-                            
-                            # Inject database manager into the rule instance
+
+                            # Inject managers and app_root into the rule instance
                             rule_instance.db_manager = self.db_manager
-                            
+                            rule_instance.analysis_manager = self.analysis_manager # INJECT HERE
+                            rule_instance.app_root = self.app_root
+
+                            # Initialize red directory
+                            rule_instance._ensure_red_dir()
+
                             self.rules.append(rule_instance)
                             logger.info(f"Loaded rule: {rule_instance.name} from {filename}")
                             print(f"Loaded rule: {rule_instance.name} from {filename}")
-                
+
                 except Exception as e:
                     logger.error(f"Error loading rule {module_name}: {e}")
                     import traceback
                     traceback.print_exc()
-        
+
         # Log summary of loaded rules
-        logger.info(f"Loaded {len(self.rules)} rule modules")
-        print(f"Loaded {len(self.rules)} rule modules")
-        
-        # Add some built-in rules if no rules were loaded
+        logger.info(f"Loaded {len(self.rules)} rule modules from directory")
+        print(f"Loaded {len(self.rules)} rule modules from directory")
+
+        # Add default rules if no rules were loaded from the directory
         if not self.rules:
             self._add_default_rules()
     
@@ -537,7 +791,11 @@ class LiveCaptureGUI:
 
         # Make sure the alerts/subtabs directory exists
         os.makedirs(os.path.join(self.app_root, "alerts", "subtabs"), exist_ok=True)
-        
+
+        # Make sure the red directory exists
+        self.red_dir = os.path.join(self.app_root, "red")
+        os.makedirs(self.red_dir, exist_ok=True)
+
         # Add src directory to Python path
         if self.src_dir not in sys.path:
             sys.path.append(self.src_dir)
@@ -552,7 +810,7 @@ class LiveCaptureGUI:
         self.sliding_window_size = tk.IntVar(value=1000)
         self.selected_interface = tk.StringVar()
         self.show_inactive_interfaces = tk.BooleanVar(value=False)
-        
+
         # Enable notifications by default
         self.enable_notifications = tk.BooleanVar(value=True)
 
@@ -568,20 +826,18 @@ class LiveCaptureGUI:
 
         # Make sure log directory exists
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
-        
+
         # Path to false positives file
         self.false_positives_file = os.path.join(self.app_root, "db", "false_positives.txt")
         self.false_positives = self.load_false_positives()
 
         # IMPORTANT: Explicitly create the database manager first
         self.db_manager = db_manager
-        
-        # Initialize the analysis manager with the database manager
+
+        # Initialize the analysis manager - make sure this happens BEFORE loading rules
+        from analysis_manager import AnalysisManager
         self.analysis_manager = AnalysisManager(self.app_root, self.db_manager)
-        
-        # Link the database manager to the analysis manager for compatibility
-        setattr(self.db_manager, 'analysis_manager', self.analysis_manager)
-        
+
         # Only after db_manager is created, initialize the capture engine
         from traffic_capture import TrafficCaptureEngine
         self.capture_engine = TrafficCaptureEngine(self)
@@ -591,71 +847,139 @@ class LiveCaptureGUI:
         self.tree_manager = TreeViewManager()
         self.tab_factory = TabFactory(self)
 
+        # Load Rules - PASS analysis_manager HERE
+        self.rule_loader = RuleLoader(self.db_manager, self.analysis_manager, self.app_root)
+        self.rules = self.rule_loader.rules
+        self.selected_rule = None
+        self.param_vars = {}
+
         # UI Setup
         self.notebook = ttk.Notebook(master)
         self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
-        
+
         self.interfaces_tab = ttk.Frame(self.notebook)
         self.settings_tab = ttk.Frame(self.notebook)
         self.rules_tab = ttk.Frame(self.notebook)
         self.alerts_tab = ttk.Frame(self.notebook)
-        
+
         self.notebook.add(self.interfaces_tab, text="Network Interfaces")
         self.notebook.add(self.settings_tab, text="Detection Settings")
         self.notebook.add(self.rules_tab, text="Rules")
         self.notebook.add(self.alerts_tab, text="Alerts")
-        
+
+
         # Initialize interfaces
         self.interface_info = []
-        
+
         # Initialize system tray icon
         self.tray_app = SystemTrayApp(self)
         self.tray_app.notification_enabled = self.enable_notifications.get()
+
+        # Initialize status flags for refresh operations
+        self.malicious_refresh_in_progress = False
+        self.leaderboard_refresh_in_progress = False
+        self.last_alerts_update_time = 0
+        self.last_stats_update_time = 0
+        self.last_red_update_time = 0  # Initialize this before creating tabs
+
+        # Data caching
+        self.data_cache = {}
+        self.cache_expiry = {}
+        self.cache_lifetime = 60  # seconds
 
         # Create UI tabs
         self.create_interfaces_tab()
         self.create_settings_tab()
         self.create_rules_tab()
         self.create_alerts_tab()
-        
+
+        # Update the rules list after creating the rules tab
+        self.update_rules_list()
+
         # Capture Variables
         self.running = False
         self.capture_thread = None
-        
-        # Initialize TrafficCaptureEngine with database manager
-        self.capture_engine = TrafficCaptureEngine(self)
-        
-        # Load Rules with database manager
-        self.rule_loader = RuleLoader(self.db_manager)
-        self.rules = self.rule_loader.rules
-        self.selected_rule = None
-        self.param_vars = {}
-        self.update_rules_list()
-        
+
         # Start system tray icon
         self.tray_app.run()
-        
+
         # Initialize interfaces after UI is set up
         self.refresh_interfaces()
-        
+
         # Set up window close handler
         self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
-        # Initialize status flags for refresh operations
-        self.malicious_refresh_in_progress = False
-        self.leaderboard_refresh_in_progress = False
-        self.last_alerts_update_time = 0
-        self.last_stats_update_time = 0
-        
-        # Data caching
-        self.data_cache = {}
-        self.cache_expiry = {}
-        self.cache_lifetime = 60  # seconds
+    
+    
 
-        # Initialize the red report manager
-        from src.red_report_manager import RedReportManager
-        self.red_report_manager = RedReportManager(self.app_root, self.analysis_manager)
-        self.update_output("Red Report Manager initialized")
+        
+
+    def _load_red_findings_from_files(self):
+        """Load red findings directly from the files in the red directory"""
+        findings = []
+        
+        try:
+            if not os.path.exists(self.red_dir):
+                return findings
+                
+            for filename in os.listdir(self.red_dir):
+                if filename.endswith('.json'):
+                    try:
+                        file_path = os.path.join(self.red_dir, filename)
+                        with open(file_path, 'r') as f:
+                            data = json.load(f)
+                            
+                        # Extract the key fields
+                        timestamp = data.get("timestamp", 0)
+                        src_ip = data.get("src_ip", "N/A")
+                        dst_ip = data.get("dst_ip", "N/A")
+                        rule_name = data.get("rule_name", "Unknown")
+                        severity = data.get("severity", "medium")
+                        description = data.get("description", "No description")
+                        
+                        findings.append((timestamp, src_ip, dst_ip, rule_name, severity, description))
+                    except Exception as e:
+                        self.update_output(f"Error loading finding file {filename}: {e}")
+                        
+            # Sort by timestamp descending
+            findings.sort(reverse=True, key=lambda x: x[0])
+            
+            return findings
+        except Exception as e:
+            self.update_output(f"Error loading findings from files: {e}")
+            return []
+
+        
+
+    def add_red_finding(self, src_ip, dst_ip, description, severity="medium", details=None, connection_key=None, remediation=None):
+        """
+        Add a red team finding
+        This will be stored in the x_red table and as a file in the red folder
+        """
+        if not self.rules:
+            self.update_output("No rules loaded, cannot add red finding")
+            return False
+            
+        # Use any rule to add the finding
+        rule = self.rules[0]
+        result = rule.add_red_finding(
+            src_ip=src_ip,
+            dst_ip=dst_ip, 
+            description=description,
+            severity=severity,
+            details=details,
+            connection_key=connection_key,
+            remediation=remediation
+        )
+        
+        if result:
+            self.update_output(f"Added red team finding: {description}")
+            # Don't try to refresh the red findings tab since it doesn't exist anymore
+            # Instead, refresh the alerts tab to show the new finding
+            self.refresh_alerts()
+        else:
+            self.update_output("Error adding red team finding")
+            
+        return result
 
     def get_cached_data(self, cache_key, query_func, *args, force_refresh=False, **kwargs):
         """Get data from cache or fetch from database if expired"""
@@ -810,51 +1134,51 @@ class LiveCaptureGUI:
     def create_rules_tab(self):
         button_frame = ttk.Frame(self.rules_tab)
         button_frame.pack(fill="x", padx=10, pady=5)
-        
+
         ttk.Button(button_frame, text="Add Rule File", command=self.add_rule_file).pack(side="left", padx=5)
         ttk.Button(button_frame, text="Reload Rules", command=self.reload_rules).pack(side="left", padx=5)
-        
+
         list_frame = ttk.Frame(self.rules_tab)
         list_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        
+
         ttk.Label(list_frame, text="Active Rules:").pack(anchor="w", padx=5, pady=5)
-        
+
         scrollbar = ttk.Scrollbar(list_frame)
         scrollbar.pack(side="right", fill="y")
-        
-        self.rules_listbox = ttk.Treeview(list_frame, 
+
+        self.rules_listbox = ttk.Treeview(list_frame,
                                          columns=("name", "description", "status"),
                                          show="headings",
                                          selectmode="browse",
                                          height=10)
         self.rules_listbox.pack(fill="both", expand=True)
-        
+
         self.rules_listbox.heading("name", text="Rule Name")
         self.rules_listbox.heading("description", text="Description")
         self.rules_listbox.heading("status", text="Status")
-        
+
         self.rules_listbox.column("name", width=150)
         self.rules_listbox.column("description", width=300)
         self.rules_listbox.column("status", width=100)
-        
+
         scrollbar.config(command=self.rules_listbox.yview)
         self.rules_listbox.config(yscrollcommand=scrollbar.set)
-        
+
         self.rules_listbox.bind("<Double-1>", self.toggle_rule)
         self.rules_listbox.bind("<<TreeviewSelect>>", self.show_rule_details)
-        
+
         details_frame = ttk.LabelFrame(self.rules_tab, text="Rule Details")
         details_frame.pack(fill="x", padx=10, pady=5)
-        
+
         self.rule_details_text = tk.Text(details_frame, height=5, wrap=tk.WORD)
         self.rule_details_text.pack(fill="both", expand=True, padx=5, pady=5)
-        
+
         params_frame = ttk.LabelFrame(self.rules_tab, text="Rule Parameters")
         params_frame.pack(fill="x", padx=10, pady=5)
-        
+
         self.params_content_frame = ttk.Frame(params_frame)
         self.params_content_frame.pack(fill="both", expand=True, padx=5, pady=5)
-        
+
         self.apply_params_button = ttk.Button(params_frame, text="Apply Parameters", command=self.apply_rule_params)
         self.apply_params_button.pack(side="right", padx=5, pady=5)
         self.apply_params_button.config(state="disabled")

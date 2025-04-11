@@ -245,19 +245,15 @@ class NetworkTopologyMapperRule(Rule):
             # Create remediation guidance
             remediation = "Network segmentation via VLANs, subnets, and firewall rules to limit lateral movement. Implement principle of least privilege for network access."
             
-            # Add to red findings
-            if hasattr(self, 'analysis_manager') and self.analysis_manager and hasattr(self.analysis_manager, 'red_report_manager'):
-                self.analysis_manager.red_report_manager.add_red_finding(
-                    src_ip="N/A",  # No specific source IP for network mapping
-                    dst_ip=subnet.split('/')[0],  # Use subnet as destination
-                    rule_name=self.name,
-                    description=description,
-                    severity=severity,
-                    details=details,
-                    remediation=remediation
-                )
-            else:
-                logging.warning("Cannot add red finding: red_report_manager not available")
+            # Add to red findings directly
+            self.add_red_finding(
+                src_ip="N/A",  # No specific source IP for network mapping
+                dst_ip=subnet.split('/')[0],  # Use subnet as destination
+                description=description,
+                severity=severity,
+                details=details,
+                remediation=remediation
+            )
             
         except Exception as e:
             logging.error(f"Error adding subnet to red findings: {e}")
@@ -333,19 +329,15 @@ class NetworkTopologyMapperRule(Rule):
             else:
                 remediation = "Review network access control for this device. Implement monitoring for unusual connection patterns."
             
-            # Add to red findings
-            if hasattr(self, 'analysis_manager') and self.analysis_manager and hasattr(self.analysis_manager, 'red_report_manager'):
-                self.analysis_manager.red_report_manager.add_red_finding(
-                    src_ip="N/A",  # No specific source IP for device discovery
-                    dst_ip=device_ip,
-                    rule_name=self.name,
-                    description=description,
-                    severity=severity,
-                    details=details,
-                    remediation=remediation
-                )
-            else:
-                logging.warning("Cannot add red finding: red_report_manager not available")
+            # Add to red findings directly
+            self.add_red_finding(
+                src_ip="N/A",  # No specific source IP for device discovery
+                dst_ip=device_ip,
+                description=description,
+                severity=severity,
+                details=details,
+                remediation=remediation
+            )
             
         except Exception as e:
             logging.error(f"Error adding device to red findings: {e}")
@@ -387,50 +379,80 @@ class NetworkTopologyMapperRule(Rule):
         return None
     
     def _store_network_map(self, subnet, subnet_details):
-        """Store the network map in the database for later exploitation"""
+        """
+        Store the network map information as red team findings
+        using self.add_red_finding (writes to x_red table and JSON file).
+        """
         try:
-            # If we have an analysis_manager, store data in x_ip_threat_intel
-            if hasattr(self, 'analysis_manager') and self.analysis_manager:
-                # Create a dummy IP for the subnet (for storage purposes)
-                subnet_ip = subnet.split('/')[0]
-                
-                # Create threat intel entry for this subnet
-                threat_data = {
-                    "score": 0,  # Not a threat, just information
-                    "type": "network_topology",
-                    "confidence": 0.9,
-                    "source": self.name,
-                    "details": subnet_details,
-                    "protocol": "NETWORK",
-                    "detection_method": "traffic_analysis"
+            # --- Subnet Finding ---
+            subnet_ip = subnet.split('/')[0] # Representative IP for the subnet
+
+            # Create description for the subnet finding
+            subnet_description = f"Network subnet {subnet} identified with {subnet_details.get('device_count', 0)} devices"
+            if subnet_details.get("gateway"):
+                subnet_description += f". Potential Gateway: {subnet_details['gateway']}"
+
+            # Define severity and remediation for subnet mapping
+            subnet_severity = "low" # Network mapping is informational
+            subnet_remediation = "Review network segmentation and access controls for this subnet. Ensure least privilege principles are applied."
+
+            # Add the subnet information as a red finding
+            self.add_red_finding(
+                src_ip=None, # Not tied to a specific source
+                dst_ip=subnet_ip, # Use subnet IP as the destination/target
+                description=subnet_description,
+                severity=subnet_severity,
+                details=subnet_details, # Store the full subnet details dictionary
+                connection_key=None, # Not tied to a specific connection
+                remediation=subnet_remediation
+            )
+            logging.info(f"Added subnet {subnet} topology to red findings.") # Log success
+
+            # --- Gateway Finding (if identified) ---
+            if subnet_details.get("gateway"):
+                gateway_ip = subnet_details["gateway"]
+
+                # Prepare gateway-specific details
+                gateway_details = {
+                    "role": "gateway",
+                    "subnet": subnet,
+                    "gateway_score": self.potential_gateways.get(gateway_ip, 0),
+                    "device_info": self.devices.get(gateway_ip, {}) # Include device info if available
                 }
-                
-                # Store in the threat_intel table
-                self.analysis_manager.update_threat_intel(subnet_ip, threat_data)
-                
-                # If gateway is identified, add it to the database too
-                if subnet_details["gateway"]:
-                    gateway_ip = subnet_details["gateway"]
-                    
-                    # Create threat intel entry for this gateway
-                    gateway_data = {
-                        "score": 0,  # Not a threat, just information
-                        "type": "network_gateway",
-                        "confidence": 0.8,
-                        "source": self.name,
-                        "details": {
-                            "subnet": subnet,
-                            "gateway_score": self.potential_gateways[gateway_ip],
-                            "device_info": self.devices.get(gateway_ip, {})
-                        },
-                        "protocol": "NETWORK",
-                        "detection_method": "traffic_analysis"
-                    }
-                    
-                    # Store in the threat_intel table
-                    self.analysis_manager.update_threat_intel(gateway_ip, gateway_data)
+                # Convert sets in device_info to lists if necessary for JSON
+                if "ports_used" in gateway_details["device_info"]:
+                     gateway_details["device_info"]["ports_used"] = list(gateway_details["device_info"]["ports_used"])
+                if "protocols" in gateway_details["device_info"]:
+                     gateway_details["device_info"]["protocols"] = list(gateway_details["device_info"]["protocols"])
+
+
+                # Create description for the gateway finding
+                gateway_description = f"Potential gateway {gateway_ip} identified for subnet {subnet}"
+
+                # Define severity and remediation for gateway identification
+                gateway_severity = "low" # Identifying a gateway is informational
+                # Increase severity if gateway score is high? Maybe medium? Let's keep low for now.
+                # if self.potential_gateways.get(gateway_ip, 0) > 10:
+                #    gateway_severity = "medium"
+
+                gateway_remediation = "Ensure gateway device is secure, patched, and access is restricted according to security policies. Monitor for unauthorized access attempts."
+
+                # Add the gateway information as a red finding
+                self.add_red_finding(
+                    src_ip=None, # Not tied to a specific source
+                    dst_ip=gateway_ip, # Use gateway IP as the destination/target
+                    description=gateway_description,
+                    severity=gateway_severity,
+                    details=gateway_details, # Store the gateway-specific details
+                    connection_key=None, # Not tied to a specific connection
+                    remediation=gateway_remediation
+                )
+                logging.info(f"Added potential gateway {gateway_ip} to red findings.") # Log success
+
         except Exception as e:
-            logging.error(f"Error storing network map: {e}")
+            logging.error(f"Error storing network map as red finding: {e}")
+            import traceback
+            traceback.print_exc() # Print full traceback for debugging
     
     def get_params(self):
         return {

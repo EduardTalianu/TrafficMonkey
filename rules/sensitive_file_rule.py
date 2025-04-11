@@ -311,7 +311,7 @@ class SensitiveFileDetectorRule(Rule):
             else:
                 remediation = "Review access controls for sensitive files. Implement proper authentication and authorization for file access. Consider encrypting sensitive data both in transit and at rest."
             
-            # Add to red findings
+            # Add to red findings using our direct method
             self.add_red_finding(
                 src_ip=src_ip,
                 dst_ip=dst_ip,

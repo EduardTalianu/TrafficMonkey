@@ -308,20 +308,16 @@ class ServerMisconfigurationRule(Rule):
                     
             remediation += "\nFor web servers like Apache, these can be added to .htaccess or httpd.conf. For Nginx, add them to your server or location blocks. For application servers, add them to your response headers in code."
             
-            # Add to red findings using the red_report_manager
-            if hasattr(self, 'analysis_manager') and self.analysis_manager and hasattr(self.analysis_manager, 'red_report_manager'):
-                self.analysis_manager.red_report_manager.add_red_finding(
-                    src_ip="N/A",  # No specific source IP for this finding
-                    dst_ip=dst_ip,
-                    rule_name=self.name,
-                    description=description,
-                    severity=severity,
-                    details=details,
-                    connection_key=connection_key,
-                    remediation=remediation
-                )
-            else:
-                logging.warning("Cannot add red finding: red_report_manager not available")
+            # Add to red findings directly
+            self.add_red_finding(
+                src_ip="N/A",  # No specific source IP for this finding
+                dst_ip=dst_ip,
+                description=description,
+                severity=severity,
+                details=details,
+                connection_key=connection_key,
+                remediation=remediation
+            )
             
         except Exception as e:
             logging.error(f"Error adding missing headers to red findings: {e}")
@@ -370,20 +366,16 @@ class ServerMisconfigurationRule(Rule):
                 remediation += "- For IIS: Use URLScan to remove the Server header\n"
                 remediation += "- For application servers: Configure the server to remove or modify the header in responses"
             
-            # Add to red findings using the red_report_manager
-            if hasattr(self, 'analysis_manager') and self.analysis_manager and hasattr(self.analysis_manager, 'red_report_manager'):
-                self.analysis_manager.red_report_manager.add_red_finding(
-                    src_ip="N/A",  # No specific source IP for this finding
-                    dst_ip=dst_ip,
-                    rule_name=self.name,
-                    description=description,
-                    severity=severity,
-                    details=details,
-                    connection_key=connection_key,
-                    remediation=remediation
-                )
-            else:
-                logging.warning("Cannot add red finding: red_report_manager not available")
+            # Add to red findings directly
+            self.add_red_finding(
+                src_ip="N/A",  # No specific source IP for this finding
+                dst_ip=dst_ip,
+                description=description,
+                severity=severity,
+                details=details,
+                connection_key=connection_key,
+                remediation=remediation
+            )
             
         except Exception as e:
             logging.error(f"Error adding vulnerable server to red findings: {e}")
@@ -450,20 +442,16 @@ class ServerMisconfigurationRule(Rule):
                     "Ensure all errors are logged securely for troubleshooting without exposing details to users."
                 )
             
-            # Add to red findings using the red_report_manager
-            if hasattr(self, 'analysis_manager') and self.analysis_manager and hasattr(self.analysis_manager, 'red_report_manager'):
-                self.analysis_manager.red_report_manager.add_red_finding(
-                    src_ip="N/A",  # No specific source IP for this finding
-                    dst_ip=dst_ip,
-                    rule_name=self.name,
-                    description=description,
-                    severity=severity,
-                    details=details,
-                    connection_key=connection_key,
-                    remediation=remediation
-                )
-            else:
-                logging.warning("Cannot add red finding: red_report_manager not available")
+            # Add to red findings directly
+            self.add_red_finding(
+                src_ip="N/A",  # No specific source IP for this finding
+                dst_ip=dst_ip,
+                description=description,
+                severity=severity,
+                details=details,
+                connection_key=connection_key,
+                remediation=remediation
+            )
             
         except Exception as e:
             logging.error(f"Error adding error disclosure to red findings: {e}")

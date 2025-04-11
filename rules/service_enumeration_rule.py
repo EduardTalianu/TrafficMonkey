@@ -1,9 +1,3 @@
-# Rule class is injected by the RuleLoader
-import logging
-from collections import defaultdict
-import time
-import json
-
 class ServiceEnumerationRule(Rule):
     """Rule that identifies and maps services running on the network"""
     def __init__(self):
@@ -207,7 +201,7 @@ class ServiceEnumerationRule(Rule):
                         # Store service details in the database
                         self._store_service_info(ip, port, details)
                         
-                        # Add to red team findings
+                        # Add to red team findings directly
                         self._add_service_to_red_findings(ip, port, details, reason)
             
             return alerts
@@ -218,11 +212,8 @@ class ServiceEnumerationRule(Rule):
             return [error_msg]
     
     def _add_service_to_red_findings(self, ip, port, details, reason):
-        """Add the discovered service to red team findings"""
+        """Add the discovered service to red team findings using the new integrated method"""
         try:
-            # Add debug logging
-            logging.info(f"Attempting to add service to red findings: {ip}:{port} - {details.get('service')}")
-            
             # Extract service and additional info
             service_name = details.get('service', f"Unknown-{port}")
             
@@ -274,30 +265,26 @@ class ServiceEnumerationRule(Rule):
             elif service_name in ["LDAP"]:
                 remediation = "Use LDAPS (LDAP over SSL/TLS) instead of unencrypted LDAP. Restrict directory service access to authenticated users only."
             
-            # Add to red findings using the red_report_manager through analysis_manager
-            if hasattr(self, 'analysis_manager') and self.analysis_manager and hasattr(self.analysis_manager, 'red_report_manager'):
-                logging.info(f"About to add red finding for {service_name} service on {ip}:{port}")
-                self.analysis_manager.red_report_manager.add_red_finding(
-                    src_ip="N/A",  # No specific source IP for service discovery
-                    dst_ip=ip,
-                    rule_name=self.name,
-                    description=description,
-                    severity=severity,
-                    details=details_dict,
-                    remediation=remediation
-                )
-                logging.info(f"Successfully added red finding for {service_name} service")
-            else:
-                logging.warning(f"Cannot add red finding for {ip}:{port}: red_report_manager not available")
-                
+            # Add red finding directly using our built-in method
+            self.add_red_finding(
+                src_ip="N/A",  # No specific source IP for service discovery
+                dst_ip=ip,
+                description=description,
+                severity=severity,
+                details=details_dict,
+                connection_key=None,
+                remediation=remediation
+            )
+            
+            logging.info(f"Successfully added red finding for {service_name} service")
         except Exception as e:
             logging.error(f"Error adding service to red findings: {e}", exc_info=True)
     
     def _store_service_info(self, ip, port, details):
         """Store the service information in the database for later exploitation"""
         try:
-            # If we have an analysis_manager, store data in x_ip_threat_intel
-            if hasattr(self, 'analysis_manager') and self.analysis_manager:
+            # Store directly in the captures table instead of relying on analysis_manager
+            if self.db_manager and hasattr(self.db_manager, 'capture_conn'):
                 # Create threat intel entry for this service
                 threat_data = {
                     "score": 0,  # Not a threat, just information
@@ -321,8 +308,67 @@ class ServiceEnumerationRule(Rule):
                     "detection_method": "traffic_analysis"
                 }
                 
-                # Store in the threat_intel table
-                self.analysis_manager.update_threat_intel(ip, threat_data)
+                # Store in the database directly
+                cursor = self.db_manager.capture_conn.cursor()
+                try:
+                    # Try to create the table if it doesn't exist
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS x_ip_threat_intel (
+                            ip_address TEXT PRIMARY KEY,
+                            threat_score REAL DEFAULT 0,
+                            threat_type TEXT,
+                            confidence REAL DEFAULT 0,
+                            source TEXT,
+                            first_seen TIMESTAMP,
+                            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            details TEXT,
+                            protocol TEXT,
+                            destination_ip TEXT,
+                            destination_port INTEGER,
+                            bytes_transferred INTEGER,
+                            detection_method TEXT,
+                            encoding_type TEXT,
+                            packet_count INTEGER,
+                            timing_variance REAL,
+                            alert_count INTEGER DEFAULT 1
+                        )
+                    """)
+                    
+                    # Basic index
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_threat_score ON x_ip_threat_intel(threat_score DESC)")
+                    
+                    # Insert or update the record
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO x_ip_threat_intel
+                        (ip_address, threat_score, threat_type, confidence, source, first_seen, 
+                        last_seen, details, protocol, destination_port, detection_method)
+                        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+                    """, (
+                        ip, 
+                        threat_data.get('score', 0), 
+                        threat_data.get('type'),
+                        threat_data.get('confidence', 0),
+                        threat_data.get('source'),
+                        time.time(),
+                        json.dumps(threat_data.get('details', {})),
+                        threat_data.get('protocol'),
+                        threat_data.get('destination_port'),
+                        threat_data.get('detection_method')
+                    ))
+                    
+                    # Update alert count if this is an existing record
+                    cursor.execute("""
+                        UPDATE x_ip_threat_intel 
+                        SET alert_count = alert_count + 1
+                        WHERE ip_address = ? AND alert_count IS NOT NULL
+                    """, (ip,))
+                    
+                    self.db_manager.capture_conn.commit()
+                    
+                except Exception as e:
+                    logging.error(f"Error creating x_ip_threat_intel table or inserting data: {e}")
+                finally:
+                    cursor.close()
         except Exception as e:
             logging.error(f"Error storing service information: {e}")
     

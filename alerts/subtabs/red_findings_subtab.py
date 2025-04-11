@@ -5,11 +5,12 @@ from tkinter import ttk
 import logging
 import time
 import json
+import os
 from datetime import datetime
 from subtab_base import SubtabBase
 
 class RedFindingsSubtab(SubtabBase):
-    """Display red team findings from analysis_1.db"""
+    """Display red team findings from the consolidated system"""
     
     def __init__(self):
         super().__init__("Red Findings", "Displays security findings for red team activities")
@@ -142,21 +143,56 @@ class RedFindingsSubtab(SubtabBase):
         self.filter_text = ""
         self.refresh()
     
+    def _get_rule_instance(self):
+        """Get a rule instance to work with (any rule will do)"""
+        # This method becomes less critical if we query analysis_manager directly
+        if hasattr(self.gui, 'rules') and self.gui.rules:
+            return self.gui.rules[0]
+        return None
+    
     def clear_findings(self):
-        """Clear all findings"""
-        if hasattr(self.gui, 'red_report_manager') and self.gui.red_report_manager:
-            self.gui.red_report_manager.clear_findings()
+        """Clear all findings using AnalysisManager"""
+        # MODIFY TO USE ANALYSIS_MANAGER DIRECTLY IF POSSIBLE
+        if hasattr(self.gui, 'analysis_manager') and hasattr(self.gui.analysis_manager, 'clear_red_findings'):
+             # Assumes AnalysisManager has a clear_red_findings method
+             self.gui.analysis_manager.queue_query(
+                 self.gui.analysis_manager.clear_red_findings,
+                 callback=self._after_clear_findings
+             )
+        else:
+            # Fallback to using a rule instance
+            rule = self._get_rule_instance()
+            if rule:
+                if rule.clear_red_findings():
+                    self.update_output("Red findings cleared")
+                    self.refresh()
+                else:
+                    self.update_output("Failed to clear red findings")
+            else:
+                self.update_output("Cannot clear findings: No rules or analysis manager method available")
+
+    def _after_clear_findings(self, success):
+        """Callback after clearing findings via analysis_manager"""
+        if success:
+            self.update_output("Red findings cleared via AnalysisManager")
             self.refresh()
+        else:
+            self.update_output("Failed to clear red findings via AnalysisManager")
     
     def refresh(self):
         """Refresh the findings display"""
-        if not hasattr(self.gui, 'red_report_manager'):
-            self.update_output("Red Report Manager not initialized")
+        rule = self._get_rule_instance()
+        if not rule:
+            self.update_output("No rules available to get red findings")
             return
             
         try:
-            # Get data from manager
-            findings = self.gui.red_report_manager.get_recent_findings(limit=1000)
+            # Get findings from any rule (they all have access to the same data)
+            findings = rule.get_recent_red_findings(limit=1000)
+            
+            # If no findings are found in the database, try to load from files
+            if not findings:
+                findings = self._load_findings_from_files()
             
             # Clear current items
             for item in self.tree.get_children():
@@ -178,7 +214,10 @@ class RedFindingsSubtab(SubtabBase):
                 
                 # Format timestamp
                 try:
-                    timestamp_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                    if isinstance(timestamp, (int, float)):
+                        timestamp_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        timestamp_str = str(timestamp)
                 except:
                     timestamp_str = str(timestamp)
                 
@@ -213,13 +252,57 @@ class RedFindingsSubtab(SubtabBase):
             
         except Exception as e:
             self.update_output(f"Error refreshing red findings: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _load_findings_from_files(self):
+        """Load red findings directly from the files in the red directory"""
+        findings = []
+        
+        try:
+            # Get path to red directory
+            red_dir = None
+            if hasattr(self.gui, 'red_dir'):
+                red_dir = self.gui.red_dir
+            elif hasattr(self.gui, 'app_root'):
+                red_dir = os.path.join(self.gui.app_root, "red")
+            
+            if not red_dir or not os.path.exists(red_dir):
+                return findings
+                
+            for filename in os.listdir(red_dir):
+                if filename.endswith('.json'):
+                    try:
+                        file_path = os.path.join(red_dir, filename)
+                        with open(file_path, 'r') as f:
+                            data = json.load(f)
+                            
+                        # Extract the key fields
+                        timestamp = data.get("timestamp", 0)
+                        src_ip = data.get("src_ip", "N/A")
+                        dst_ip = data.get("dst_ip", "N/A")
+                        rule_name = data.get("rule_name", "Unknown")
+                        severity = data.get("severity", "medium")
+                        description = data.get("description", "No description")
+                        
+                        findings.append((timestamp, src_ip, dst_ip, rule_name, severity, description))
+                    except Exception as e:
+                        self.update_output(f"Error loading finding file {filename}: {e}")
+                        
+            # Sort by timestamp descending
+            findings.sort(reverse=True, key=lambda x: x[0])
+            
+            return findings
+        except Exception as e:
+            self.update_output(f"Error loading findings from files: {e}")
+            return []
     
     def on_finding_selected(self, event):
         """Display details when a finding is selected"""
         self.show_details()
     
     def show_details(self):
-        """Show detailed information about the selected finding"""
+        """Show detailed information about the selected finding using files or direct DB access"""
         selected = self.tree.selection()
         if not selected:
             return
@@ -231,55 +314,167 @@ class RedFindingsSubtab(SubtabBase):
             
         timestamp_str, severity, rule_name, src_ip, dst_ip, description = values
         
-        # Query database for full details
-        if hasattr(self.gui, 'red_report_manager') and self.gui.red_report_manager and self.gui.red_report_manager.analysis_manager:
-            try:
-                cursor = self.gui.red_report_manager.analysis_manager.get_cursor()
-                cursor.execute("""
-                    SELECT details, connection_key, remediation
-                    FROM x_red
-                    WHERE rule_name = ? AND src_ip = ? AND dst_ip = ? AND description = ?
-                    ORDER BY timestamp DESC
-                    LIMIT 1
-                """, (rule_name, src_ip, dst_ip, description))
-                
-                row = cursor.fetchone()
-                if row:
-                    details_json, connection_key, remediation = row
-                    
-                    # Format details for display
-                    self.detail_text.delete(1.0, tk.END)
-                    self.detail_text.insert(tk.END, f"Rule: {rule_name}\n")
-                    self.detail_text.insert(tk.END, f"Severity: {severity.upper()}\n")
-                    self.detail_text.insert(tk.END, f"Time: {timestamp_str}\n")
-                    self.detail_text.insert(tk.END, f"Source IP: {src_ip}\n")
-                    self.detail_text.insert(tk.END, f"Destination IP: {dst_ip}\n")
-                    self.detail_text.insert(tk.END, f"Description: {description}\n\n")
-                    
-                    if connection_key:
-                        self.detail_text.insert(tk.END, f"Connection: {connection_key}\n")
-                    
-                    if details_json:
-                        try:
-                            details = json.loads(details_json)
-                            self.detail_text.insert(tk.END, "Details:\n")
-                            for key, value in details.items():
-                                self.detail_text.insert(tk.END, f"  {key}: {value}\n")
-                        except:
-                            self.detail_text.insert(tk.END, f"Details: {details_json}\n")
-                    
-                    if remediation:
-                        self.detail_text.insert(tk.END, f"\nRemediation:\n{remediation}\n")
-                    
-                    return
-            except Exception as e:
-                self.update_output(f"Error retrieving finding details: {e}")
-        
-        # Fallback to basic info if query fails
+        # Clear details area
         self.detail_text.delete(1.0, tk.END)
+        
+        # First try to find matching file
+        finding_file = self._find_matching_file(timestamp_str, rule_name, src_ip, dst_ip)
+        
+        if finding_file:
+            # We found a file, load details from it
+            try:
+                with open(finding_file, 'r') as f:
+                    data = json.load(f)
+                
+                # Basic details
+                self.detail_text.insert(tk.END, f"Rule: {rule_name}\n")
+                self.detail_text.insert(tk.END, f"Severity: {severity.upper()}\n")
+                self.detail_text.insert(tk.END, f"Time: {timestamp_str}\n")
+                self.detail_text.insert(tk.END, f"Source IP: {src_ip}\n")
+                self.detail_text.insert(tk.END, f"Destination IP: {dst_ip}\n")
+                self.detail_text.insert(tk.END, f"Description: {description}\n\n")
+                
+                # Connection key if available
+                if "connection_key" in data and data["connection_key"]:
+                    self.detail_text.insert(tk.END, f"Connection: {data['connection_key']}\n")
+                
+                # Additional details
+                if "details" in data and data["details"]:
+                    self.detail_text.insert(tk.END, "Details:\n")
+                    if isinstance(data["details"], dict):
+                        for key, value in data["details"].items():
+                            self.detail_text.insert(tk.END, f"  {key}: {value}\n")
+                    else:
+                        self.detail_text.insert(tk.END, f"  {data['details']}\n")
+                
+                # Remediation if available
+                if "remediation" in data and data["remediation"]:
+                    self.detail_text.insert(tk.END, f"\nRemediation:\n{data['remediation']}\n")
+                    
+                return
+            except Exception as e:
+                self.update_output(f"Error reading finding file: {e}")
+        
+        # If we reach here, either no file was found or there was an error reading it
+        # Try to get details from database
+        rule = self._get_rule_instance()
+        if rule and hasattr(rule, 'db_manager'):
+            try:
+                # Determine which database connection to use
+                conn = None
+                if hasattr(rule.db_manager, 'analysis_conn'):
+                    conn = rule.db_manager.analysis_conn
+                elif hasattr(rule.db_manager, 'capture_conn'):
+                    conn = rule.db_manager.capture_conn
+                    
+                if conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT details, connection_key, remediation
+                        FROM x_red
+                        WHERE rule_name = ? AND src_ip = ? AND dst_ip = ? AND description = ?
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                    """, (rule_name, src_ip, dst_ip, description))
+                    
+                    row = cursor.fetchone()
+                    if row:
+                        details_json, connection_key, remediation = row
+                        
+                        # Format details for display
+                        self.detail_text.insert(tk.END, f"Rule: {rule_name}\n")
+                        self.detail_text.insert(tk.END, f"Severity: {severity.upper()}\n")
+                        self.detail_text.insert(tk.END, f"Time: {timestamp_str}\n")
+                        self.detail_text.insert(tk.END, f"Source IP: {src_ip}\n")
+                        self.detail_text.insert(tk.END, f"Destination IP: {dst_ip}\n")
+                        self.detail_text.insert(tk.END, f"Description: {description}\n\n")
+                        
+                        if connection_key:
+                            self.detail_text.insert(tk.END, f"Connection: {connection_key}\n")
+                        
+                        if details_json:
+                            try:
+                                details = json.loads(details_json)
+                                self.detail_text.insert(tk.END, "Details:\n")
+                                for key, value in details.items():
+                                    self.detail_text.insert(tk.END, f"  {key}: {value}\n")
+                            except:
+                                self.detail_text.insert(tk.END, f"Details: {details_json}\n")
+                        
+                        if remediation:
+                            self.detail_text.insert(tk.END, f"\nRemediation:\n{remediation}\n")
+                        
+                        return
+            except Exception as e:
+                self.update_output(f"Error retrieving finding details from database: {e}")
+        
+        # Fallback to basic info if both approaches fail
         self.detail_text.insert(tk.END, f"Rule: {rule_name}\n")
         self.detail_text.insert(tk.END, f"Severity: {severity.upper()}\n")
         self.detail_text.insert(tk.END, f"Time: {timestamp_str}\n")
         self.detail_text.insert(tk.END, f"Source IP: {src_ip}\n")
         self.detail_text.insert(tk.END, f"Destination IP: {dst_ip}\n")
         self.detail_text.insert(tk.END, f"Description: {description}\n")
+        self.detail_text.insert(tk.END, "\n(Detailed information not available)\n")
+    
+    def _find_matching_file(self, timestamp_str, rule_name, src_ip, dst_ip):
+        """Try to find a matching finding file based on the information we have"""
+        try:
+            # Get path to red directory
+            red_dir = None
+            if hasattr(self.gui, 'red_dir'):
+                red_dir = self.gui.red_dir
+            elif hasattr(self.gui, 'app_root'):
+                red_dir = os.path.join(self.gui.app_root, "red")
+            
+            if not red_dir or not os.path.exists(red_dir):
+                return None
+                
+            # Convert timestamp string to datetime object if possible
+            timestamp_obj = None
+            try:
+                timestamp_obj = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                timestamp_file_prefix = timestamp_obj.strftime("%Y%m%d_%H%M%S")
+            except:
+                timestamp_file_prefix = None
+                
+            # Sanitize values for filename matching
+            safe_rule_name = rule_name.replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')
+            safe_src_ip = src_ip.replace(':', '_')
+            safe_dst_ip = dst_ip.replace(':', '_')
+            
+            # First try exact timestamp match if available
+            if timestamp_file_prefix:
+                exact_match = f"{timestamp_file_prefix}_{safe_rule_name}_{safe_src_ip}_{safe_dst_ip}.json"
+                exact_path = os.path.join(red_dir, exact_match)
+                if os.path.exists(exact_path):
+                    return exact_path
+                    
+                # Try without timestamps
+                for filename in os.listdir(red_dir):
+                    if (filename.endswith('.json') and 
+                        safe_rule_name in filename and 
+                        safe_src_ip in filename and 
+                        safe_dst_ip in filename):
+                        return os.path.join(red_dir, filename)
+                        
+                # Try with just IPs
+                for filename in os.listdir(red_dir):
+                    if (filename.endswith('.json') and 
+                        (safe_src_ip in filename or safe_dst_ip in filename) and
+                        safe_rule_name in filename):
+                        return os.path.join(red_dir, filename)
+            else:
+                # No timestamp, try by rule and IPs
+                for filename in os.listdir(red_dir):
+                    if (filename.endswith('.json') and 
+                        safe_rule_name in filename and 
+                        (safe_src_ip in filename or safe_dst_ip in filename)):
+                        return os.path.join(red_dir, filename)
+            
+            # No match found
+            return None
+            
+        except Exception as e:
+            self.update_output(f"Error finding matching file: {e}")
+            return None

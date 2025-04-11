@@ -94,6 +94,18 @@ EXTENDED_TABLE_DEFINITIONS = {
         {"name": "http_connections", "type": "INTEGER", "required": False},
         {"name": "https_connections", "type": "INTEGER", "required": False},
         {"name": "dns_queries", "type": "INTEGER", "required": False}
+    ],
+    "x_red": [
+        {"name": "id", "type": "INTEGER PRIMARY KEY AUTOINCREMENT", "required": True},
+        {"name": "timestamp", "type": "REAL", "required": True},
+        {"name": "src_ip", "type": "TEXT", "required": False}, # Allow NULL for network-wide findings
+        {"name": "dst_ip", "type": "TEXT", "required": False}, # Allow NULL for network-wide findings
+        {"name": "rule_name", "type": "TEXT", "required": True},
+        {"name": "severity", "type": "TEXT", "required": False},
+        {"name": "description", "type": "TEXT", "required": True},
+        {"name": "details", "type": "TEXT", "required": False}, # Store JSON as TEXT
+        {"name": "connection_key", "type": "TEXT", "required": False},
+        {"name": "remediation", "type": "TEXT", "required": False}
     ]
 }
 
@@ -156,18 +168,7 @@ class AnalysisManager:
         self.analysis_plugins_dir = os.path.join(app_root, "analysis")
         os.makedirs(self.analysis_plugins_dir, exist_ok=True)
         
-        # Import and initialize RedReportManager
-        try:
-            from red_report_manager import RedReportManager
-            self.red_report_manager = RedReportManager(app_root, self)
-            logger.info("Red Report Manager initialized")
-        except Exception as e:
-            logger.error(f"Error initializing Red Report Manager: {e}")
-            self.red_report_manager = None
-        
-        # Load analysis plugins
-        self.load_analysis_plugins()
-        
+                
         # Start periodic analysis thread
         self.analysis_interval = 300  # Run analysis every 5 minutes
         self.last_analysis_time = 0   # Force first analysis soon after startup
@@ -265,6 +266,13 @@ class AnalysisManager:
         
         # Connection statistics indices
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_conn_stats_time ON x_connection_statistics(timestamp)")
+
+        # ADD INDICES FOR x_red TABLE
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_red_timestamp ON x_red(timestamp DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_red_src_ip ON x_red(src_ip)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_red_dst_ip ON x_red(dst_ip)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_red_rule ON x_red(rule_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_x_red_severity ON x_red(severity)")
     
     def load_analysis_plugins(self):
         """Load analysis plugins from the analysis directory"""
